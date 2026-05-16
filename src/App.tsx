@@ -252,6 +252,14 @@ export default function App() {
       addLog(message, 'warning');
       return false;
     }
+    if (entryLockUntilRef.current > Date.now()) {
+      const retryTime = new Date(entryLockUntilRef.current).toLocaleTimeString();
+      const message = `Live trading disabled until ${retryTime}`;
+      setSyncError(message);
+      setExecutionFeedback({ type: 'warning', message });
+      addLog(message, 'warning');
+      return false;
+    }
     isSyncingRef.current = true;
     setIsSyncing(true);
     addLog(`INITIATING EXCHANGE HANDSHAKE...`, 'info');
@@ -285,7 +293,9 @@ export default function App() {
         } else if (isAuthFailedStatus || isAuthError) {
           const currentIp = serverConfig?.outboundIp || 'Unknown';
           const retrySuffix = authRetryAt ? ` Retry at ${authRetryAt}.` : '';
-          message = `AUTH ERROR: Detected IP: ${currentIp}. If using Binance, ensure API key is valid, IP is allowed, and "Enable Futures" is selected.${retrySuffix}`;
+          message = authRetryAt
+            ? `Live trading disabled until ${authRetryAt}`
+            : `Live trading disabled until ${(new Date(authBlockedUntil || Date.now() + 60000)).toLocaleTimeString()}`;
           setIsRealMode(false);
           setAutoTrade(false);
           if (hasAuthBlock) {
@@ -1454,6 +1464,16 @@ export default function App() {
   const displayedAvailableFunds = isRealMode ? availableFunds : balance;
   const entryLockActive = entryLockUntil > Date.now();
   const entryLockRemainingSec = entryLockActive ? Math.max(1, Math.ceil((entryLockUntil - Date.now()) / 1000)) : 0;
+  const entryLockRetryTime = entryLockActive ? new Date(entryLockUntil).toLocaleTimeString() : '';
+  const syncErrorLower = (syncError || '').toLowerCase();
+  const isAuthDisabledBannerVisible = entryLockActive && (
+    syncErrorLower.includes('auth error') ||
+    syncErrorLower.includes('api key') ||
+    syncErrorLower.includes('enable futures') ||
+    syncErrorLower.includes('-2015')
+  );
+  const authLockMinutes = Math.floor(entryLockRemainingSec / 60);
+  const authLockSeconds = String(entryLockRemainingSec % 60).padStart(2, '0');
   const visibleTradeHistory = tradeHistory.filter(t => {
     // Hide SCAN skips
     if (t.symbol === 'SCAN' && t.status === 'SKIPPED') return false;
@@ -1489,6 +1509,20 @@ export default function App() {
         </div>
       )}
 
+      {isAuthDisabledBannerVisible && (
+        <div className="max-w-7xl mx-auto mb-4 border-2 border-rose-700 bg-rose-50 px-4 py-3 shadow-[6px_6px_0px_0px_#881337]">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start gap-2">
+              <ShieldAlert size={16} className="text-rose-700 mt-0.5 shrink-0" />
+              <div>
+                <p className="text-[10px] font-black uppercase tracking-[0.18em] text-rose-900">Live trading disabled until {entryLockRetryTime}</p>
+              </div>
+            </div>
+            <span className="text-[10px] font-mono font-black text-rose-800 border border-rose-300 bg-white px-2 py-1 rounded-sm shrink-0">{entryLockRetryTime}</span>
+          </div>
+        </div>
+      )}
+
       <header className="max-w-7xl mx-auto mb-8 flex flex-col md:flex-row md:items-end justify-between gap-4 border-b border-[#141414] pb-4">
         <div className="flex flex-col">
           <div className="flex items-center gap-2 mb-1">
@@ -1510,6 +1544,12 @@ export default function App() {
                 <button 
                   onClick={async () => {
                     setSyncError(null);
+                    if (entryLockActive) {
+                      const lockMessage = `Live trading disabled until ${entryLockRetryTime}`;
+                      setExecutionFeedback({ type: 'warning', message: lockMessage });
+                      addLog(lockMessage, 'warning');
+                      return;
+                    }
                     if (serverConfig?.hasKeys) {
                       const success = await syncRealBalance();
                       if (success) setIsRealMode(true);
@@ -1523,14 +1563,19 @@ export default function App() {
                       addLog(message, 'warning');
                     }
                   }}
-                  disabled={isSyncing}
-                  className={`w-32 px-4 py-1.5 text-[10px] font-black uppercase tracking-tighter transition-all flex items-center justify-center gap-2 ${isRealMode ? 'bg-rose-600 text-white shadow-lg' : 'text-white/40 hover:text-white'} ${isSyncing ? 'cursor-wait' : ''}`}
+                  disabled={isSyncing || entryLockActive}
+                  className={`w-32 px-4 py-1.5 text-[10px] font-black uppercase tracking-tighter transition-all flex items-center justify-center gap-2 ${isRealMode ? 'bg-rose-600 text-white shadow-lg' : 'text-white/40 hover:text-white'} ${(isSyncing || entryLockActive) ? 'cursor-not-allowed opacity-70' : ''}`}
                 >
                   <span className="inline-flex w-3 h-3 items-center justify-center">
                     <Loader2 size={10} className={isSyncing ? 'opacity-60' : 'opacity-0'} />
                   </span>
                   Live Futures
                 </button>
+                {entryLockActive && (
+                  <span className="text-[8px] font-mono uppercase text-rose-600 ml-1">
+                    Disabled until {entryLockRemainingSec}s
+                  </span>
+                )}
              </div>
 
              <div className="h-6 w-px bg-[#141414]/10 mx-1" />
