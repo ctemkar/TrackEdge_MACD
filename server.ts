@@ -22,6 +22,31 @@ async function startServer() {
     .filter(Boolean);
   const unsupportedSymbolSkips = new Map<string, { until: number; count: number; reason: string }>();
 
+  // Rate-limit state: tracks when Binance bans expire + consecutive failure count for backoff
+  const rateLimitState = {
+    bannedUntil: 0,       // epoch ms when Binance IP ban expires
+    failCount: 0,         // consecutive sync failures
+    backoffUntil: 0,      // epoch ms to suppress retries during backoff
+    authFailCount: 0,     // consecutive Binance auth/permission failures
+    authBlockedUntil: 0,  // epoch ms to suppress retries for invalid keys/permissions
+  };
+  const MAX_BACKOFF_MS = 5 * 60 * 1000; // cap backoff at 5 minutes
+  const MAX_AUTH_BLOCK_MS = 10 * 60 * 1000; // cap auth block at 10 minutes
+
+  const isBinanceAuthErrorMessage = (message: string) => {
+    const normalized = String(message || '').toLowerCase();
+    return (
+      normalized.includes('-2015') ||
+      normalized.includes('-2014') ||
+      normalized.includes('invalid api-key') ||
+      normalized.includes('api-key format invalid') ||
+      normalized.includes('signature for this request is not valid') ||
+      normalized.includes('invalid signature') ||
+      normalized.includes('ip, or permissions for action') ||
+      normalized.includes('enable futures')
+    );
+  };
+
   app.use(cors());
   app.use(express.json());
   app.use((req, res, next) => {
@@ -34,7 +59,7 @@ async function startServer() {
   });
 
   // Direct Binance API helper for positions (bypasses CCXT method issues)
-  const fetchBinancePositionsViaHttp = async (apiKey: string, apiSecret: string): Promise<any[]> => {
+  const fetchBinancePositionsViaHttp = async (apiKey: string, apiSecret: string): Promise<{ positions: any[]; authError: boolean; message?: string }> => {
     try {
       const timestamp = Date.now();
       const params = new URLSearchParams({ timestamp: String(timestamp) });
@@ -58,18 +83,27 @@ async function startServer() {
       if (!response.ok) {
         const text = await response.text();
         console.warn(`[TradeEdge] Binance /fapi/v2/positionRisk returned ${response.status}: ${text.substring(0, 100)}`);
-        return [];
+        return {
+          positions: [],
+          authError: response.status === 401 || isBinanceAuthErrorMessage(text),
+          message: text,
+        };
       }
       
       const data = await response.json();
       if (Array.isArray(data)) {
         console.log(`[TradeEdge] Direct Binance HTTP: Got ${data.length} positions from /fapi/v2/positionRisk`);
-        return data;
+        return { positions: data, authError: false };
       }
-      return [];
+      return { positions: [], authError: false };
     } catch (e: any) {
       console.warn(`[TradeEdge] Direct Binance HTTP request failed: ${e?.message}`);
-      return [];
+      const errMsg = String(e?.message || '');
+      return {
+        positions: [],
+        authError: isBinanceAuthErrorMessage(errMsg),
+        message: errMsg,
+      };
     }
   };
 
@@ -156,6 +190,8 @@ async function startServer() {
   // API Routes
   app.get('/api/health', async (req, res) => {
     let outboundIp = 'unknown';
+    const now = Date.now();
+    const blockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
     try {
       const providers = [
         'https://api.ipify.org?format=json',
@@ -200,6 +236,7 @@ async function startServer() {
       exchange: currentExchange,
       type: currentExchange === 'binance' ? 'FUTURES' : 'SPOT',
       outboundIp,
+      blockedUntil: blockedUntil > now ? blockedUntil : 0,
       config: {
         realTradingEnabled: process.env.ENABLE_REAL_TRADING === 'true',
         hasKeys: !!(
@@ -321,6 +358,25 @@ async function startServer() {
   });
 
   app.get('/api/binance/balance', async (req, res) => {
+    // Refuse the call while we're still in a ban or backoff window
+    const now = Date.now();
+    if (rateLimitState.authBlockedUntil > now) {
+      const waitSec = Math.ceil((rateLimitState.authBlockedUntil - now) / 1000);
+      return res.status(401).json({
+        status: 'auth_failed',
+        retryAfterMs: rateLimitState.authBlockedUntil - now,
+        blockedUntil: rateLimitState.authBlockedUntil,
+        message: `Binance Futures API auth/permissions failed. Retry in ${waitSec}s after fixing API key permissions.`,
+      });
+    }
+
+    const blockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+    if (blockedUntil > now) {
+      const waitSec = Math.ceil((blockedUntil - now) / 1000);
+      console.warn(`[TradeEdge RateLimit] Sync suppressed — ${waitSec}s remaining (bannedUntil=${new Date(rateLimitState.bannedUntil).toISOString()})`);
+      return res.status(429).json({ status: 'rate_limited', retryAfterMs: blockedUntil - now, message: `Rate limited. Retry in ${waitSec}s.` });
+    }
+
     try {
       const client = getExchange();
       let params: any = {};
@@ -448,6 +504,9 @@ async function startServer() {
       let totalUnrealizedPnl = 0;
 
       if (client.id === 'binance') {
+        let authFailureDetected = false;
+        let authFailureReason = '';
+
         const upsertPosition = (input: any) => {
           const rawAmt = Number(input?.contracts ?? input?.positionAmt ?? input?.info?.positionAmt ?? 0);
           const contracts = Math.abs(rawAmt);
@@ -474,6 +533,13 @@ async function startServer() {
           if (!symbolRaw) return;
           const compact = symbolRaw.replace('/', '').replace(':USDT', '').replace(':USD', '').replace(':', '');
           const normalized = compact.endsWith('USDT') || compact.endsWith('USD') ? compact : `${compact}USDT`;
+          
+          // STRICT VALIDATION: Reject malformed symbols (repeated quote assets like USDTUSDTUSDT)
+          if (!/^[A-Z0-9]+(USDT|USDC|USD)$/.test(normalized) || /USDT.*USDT|USDC.*USDC/.test(normalized)) {
+            console.warn(`[TradeEdge] Rejecting malformed symbol: "${normalized}" (doesn't match valid trading pair format)`);
+            return;
+          }
+
           const displaySymbol = String(input?.symbol || '').includes('/')
             ? String(input?.symbol)
             : (normalized.endsWith('USDT')
@@ -505,7 +571,12 @@ async function startServer() {
         const binanceSecret = (process.env.BINANCE_LIVE_API_SECRET || process.env.BINANCE_API_SECRET || process.env.BINANCE_SECRET || '').trim();
         
         if (binanceKey && binanceSecret) {
-          const httpPositions = await fetchBinancePositionsViaHttp(binanceKey, binanceSecret);
+          const httpPositionResult = await fetchBinancePositionsViaHttp(binanceKey, binanceSecret);
+          const httpPositions = httpPositionResult.positions;
+          if (httpPositionResult.authError) {
+            authFailureDetected = true;
+            authFailureReason = httpPositionResult.message || 'Binance futures positionRisk authentication failed (-2015).';
+          }
           if (httpPositions.length > 0) {
             console.log(`[TradeEdge Sync] Successfully fetched ${httpPositions.length} positions via direct HTTP API`);
             httpPositions.forEach(upsertPosition);
@@ -527,6 +598,14 @@ async function startServer() {
             console.log(`[TradeEdge Sync] Found ${umAssets.length} assets with UM positions in fetchBalance info`);
             umAssets.forEach((asset: any) => {
               const symbol = String(asset.asset || '').toUpperCase();
+              
+              // SKIP quote assets (USDT, USDC, BUSD, etc.) - they're not tradable base assets
+              const QUOTE_ASSETS = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'USDN', 'EUR', 'GBP', 'JPY']);
+              if (QUOTE_ASSETS.has(symbol)) {
+                console.log(`[TradeEdge Sync] Skipping quote asset: ${symbol} (not a tradable base asset)`);
+                return;
+              }
+              
               const umBal = Number(asset.umWalletBalance || 0);
               const umPnl = Number(asset.umUnrealizedPNL || 0);
               if (symbol && (umBal !== 0 || umPnl !== 0)) {
@@ -563,6 +642,10 @@ async function startServer() {
             }
           } catch (e: any) {
             console.warn(`[TradeEdge Sync] fetchPositions failed: ${e?.message || 'unknown error'}`);
+            if (isBinanceAuthErrorMessage(String(e?.message || ''))) {
+              authFailureDetected = true;
+              authFailureReason = String(e?.message || authFailureReason || 'Binance futures permissions failed while fetching positions.');
+            }
           }
         }
 
@@ -587,8 +670,26 @@ async function startServer() {
               }
             } catch (e: any) {
               console.warn(`[TradeEdge Sync] ${name} failed: ${e?.message || 'unknown error'}`);
+              if (isBinanceAuthErrorMessage(String(e?.message || ''))) {
+                authFailureDetected = true;
+                authFailureReason = String(e?.message || authFailureReason || 'Binance futures permissions failed while reading position risk.');
+              }
             }
           }
+        }
+
+        if (authFailureDetected) {
+          rateLimitState.authFailCount += 1;
+          const blockMs = Math.min(rateLimitState.authFailCount * 2 * 60 * 1000, MAX_AUTH_BLOCK_MS);
+          rateLimitState.authBlockedUntil = Date.now() + blockMs;
+          const retryAt = new Date(rateLimitState.authBlockedUntil).toISOString();
+          console.error(`[TradeEdge Auth] Binance futures auth/permission failure detected. Blocking live sync until ${retryAt}.`);
+          return res.status(401).json({
+            status: 'auth_failed',
+            message: authFailureReason || 'Binance futures API key is invalid or missing required permissions (-2015).',
+            blockedUntil: rateLimitState.authBlockedUntil,
+            retryAfterMs: blockMs,
+          });
         }
         
         if (!positionsFetched && Object.keys(allPositions).length === 0) {
@@ -724,9 +825,53 @@ async function startServer() {
           info: balanceData.info 
         } : undefined
       });
+      // Successful sync — reset failure counter
+      rateLimitState.failCount = 0;
+      rateLimitState.backoffUntil = 0;
+      rateLimitState.authFailCount = 0;
+      rateLimitState.authBlockedUntil = 0;
     } catch (error: any) {
-      console.error(`[TradeEdge Sync Error] ${error.message}`);
-      res.status(500).json({ status: 'error', message: error.message });
+      const msg = String(error?.message || '');
+      const statusCode = Number(error?.status || error?.httpCode || 0);
+
+      if (isBinanceAuthErrorMessage(msg)) {
+        rateLimitState.authFailCount += 1;
+        const blockMs = Math.min(rateLimitState.authFailCount * 2 * 60 * 1000, MAX_AUTH_BLOCK_MS);
+        rateLimitState.authBlockedUntil = Date.now() + blockMs;
+        return res.status(401).json({
+          status: 'auth_failed',
+          message: msg,
+          blockedUntil: rateLimitState.authBlockedUntil,
+          retryAfterMs: blockMs,
+        });
+      }
+
+      // Detect 418 (IP ban) or 429 (rate limit) from Binance
+      if (statusCode === 418 || statusCode === 429 || msg.includes('banned until') || msg.includes('Too many requests')) {
+        // Parse the 'banned until' timestamp from the error message if present
+        const banMatch = msg.match(/banned until (\d+)/);
+        if (banMatch) {
+          rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
+          console.error(`[TradeEdge RateLimit] IP ban detected — suppressing sync until ${new Date(rateLimitState.bannedUntil).toISOString()}`);
+        } else {
+          // No explicit ban time — apply exponential backoff
+          rateLimitState.failCount++;
+          const backoffMs = Math.min(Math.pow(2, rateLimitState.failCount) * 5000, MAX_BACKOFF_MS);
+          rateLimitState.backoffUntil = Date.now() + backoffMs;
+          console.error(`[TradeEdge RateLimit] Rate limited (attempt ${rateLimitState.failCount}) — backing off ${backoffMs / 1000}s`);
+        }
+        res.status(429).json({ status: 'rate_limited', message: msg, bannedUntil: rateLimitState.bannedUntil || rateLimitState.backoffUntil });
+      } else {
+        // Generic error — apply small backoff on repeated failures
+        rateLimitState.failCount++;
+        if (rateLimitState.failCount > 3) {
+          const backoffMs = Math.min(rateLimitState.failCount * 10000, MAX_BACKOFF_MS);
+          rateLimitState.backoffUntil = Date.now() + backoffMs;
+          console.warn(`[TradeEdge Sync] ${rateLimitState.failCount} consecutive failures — backing off ${backoffMs / 1000}s`);
+        }
+        console.error(`[TradeEdge Sync Error] ${msg}`);
+        res.status(500).json({ status: 'error', message: msg });
+      }
     }
   });
 
@@ -908,10 +1053,12 @@ async function startServer() {
           if (wantsReduceOnly) orderParams.reduceOnly = true;
 
           const submitMarketOrder = async (params: Record<string, any>) => {
-            return await client.createMarketOrder(
+            return await client.createOrder(
               ccxtSymbol,
+              'market',
               side.toLowerCase(),
               finalAmount,
+              undefined,
               params
             );
           };
@@ -977,6 +1124,12 @@ async function startServer() {
 
   // Public Proxies with User-Preferred Exchange Logic
   app.get('/api/binance/proxy/klines', async (req, res) => {
+    // Honour rate-limit ban window
+    const now = Date.now();
+    const blockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+    if (blockedUntil > now) {
+      return res.json([]); // return empty candles so scanner skips quietly
+    }
     try {
       const { symbol, interval, limit } = req.query;
       const usePrivateGemini = preferGemini() && hasConfiguredKeys();
@@ -1002,7 +1155,14 @@ async function startServer() {
         const binanceUrl = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
         const response = await fetch(binanceUrl);
         if (response.ok) return res.json(await response.json());
-        // Some symbols intermittently return non-200; return empty candles so scanner continues.
+        if (response.status === 418 || response.status === 429) {
+          const body: any = await response.json().catch(() => ({}));
+          const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
+          if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
+          else rateLimitState.backoffUntil = Date.now() + 60000;
+          console.warn(`[TradeEdge RateLimit] klines rate limited — suppressing`);
+          return res.json([]);
+        }
         return res.json([]);
       }
     } catch (error: any) {
@@ -1012,6 +1172,12 @@ async function startServer() {
   });
 
   app.get('/api/binance/proxy/exchangeInfo', async (req, res) => {
+    // Honour rate-limit ban window
+    const now = Date.now();
+    const blockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+    if (blockedUntil > now) {
+      return res.status(429).json({ status: 'rate_limited', symbols: [], bannedUntil: blockedUntil });
+    }
     try {
       const usePrivateGemini = preferGemini() && hasConfiguredKeys();
       if (usePrivateGemini) {
@@ -1034,6 +1200,15 @@ async function startServer() {
         const url = 'https://fapi.binance.com/fapi/v1/exchangeInfo';
         const response = await fetch(url);
         if (response.ok) return res.json(await response.json());
+        if (response.status === 418 || response.status === 429) {
+          const body: any = await response.json().catch(() => ({}));
+          const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
+          if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
+          else rateLimitState.backoffUntil = Date.now() + 60000;
+          console.warn(`[TradeEdge RateLimit] exchangeInfo rate limited — suppressing`);
+          const newBlockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+          return res.status(429).json({ status: 'rate_limited', symbols: [], bannedUntil: newBlockedUntil });
+        }
         throw new Error('Binance exchangeInfo failed');
       }
     } catch (error: any) {

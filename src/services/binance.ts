@@ -31,8 +31,18 @@ export async function fetchAllSymbols(): Promise<{ label: string, value: string 
   try {
     const response = await fetch('/api/binance/proxy/exchangeInfo');
     const data = await response.json();
+
+    // Rate limited — attach retry time so callers can surface it
+    if (data?.status === 'rate_limited') {
+      const retryAt = data.bannedUntil || (Date.now() + 60000);
+      const err: any = new Error(`RATE_LIMITED`);
+      err.retryAt = retryAt;
+      throw err;
+    }
+
     const allowedQuotes = new Set(['USDT', 'USDC']);
-    return data.symbols
+    const symbols = Array.isArray(data?.symbols) ? data.symbols : [];
+    return symbols
       .filter((s: any) => {
         const status = String(s?.status || '').toUpperCase();
         const contractType = String(s?.contractType || '').toUpperCase();
@@ -46,7 +56,10 @@ export async function fetchAllSymbols(): Promise<{ label: string, value: string 
         label: s.symbol,
         value: s.symbol
       }));
-  } catch (error) {
+  } catch (error: any) {
+    if (error?.message === 'RATE_LIMITED') {
+      throw error;
+    }
     console.error('Error fetching symbols:', error);
     return [];
   }
@@ -65,10 +78,15 @@ export async function fetchTopSymbolsByVolume(limit: number = 20): Promise<strin
     return ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT', 'DOTUSDT'];
   }
 }
-export function subscribeToTicker(symbol: string, onUpdate: (price: number) => void) {
+export function subscribeToTicker(
+  symbol: string,
+  onUpdate: (price: number) => void,
+  options?: { preferWebSocket?: boolean }
+) {
+  const preferWebSocket = options?.preferWebSocket === true;
   const isBinanceSymbol = (symbol.endsWith('USDT') || symbol.endsWith('USDC')) && !symbol.includes('/');
-  
-  if (isBinanceSymbol) {
+
+  if (preferWebSocket && isBinanceSymbol) {
     const ws = new WebSocket(`wss://fstream.binance.com/ws/${symbol.toLowerCase()}@ticker`);
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);

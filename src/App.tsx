@@ -99,10 +99,7 @@ export default function App() {
     }
   });
   
-  const [autoTrade, setAutoTrade] = useState(() => {
-    const saved = localStorage.getItem('te_auto_trade');
-    return saved !== null ? saved === 'true' : true;
-  });
+  const [autoTrade, setAutoTrade] = useState(false);
   const [useBNBFees, setUseBNBFees] = useState(true);
   const [isRealMode, setIsRealMode] = useState(() => {
     const saved = localStorage.getItem('te_real_mode');
@@ -129,9 +126,19 @@ export default function App() {
   const [scanExecutionStats, setScanExecutionStats] = useState({ cycleId: 0, attempted: 0, filled: 0, failed: 0, skipped: 0 });
   const [executionFeedback, setExecutionFeedback] = useState<{ type: 'info' | 'success' | 'warning', message: string } | null>(null);
   const [entryLockUntil, setEntryLockUntil] = useState(0);
+
+  // Auto-dismiss toast after 8s for warnings/errors, 4s for success/info
+  React.useEffect(() => {
+    if (!executionFeedback) return;
+    const delay = executionFeedback.type === 'warning' ? 8000 : 4000;
+    const t = setTimeout(() => setExecutionFeedback(null), delay);
+    return () => clearTimeout(t);
+  }, [executionFeedback]);
   const tradeLockout = React.useRef<Set<string>>(new Set());
   const isSyncingRef = React.useRef(false);
   const scanningRef = React.useRef(false);
+  const rateLimitedUntilRef = React.useRef(0);
+  const RATE_LIMIT_UNTIL_KEY = 'te_rate_limited_until';
   const currentScanCycleRef = React.useRef(0);
   const entryLockUntilRef = React.useRef(0);
   const lastScanSkipLogRef = React.useRef<Record<string, number>>({});
@@ -148,8 +155,42 @@ export default function App() {
   }, [holdings, autoTrade, maxConcurrentTrades]);
 
   React.useEffect(() => {
+    // Safety-first boot: never resume autonomous scanning from persisted state.
+    localStorage.setItem('te_auto_trade', 'false');
+    autoTradeRef.current = false;
+    setAutoTrade(false);
+  }, []);
+
+  React.useEffect(() => {
     entryLockUntilRef.current = entryLockUntil;
   }, [entryLockUntil]);
+
+  const setRateLimitUntil = React.useCallback((until: number) => {
+    rateLimitedUntilRef.current = until;
+    if (until > Date.now()) {
+      localStorage.setItem(RATE_LIMIT_UNTIL_KEY, String(until));
+    } else {
+      localStorage.removeItem(RATE_LIMIT_UNTIL_KEY);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    const saved = parseInt(localStorage.getItem(RATE_LIMIT_UNTIL_KEY) || '0', 10);
+    if (Number.isFinite(saved) && saved > Date.now()) {
+      rateLimitedUntilRef.current = saved;
+    } else {
+      localStorage.removeItem(RATE_LIMIT_UNTIL_KEY);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (!autoTrade) {
+      scanningRef.current = false;
+      setScanning(false);
+      setIsBotActive(false);
+      setScanProgress({ current: 0, total: 0 });
+    }
+  }, [autoTrade]);
 
   const [seedCapital, setSeedCapital] = useState(() => {
     const saved = localStorage.getItem('te_seed');
@@ -203,6 +244,14 @@ export default function App() {
 
   const syncRealBalance = React.useCallback(async () => {
     if (isSyncingRef.current) return false;
+    if (rateLimitedUntilRef.current > Date.now()) {
+      const retryTime = new Date(rateLimitedUntilRef.current).toLocaleTimeString();
+      const message = `BINANCE RATE LIMITED: IP temporarily banned by Binance. Retry at ${retryTime}. (Too many API requests were made recently.)`;
+      setSyncError(message);
+      setExecutionFeedback({ type: 'warning', message });
+      addLog(message, 'warning');
+      return false;
+    }
     isSyncingRef.current = true;
     setIsSyncing(true);
     addLog(`INITIATING EXCHANGE HANDSHAKE...`, 'info');
@@ -212,19 +261,43 @@ export default function App() {
       if (!resp.ok) {
         const errorData = await resp.json().catch(() => ({}));
         let message = errorData.message || `Server responded with ${resp.status}`;
-        
-        if (message.includes('-2015') || message.includes('API key') || message.includes('permission')) {
+        const normalizedMessage = String(message).toLowerCase();
+        const authBlockedUntil = Number(errorData.blockedUntil || 0);
+        const hasAuthBlock = Number.isFinite(authBlockedUntil) && authBlockedUntil > Date.now();
+        const authRetryAt = hasAuthBlock ? new Date(authBlockedUntil).toLocaleTimeString() : null;
+        const isAuthFailedStatus = errorData.status === 'auth_failed';
+        const isAuthError =
+          normalizedMessage.includes('-2015') ||
+          normalizedMessage.includes('-2014') ||
+          normalizedMessage.includes('invalid api-key') ||
+          normalizedMessage.includes('api-key format invalid') ||
+          normalizedMessage.includes('signature for this request is not valid') ||
+          normalizedMessage.includes('invalid signature') ||
+          normalizedMessage.includes('ip address') ||
+          normalizedMessage.includes('whitelist') ||
+          normalizedMessage.includes('enable futures');
+
+        if (resp.status === 429 || errorData.status === 'rate_limited') {
+          const bannedUntil: number = errorData.bannedUntil || (Date.now() + (errorData.retryAfterMs || 60000));
+          setRateLimitUntil(bannedUntil);
+          const retryTime = new Date(bannedUntil).toLocaleTimeString();
+          message = `BINANCE RATE LIMITED: IP temporarily banned by Binance. Retry at ${retryTime}. (Too many API requests were made recently.)`;
+        } else if (isAuthFailedStatus || isAuthError) {
           const currentIp = serverConfig?.outboundIp || 'Unknown';
-          message = `AUTH ERROR: Detected IP: ${currentIp}. If using Binance, ensure IP is unrestricted in API settings and "Enable Futures" is selected. If using Gemini, double-check your keys (API Key & Secret).`;
+          const retrySuffix = authRetryAt ? ` Retry at ${authRetryAt}.` : '';
+          message = `AUTH ERROR: Detected IP: ${currentIp}. If using Binance, ensure API key is valid, IP is allowed, and "Enable Futures" is selected.${retrySuffix}`;
           setIsRealMode(false);
-          setSyncError(message);
+          setAutoTrade(false);
+          if (hasAuthBlock) {
+            setEntryLockUntil(authBlockedUntil);
+            setRateLimitUntil(authBlockedUntil);
+          }
         } else if (message.includes('-1021')) {
-          message = "TIMESTAMP REJECTED. Your local clock may be out of sync with exchange servers.";
-          setSyncError(message);
-        } else {
-          setSyncError(message);
+          message = 'TIMESTAMP REJECTED. Your local clock may be out of sync with exchange servers.';
         }
-        
+
+        setSyncError(message);
+        setExecutionFeedback({ type: 'warning', message });
         return false;
       }
       
@@ -254,7 +327,7 @@ export default function App() {
             console.log(`[TradeEdge SYNC] Position keys: ${Object.keys(data.positions).join(', ')}`);
           }
 
-          freshHoldings = Object.entries(data.positions).map(([coin, info]: [string, any]) => {
+          freshHoldings = Object.entries(data.positions).map(([coin, info]: [string, any]): Holding | null => {
             const coinUpper = coin.toUpperCase();
             const fromInfoSymbol = toCompactSymbol(info?.symbol || '');
             let normalizedSymbol = fromInfoSymbol || (coinUpper.endsWith('USD') || coinUpper.endsWith('USDT') || coinUpper.endsWith('USDC')
@@ -276,7 +349,8 @@ export default function App() {
               return null;
             }
 
-            if (info.amount <= 0) return null;
+            const amount = Number(info?.amount || 0);
+            if (!(amount > 0)) return null;
 
             return {
               id: `${normalizedSymbol}_${info.side || 'LONG'}`,
@@ -284,8 +358,8 @@ export default function App() {
               displaySymbol: typeof info?.symbol === 'string' && info.symbol.includes('/') ? info.symbol : undefined,
               exchange: info?.exchange || (data.exchange ? String(data.exchange).charAt(0).toUpperCase() + String(data.exchange).slice(1) : undefined),
               contracts: Number(info?.contracts || info?.amount || 0) || undefined,
-              amount: info.amount,
-              side: info.side === 'SHORT' ? 'SHORT' : 'LONG',
+              amount,
+              side: (info.side === 'SHORT' ? 'SHORT' : 'LONG') as 'LONG' | 'SHORT',
               entryPrice: Number(info.entryPrice) > 0 ? Number(info.entryPrice) : price,
               markPrice: Number(info.markPrice) > 0 ? Number(info.markPrice) : undefined,
               notional: Number(info.notional) > 0 ? Number(info.notional) : undefined,
@@ -331,8 +405,10 @@ export default function App() {
         setServerStatus('OK');
         return true;
       } else {
-        setSyncError(data.message || 'Unknown balance sync error');
-        addLog(`SYNC FAILED: ${data.message || 'Unknown error'}`, 'warning');
+        const message = data.message || 'Unknown balance sync error';
+        setSyncError(message);
+        setExecutionFeedback({ type: 'warning', message });
+        addLog(`SYNC FAILED: ${message}`, 'warning');
         return false;
       }
     } catch (e: any) {
@@ -352,6 +428,9 @@ export default function App() {
       const resp = await fetch('/api/health');
       if (resp.ok) {
         const data = await resp.json();
+        if (Number(data?.blockedUntil) > Date.now()) {
+          setRateLimitUntil(Number(data.blockedUntil));
+        }
         setServerStatus('OK');
         setServerConfig({
           ...data.config,
@@ -463,16 +542,12 @@ export default function App() {
             ? Math.max(realFreeCapital, realFallbackCapital)
             : Math.max(0, balance);
           let allocation = Math.min(tradableCapital, tradableCapital / slotsAvailable);
-          const minLiveNotional = 80;
+          const minLiveNotional = 10;
 
           // Avoid over-fragmenting capital across many slots; if we can fund at least one
           // minimal order, keep per-trade allocation at $10+ instead of skipping every entry.
           if (tradableCapital >= 10) {
             allocation = Math.max(allocation, 10);
-          }
-
-          if (isRealMode && allocation < minLiveNotional && tradableCapital >= minLiveNotional) {
-            allocation = minLiveNotional;
           }
 
           allocation = Math.min(allocation, tradableCapital);
@@ -590,6 +665,12 @@ export default function App() {
             addLog(`REAL ${type} FAILED: ${tradeSymbol} - ${msg}`, 'warning');
             setExecutionFeedback({ type: 'warning', message: `${type} failed for ${tradeSymbol}: Position not found.` });
             pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `FAILED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
+            // Safety brake: stop autonomous live entries after ambiguous exchange response.
+            if (!closingExisting) {
+              autoTradeRef.current = false;
+              setAutoTrade(false);
+              addLog('AUTONOMOUS PAUSED: Exchange did not confirm live position after order response.', 'warning');
+            }
             if (closingExisting) {
               lockEntries(5 * 60 * 1000, `Close verification failed for ${tradeSymbol}. New entries paused for 5m.`);
             }
@@ -645,6 +726,8 @@ export default function App() {
         }
       } catch (e: any) {
         const msg = String(e?.message || 'Unknown order failure');
+        const isMarginOrFundsFailure = /-2019|margin is insufficient|insufficient margin|insufficient balance/i.test(msg);
+        const isAuthFailure = /-2015|invalid api-key|invalid api key|ip|permissions for action|whitelist/i.test(msg);
         const softSkip = /(SYMBOL SKIPPED|UNSUPPORTED MARKET|INVALID ORDER SIZE|ORDER SIZE UNDERFLOW|allocation below|Unable to size|No open position|Duplicate order lockout)/i.test(msg);
 
         if (softSkip) {
@@ -697,6 +780,20 @@ export default function App() {
         addLog(`REAL ${type} FAILED: ${msg}`, 'warning');
   setExecutionFeedback({ type: 'warning', message: `${type} failed for ${tradeSymbol}: ${msg}` });
         pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `FAILED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
+
+        if (isMarginOrFundsFailure || isAuthFailure) {
+          // Hard fail-safe: disable autonomous trading immediately on exchange-level hard failures.
+          autoTradeRef.current = false;
+          setAutoTrade(false);
+          lockEntries(15 * 60 * 1000, `Entry lock engaged after hard exchange failure (${isAuthFailure ? 'auth/permission' : 'margin'}).`);
+          if (isAuthFailure) {
+            setIsRealMode(false);
+            addLog('LIVE MODE DISABLED: Exchange auth/permission failure detected.', 'warning');
+          } else {
+            addLog('AUTONOMOUS PAUSED: Margin insufficient. Review leverage/available margin before retrying.', 'warning');
+          }
+        }
+
         if (closingExisting) {
           lockEntries(5 * 60 * 1000, `Close order failed for ${tradeSymbol}. New entries paused for 5m.`);
         }
@@ -869,6 +966,8 @@ export default function App() {
 
   useEffect(() => {
     if (!isRealMode) return;
+    if (serverStatus !== 'OK') return;
+    if (rateLimitedUntilRef.current > Date.now()) return;
 
     // Keep live account metrics fresh after user has explicitly enabled Live mode.
     syncRealBalance();
@@ -877,7 +976,7 @@ export default function App() {
     }, 15000);
 
     return () => clearInterval(timer);
-  }, [isRealMode, syncRealBalance]);
+  }, [isRealMode, syncRealBalance, serverStatus]);
 
   const currentHolding = holdings.find(h => h.symbol === symbol);
   const stopLossPrice = (currentHolding && currentPrice)
@@ -941,6 +1040,11 @@ export default function App() {
   // Market Scanner Logic
   const performScan = React.useCallback(async () => {
     if (scanningRef.current) return;
+    if (!autoTradeRef.current) return;
+    if (rateLimitedUntilRef.current > Date.now()) {
+      setScanProgress({ current: 0, total: 0 });
+      return;
+    }
     const cycleId = Date.now();
     currentScanCycleRef.current = cycleId;
     setScanExecutionStats({ cycleId, attempted: 0, filled: 0, failed: 0, skipped: 0 });
@@ -949,7 +1053,22 @@ export default function App() {
     setIsBotActive(true);
     try {
       setScanProgress({ current: 0, total: 0 });
-      const allSymbols = await fetchAllSymbols();
+      let allSymbols: { label: string; value: string }[];
+      try {
+        allSymbols = await fetchAllSymbols();
+      } catch (err: any) {
+        const retryAt: number = err?.retryAt || 0;
+        if (retryAt > Date.now()) {
+          setRateLimitUntil(retryAt);
+        }
+        const msg = retryAt > Date.now()
+          ? `Scanner blocked: Binance rate limit active. Retry at ${new Date(retryAt).toLocaleTimeString()}.`
+          : 'Scanner idle: failed to load symbol list.';
+        addLog(msg, 'warning');
+        setExecutionFeedback({ type: 'warning', message: msg });
+        setScanProgress({ current: 0, total: 0 });
+        return;
+      }
       const allValues = allSymbols.map(s => s.value);
       const liveNormalized = (v: string) => (v.toUpperCase().endsWith('USD') && !v.toUpperCase().endsWith('USDT') ? `${v}T` : v);
       const hasAllowedQuote = (v: string) => {
@@ -984,7 +1103,9 @@ export default function App() {
       setScanProgress({ current: 0, total: totalToScan });
       
       let lastLoggedCount = 0;
-      const results = await scanMarket(symbolsToScan, (current, total) => {
+      const results = await scanMarket(
+        symbolsToScan,
+        (current, total) => {
         const safeTotal = total > 0 ? total : totalToScan;
         const safeCurrent = Math.min(Math.max(current, 0), safeTotal);
         setScanProgress({ current: safeCurrent, total: safeTotal });
@@ -992,7 +1113,14 @@ export default function App() {
         if (safeCurrent >= lastLoggedCount + 50 || safeCurrent === safeTotal) {
           lastLoggedCount = safeCurrent;
         }
-      });
+        },
+        () => autoTradeRef.current && rateLimitedUntilRef.current <= Date.now()
+      );
+
+      if (!autoTradeRef.current || rateLimitedUntilRef.current > Date.now()) {
+        setScanProgress({ current: 0, total: 0 });
+        return;
+      }
 
       setMarketPicks(results);
       // Wait a moment before resetting progress to let the user see "Complete" in the UI
@@ -1069,10 +1197,17 @@ export default function App() {
           const toTrade = entries.slice(0, availableSlots);
           
           if (toTrade.length > 0) {
-            toTrade.forEach(({ side, pick }) => {
+            // Live mode safety: execute entries sequentially to avoid burst margin failures.
+            const maxEntriesThisCycle = isRealMode ? 1 : availableSlots;
+            const selectedTrades = toTrade.slice(0, maxEntriesThisCycle);
+            for (const { side, pick } of selectedTrades) {
               const entryType = side === 'BUY' ? 'LONG' : 'SHORT';
-              executeTrade(side, pick.symbol, pick.lastPrice, `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`, undefined, cycleId);
-            });
+              await executeTrade(side, pick.symbol, pick.lastPrice, `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`, undefined, cycleId);
+              if (!autoTradeRef.current || entryLockUntilRef.current > Date.now()) break;
+              if (isRealMode) {
+                await new Promise(r => setTimeout(r, 400));
+              }
+            }
           } else {
             pushScanSkipEvent(`SKIP: No eligible entries (BUY=${potentialLongs.length}, SELL=${potentialShorts.length}, slots=${availableSlots})`, cycleId);
           }
@@ -1089,7 +1224,7 @@ export default function App() {
       setScanning(false);
       setTimeout(() => setIsBotActive(false), 2000);
     }
-  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance]);
+  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil]);
  // Removed 'scanning' from dependencies
 
   const resetAccount = React.useCallback(() => {
@@ -1108,17 +1243,38 @@ export default function App() {
 
   useEffect(() => {
     const initSymbols = async () => {
-      const all = await fetchAllSymbols();
-      setAvailableSymbols(all);
-      addLog(`Market Metadata: ${all.length} exchange vectors mapped.`, 'info');
+      if (serverStatus !== 'OK') return;
+      if (!autoTradeRef.current || rateLimitedUntilRef.current > Date.now()) {
+        setAvailableSymbols([]);
+        return;
+      }
+      try {
+        const all = await fetchAllSymbols();
+        setAvailableSymbols(all);
+        addLog(`Market Metadata: ${all.length} exchange vectors mapped.`, 'info');
+      } catch (err: any) {
+        const retryAt: number = err?.retryAt || 0;
+        if (retryAt > Date.now()) {
+          setRateLimitUntil(retryAt);
+          addLog(`Scanner blocked: Binance rate limit active. Retry at ${new Date(retryAt).toLocaleTimeString()}.`, 'warning');
+        } else {
+          addLog('Market Metadata: symbol map unavailable.', 'warning');
+        }
+      }
       addLog(`PROTOCOL STATUS: Autonomous Execution is ${autoTrade ? 'ACTIVE' : 'IDLE'}`, autoTrade ? 'success' : 'info');
     };
     initSymbols();
-  }, []);
+  }, [addLog, autoTrade, setRateLimitUntil, serverStatus]);
 
   // Main Data Loading & Scanner Auto-Refresh
   useEffect(() => {
+    if (serverStatus !== 'OK') return;
+
     const loadData = async (silent = false) => {
+      if (rateLimitedUntilRef.current > Date.now()) {
+        if (!silent) setLoading(false);
+        return;
+      }
       // ONLY show the dark loading screen if we have zero data (initial boot or fresh asset)
       if (!silent && data.length === 0) setLoading(true); 
       
@@ -1142,34 +1298,45 @@ export default function App() {
     };
 
     loadData();
-    performScan();
+    if (autoTradeRef.current) performScan();
 
     const refreshInterval = setInterval(() => {
       loadData(true);
-      performScan();
-      setNextScanSec(30);
+      if (autoTradeRef.current) {
+        performScan();
+        setNextScanSec(30);
+      } else {
+        setNextScanSec(0);
+      }
     }, 30000);
 
     const countdownInterval = setInterval(() => {
       setNextScanSec(prev => Math.max(0, prev - 1));
     }, 1000);
 
-    const unsubscribe = subscribeToTicker(symbol, (price) => {
-      setCurrentPrice(price);
-    });
+    const useBinanceWsTicker = isRealMode && serverConfig?.exchange === 'binance';
+    const unsubscribe = subscribeToTicker(
+      symbol,
+      (price) => {
+        setCurrentPrice(price);
+      },
+      { preferWebSocket: useBinanceWsTicker }
+    );
 
     return () => {
       unsubscribe();
       clearInterval(refreshInterval);
       clearInterval(countdownInterval);
     };
-  }, [symbol, performScan]);
+  }, [symbol, performScan, isRealMode, serverConfig?.exchange, serverStatus]);
 
   // Dedicated Portfolio Price Watcher (High Frequency)
   useEffect(() => {
     if (holdings.length === 0) return;
+    if (serverStatus !== 'OK') return;
 
     const pollHoldingPrices = async () => {
+      if (rateLimitedUntilRef.current > Date.now()) return;
       const updates: Record<string, number> = {};
       await Promise.all(holdings.map(async (h) => {
         try {
@@ -1200,7 +1367,7 @@ export default function App() {
     pollHoldingPrices();
 
     return () => clearInterval(interval);
-  }, [holdings]);
+  }, [holdings, serverStatus]);
 
   useEffect(() => {
     if (holdings.length > 0) {
@@ -1286,6 +1453,7 @@ export default function App() {
   const investedPct = equity > 0 ? (totalInvested / equity) * 100 : 0;
   const displayedAvailableFunds = isRealMode ? availableFunds : balance;
   const entryLockActive = entryLockUntil > Date.now();
+  const entryLockRemainingSec = entryLockActive ? Math.max(1, Math.ceil((entryLockUntil - Date.now()) / 1000)) : 0;
   const visibleTradeHistory = tradeHistory.filter(t => {
     // Hide SCAN skips
     if (t.symbol === 'SCAN' && t.status === 'SKIPPED') return false;
@@ -1306,6 +1474,21 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#E4E3E0] text-[#141414] p-4 md:p-8 font-sans selection:bg-[#F27D26] selection:text-white overflow-x-hidden">
+
+      {/* Fixed overlay toast — always visible regardless of scroll position */}
+      {executionFeedback && (
+        <div className={`fixed top-4 left-1/2 -translate-x-1/2 z-50 max-w-xl w-full px-5 py-3 shadow-2xl border-2 text-[11px] font-mono uppercase tracking-wider flex items-start justify-between gap-4 ${
+          executionFeedback.type === 'success'
+            ? 'bg-emerald-900 border-emerald-400 text-emerald-100'
+            : executionFeedback.type === 'warning'
+              ? 'bg-amber-900 border-amber-400 text-amber-100'
+              : 'bg-sky-900 border-sky-400 text-sky-100'
+        }`}>
+          <span className="leading-relaxed">{executionFeedback.message}</span>
+          <button onClick={() => setExecutionFeedback(null)} className="shrink-0 font-black opacity-60 hover:opacity-100 text-xs">✕</button>
+        </div>
+      )}
+
       <header className="max-w-7xl mx-auto mb-8 flex flex-col md:flex-row md:items-end justify-between gap-4 border-b border-[#141414] pb-4">
         <div className="flex flex-col">
           <div className="flex items-center gap-2 mb-1">
@@ -1331,7 +1514,14 @@ export default function App() {
                       const success = await syncRealBalance();
                       if (success) setIsRealMode(true);
                     }
-                    else addLog("API keys required in Settings for Real Mode", "warning");
+                    else {
+                      const message = serverStatus !== 'OK'
+                        ? 'SERVER STATUS UNKNOWN: wait for connection health before enabling Live Futures.'
+                        : 'API KEYS REQUIRED: configure exchange credentials before enabling Live Futures.';
+                      setSyncError(message);
+                      setExecutionFeedback({ type: 'warning', message });
+                      addLog(message, 'warning');
+                    }
                   }}
                   disabled={isSyncing}
                   className={`w-32 px-4 py-1.5 text-[10px] font-black uppercase tracking-tighter transition-all flex items-center justify-center gap-2 ${isRealMode ? 'bg-rose-600 text-white shadow-lg' : 'text-white/40 hover:text-white'} ${isSyncing ? 'cursor-wait' : ''}`}
@@ -1352,6 +1542,12 @@ export default function App() {
                 </div>
                 <button 
                   onClick={() => {
+                    if (!autoTrade && entryLockActive) {
+                      const lockMessage = `AUTONOMOUS DISABLED BY SAFETY LOCK: retry in ~${entryLockRemainingSec}s.`;
+                      setExecutionFeedback({ type: 'warning', message: lockMessage });
+                      addLog(lockMessage, 'warning');
+                      return;
+                    }
                     const newState = !autoTrade;
                     setAutoTrade(newState);
                     addLog(`SYSTEM UPDATE: Autonomous Execution ${newState ? 'ENGAGED' : 'SUSPENDED'}`, newState ? 'success' : 'warning');
@@ -1363,6 +1559,11 @@ export default function App() {
                     <div className={`w-1 h-1 rounded-full ${autoTrade ? 'bg-emerald-500' : 'bg-gray-300'}`} />
                   </div>
                 </button>
+                  {!autoTrade && entryLockActive && (
+                    <span className="text-[8px] font-mono uppercase text-rose-600">
+                      Disabled by Safety Lock ({entryLockRemainingSec}s)
+                    </span>
+                  )}
              </div>
 
              <div className="flex items-center bg-white border border-[#141414] rounded-sm overflow-hidden">
@@ -1712,9 +1913,12 @@ export default function App() {
                       </span>
                     </div>
                     <button 
-                      onClick={() => {
+                      onClick={async () => {
                         if (isRealMode) setIsRealMode(false);
-                        else syncRealBalance();
+                        else {
+                          const success = await syncRealBalance();
+                          if (success) setIsRealMode(true);
+                        }
                       }}
                       disabled={isSyncing}
                       className={`text-[9px] px-3 py-1 font-black transition-all ${isRealMode ? 'bg-[#141414] text-white hover:bg-black/80' : 'bg-[#F27D26] text-white hover:bg-orange-600'} ${isSyncing ? 'opacity-50' : ''}`}
