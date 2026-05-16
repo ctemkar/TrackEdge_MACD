@@ -558,7 +558,7 @@ export default function App() {
 
       if (currentAutoTrade) {
         const potentialBuys = results
-          .filter(r => r.signal.overall === 'BUY' && r.signal.score >= 7)
+          .filter(r => r.signal.overall === 'BUY' && r.signal.score >= 6)
           .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
           .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now());
 
@@ -757,12 +757,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#E4E3E0] text-[#141414] p-4 md:p-8 font-sans selection:bg-[#F27D26] selection:text-white overflow-x-hidden">
-      {showInitialLoading && (
-        <div className="max-w-7xl mx-auto mb-4 flex items-center gap-3 rounded-sm border border-[#141414]/10 bg-white/60 px-4 py-2 font-mono text-[10px] uppercase tracking-[0.25em] opacity-70">
-          <Activity size={14} className="text-[#F27D26]" />
-          Calibrating indicators...
-        </div>
-      )}
       <header className="max-w-7xl mx-auto mb-8 flex flex-col md:flex-row md:items-end justify-between gap-4 border-b border-[#141414] pb-4">
         <div className="flex flex-col">
           <div className="flex items-center gap-2 mb-1">
@@ -895,11 +889,13 @@ export default function App() {
                   Market Protocol
                 </h2>
                 <span className="text-[8px] font-mono mt-1 uppercase opacity-40">
-                  Scanner Online: Monitoring {availableSymbols.length} Assets
+                  {scanning
+                    ? `Scanner Active: ${scanProgress.current} / ${scanProgress.total || 1} Assets`
+                    : `Scanner Online: Monitoring ${availableSymbols.length} Assets`}
                 </span>
               </div>
               <div className="flex items-center gap-2">
-                <span className="text-[9px] font-mono opacity-40">Auto scan ready</span>
+                <span className="text-[9px] font-mono opacity-40">{scanning ? 'Scanning now' : 'Auto scan ready'}</span>
                 <button 
                   onClick={performScan} 
                   className="cursor-pointer"
@@ -907,6 +903,19 @@ export default function App() {
                 >
                   <Zap size={14} className="text-[#F27D26]" />
                 </button>
+              </div>
+            </div>
+
+            <div className="mt-3 mb-4">
+              <div className="flex justify-between text-[8px] font-mono uppercase opacity-50 mb-1">
+                <span>{scanning ? 'Scan Progress' : 'Idle'}</span>
+                <span>{scanning ? `${Math.round((scanProgress.current / (scanProgress.total || 1)) * 100)}%` : `${availableSymbols.length} assets`}</span>
+              </div>
+              <div className="h-1 w-full bg-gray-100 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-[#F27D26]"
+                  style={{ width: scanning ? `${(scanProgress.current / (scanProgress.total || 1)) * 100}%` : `${Math.min(100, Math.max(0, availableSymbols.length > 0 ? 100 : 0))}%` }}
+                />
               </div>
             </div>
 
@@ -994,6 +1003,19 @@ export default function App() {
                 </div>
               </div>
             </div>
+
+                <div className="mt-3 mb-4">
+                  <div className="flex justify-between text-[8px] font-mono uppercase opacity-50 mb-1">
+                    <span>{scanning ? 'Scan Progress' : 'Scanner Ready'}</span>
+                    <span>{scanning ? `${scanProgress.current} / ${scanProgress.total || 1}` : `${availableSymbols.length} assets`}</span>
+                  </div>
+                  <div className="h-1 w-full bg-gray-100 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-[#F27D26]"
+                      style={{ width: scanning ? `${(scanProgress.current / (scanProgress.total || 1)) * 100}%` : `${availableSymbols.length > 0 ? 100 : 0}%` }}
+                    />
+                  </div>
+                </div>
           </section>
 
           {/* Risk Management Card */}

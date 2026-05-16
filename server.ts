@@ -16,6 +16,8 @@ async function startServer() {
 
   // Exchange Client (Lazy Init)
   let exchangeInstance: ccxt.Exchange | null = null;
+  const hasConfiguredKeys = () => !!((process.env.BINANCE_API_KEY && process.env.BINANCE_API_SECRET) || (process.env.GEMINI_LIVE_API_KEY && process.env.GEMINI_LIVE_API_SECRET) || (process.env.GEMINI_API_KEY && process.env.GEMINI_API_SECRET));
+  const preferGemini = () => process.env.EXCHANGE === 'gemini';
   const getExchange = () => {
     if (!exchangeInstance) {
       const bKey = (process.env.BINANCE_API_KEY || '').trim();
@@ -335,10 +337,10 @@ async function startServer() {
   app.get('/api/binance/proxy/klines', async (req, res) => {
     try {
       const { symbol, interval, limit } = req.query;
-      const client = getExchange();
-      const isGemini = client.id === 'gemini';
+      const usePrivateGemini = preferGemini() && hasConfiguredKeys();
 
-      if (isGemini) {
+      if (usePrivateGemini) {
+        const client = getExchange();
         // Gemini OHLCV Logic
         let geminiSymbol = String(symbol || '');
         // Gemini symbols in CCXT like BTC/USD or ETH/BTC
@@ -367,8 +369,9 @@ async function startServer() {
 
   app.get('/api/binance/proxy/exchangeInfo', async (req, res) => {
     try {
-      const client = getExchange();
-      if (client.id === 'gemini') {
+      const usePrivateGemini = preferGemini() && hasConfiguredKeys();
+      if (usePrivateGemini) {
+        const client = getExchange();
         const markets = await client.loadMarkets();
         const symbols = Object.values(markets).map(m => {
           // Use m.id for value, but m.symbol for label transparency if possible
@@ -396,8 +399,9 @@ async function startServer() {
 
   app.get('/api/binance/proxy/ticker24hr', async (req, res) => {
     try {
-      const client = getExchange();
-      if (client.id === 'gemini') {
+      const usePrivateGemini = preferGemini() && hasConfiguredKeys();
+      if (usePrivateGemini) {
+        const client = getExchange();
         const tickers = await client.fetchTickers();
         const mapped = Object.values(tickers).map(t => ({
           symbol: t.symbol.replace('/', ''),
