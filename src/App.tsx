@@ -415,6 +415,57 @@ export default function App() {
 
         const result = await resp.json();
         if (result.status === 'success') {
+          const normalizeLiveSymbol = (rawSymbol: string) => {
+            const compact = String(rawSymbol || '')
+              .toUpperCase()
+              .replace('/', '')
+              .replace(':USDT', '')
+              .replace(':USD', '')
+              .replace(':', '');
+            if (!compact) return compact;
+            if (compact.endsWith('USDT') || compact.endsWith('USD')) return compact;
+            if (compact.endsWith('USD') && !compact.endsWith('USDT')) return `${compact}T`;
+            return `${compact}USDT`;
+          };
+
+          const hasPositionForSymbol = (positions: Record<string, any>, rawSymbol: string) => {
+            const normalized = normalizeLiveSymbol(rawSymbol);
+            if (!normalized) return false;
+            const alt = normalized.endsWith('USDT') ? normalized.slice(0, -1) : `${normalized}T`;
+            const candidates = [normalized, alt];
+            return candidates.some((key) => {
+              const p = positions?.[key];
+              const amt = Number(p?.amount ?? p?.total ?? 0);
+              return Number.isFinite(amt) && Math.abs(amt) > 0;
+            });
+          };
+
+          // Exchange can acknowledge an order while position state lags or rejects by mode/rules.
+          // Verify live position snapshot before classifying as FILLED.
+          let verified = false;
+          try {
+            await new Promise(r => setTimeout(r, 900));
+            const verifyResp = await fetch('/api/binance/balance');
+            if (verifyResp.ok) {
+              const verify = await verifyResp.json();
+              const positions = verify?.positions || {};
+              const hasPosition = hasPositionForSymbol(positions, tradeSymbol);
+              if (closingExisting) verified = !hasPosition;
+              else if (type === 'BUY' || openingShort) verified = hasPosition;
+            }
+          } catch {
+            // Fall through to unverified handling below.
+          }
+
+          if (!verified && (type === 'BUY' || openingShort || closingExisting)) {
+            const msg = 'Exchange acknowledged order but no matching live position update was detected.';
+            addLog(`REAL ${type} UNVERIFIED: ${tradeSymbol} - ${msg}`, 'warning');
+            setExecutionFeedback({ type: 'warning', message: `${type} unverified for ${tradeSymbol}: ${msg}` });
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `FAILED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
+            setTimeout(syncRealBalance, 1200);
+            return;
+          }
+
           const closingLong = heldSide === 'LONG' && type === 'SELL';
           const closingShort = heldSide === 'SHORT' && type === 'BUY';
           if (closingLong || closingShort) {
