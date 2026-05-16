@@ -68,7 +68,10 @@ export default function App() {
     return saved !== null ? saved === 'true' : true;
   });
   const [useBNBFees, setUseBNBFees] = useState(true);
-  const [isRealMode, setIsRealMode] = useState(false);
+  const [isRealMode, setIsRealMode] = useState(() => {
+    const saved = localStorage.getItem('te_real_mode');
+    return saved !== null ? saved === 'true' : false;
+  });
   const [showSyncError, setShowSyncError] = useState(true);
   const [maxConcurrentTrades, setMaxConcurrentTrades] = useState(15);
   const [maxDrawdownPercent, setMaxDrawdownPercent] = useState(10);
@@ -440,7 +443,8 @@ export default function App() {
     localStorage.setItem('te_seed', seedCapital.toString());
     localStorage.setItem('te_benchmark_capital', benchmarkCapital.toString());
     localStorage.setItem('te_auto_trade', autoTrade.toString());
-  }, [balance, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade]);
+    localStorage.setItem('te_real_mode', isRealMode.toString());
+  }, [balance, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode]);
 
   // Baseline Safety: If paper trading and baseline is from a ghost real-sync session, fix it.
   useEffect(() => {
