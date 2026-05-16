@@ -276,63 +276,55 @@ async function startServer() {
       let totalUnrealizedPnl = 0;
 
       if (client.id === 'binance') {
+        const upsertPosition = (input: any) => {
+          const rawAmt = Number(input?.contracts ?? input?.positionAmt ?? input?.info?.positionAmt ?? 0);
+          const contracts = Math.abs(rawAmt);
+          if (!Number.isFinite(contracts) || contracts <= 0) return;
+
+          const sideRaw = String(input?.side || input?.positionSide || input?.info?.positionSide || '').toUpperCase();
+          const inferredSide: 'LONG' | 'SHORT' = sideRaw === 'SHORT' || rawAmt < 0 ? 'SHORT' : 'LONG';
+          const entry = Number(input?.entryPrice ?? input?.info?.entryPrice ?? 0);
+          const unrealized = Number(input?.unrealizedPnl ?? input?.unRealizedProfit ?? input?.info?.unRealizedProfit ?? 0);
+
+          const symbolRaw = String(input?.symbol || input?.info?.symbol || '').toUpperCase();
+          if (!symbolRaw) return;
+          const compact = symbolRaw.replace('/', '').replace(':USDT', '').replace(':USD', '').replace(':', '');
+          const normalized = compact.endsWith('USDT') || compact.endsWith('USD') ? compact : `${compact}USDT`;
+
+          allPositions[normalized] = {
+            amount: contracts,
+            total: contracts,
+            side: inferredSide,
+            entryPrice: Number.isFinite(entry) && entry > 0 ? entry : undefined,
+            unrealizedPnl: Number.isFinite(unrealized) ? unrealized : undefined,
+          };
+        };
+
         try {
-          const fetchedPositions = await (client as any).fetchPositions?.();
+          const fetchedPositions = await (client as any).fetchPositions?.(undefined, { type: 'future' });
           if (Array.isArray(fetchedPositions)) {
-            for (const p of fetchedPositions) {
-              const contracts = Math.abs(Number(p?.contracts || p?.info?.positionAmt || 0));
-              if (!Number.isFinite(contracts) || contracts <= 0) continue;
-
-              const sideRaw = String(p?.side || '').toUpperCase();
-              const inferredSide: 'LONG' | 'SHORT' = sideRaw === 'SHORT' || Number(p?.info?.positionAmt || 0) < 0 ? 'SHORT' : 'LONG';
-              const entry = Number(p?.entryPrice || p?.info?.entryPrice || 0);
-              const unrealized = Number(p?.unrealizedPnl || p?.info?.unRealizedProfit || 0);
-
-              const symbolRaw = String(p?.symbol || p?.info?.symbol || '').toUpperCase();
-              const compact = symbolRaw.replace('/', '').replace(':USDT', '').replace(':USD', '').replace(':', '');
-              const normalized = compact.endsWith('USDT') || compact.endsWith('USD') ? compact : `${compact}USDT`;
-
-              allPositions[normalized] = {
-                amount: contracts,
-                total: contracts,
-                side: inferredSide,
-                entryPrice: Number.isFinite(entry) && entry > 0 ? entry : undefined,
-                unrealizedPnl: Number.isFinite(unrealized) ? unrealized : undefined,
-              };
-              if (Number.isFinite(unrealized)) totalUnrealizedPnl += unrealized;
-            }
+            fetchedPositions.forEach(upsertPosition);
           }
-        } catch {
-          // If positions endpoint fails, keep balance-only response.
+        } catch (e: any) {
+          console.warn(`[TradeEdge Sync] fetchPositions failed: ${e?.message || 'unknown error'}`);
         }
 
-        try {
-          const umRisk = await (client as any).papiGetUmPositionRisk?.();
-          if (Array.isArray(umRisk)) {
-            for (const p of umRisk) {
-              const rawAmt = Number(p?.positionAmt || 0);
-              const contracts = Math.abs(rawAmt);
-              if (!Number.isFinite(contracts) || contracts <= 0) continue;
+        const positionRiskFetchers = [
+          async () => await (client as any).fapiPrivateV2GetPositionRisk?.(),
+          async () => await (client as any).fapiPrivateGetPositionRisk?.(),
+          async () => await (client as any).papiGetUmPositionRisk?.(),
+        ];
 
-              const rawSymbol = String(p?.symbol || '').toUpperCase();
-              if (!rawSymbol) continue;
-              const normalized = rawSymbol.endsWith('USDT') || rawSymbol.endsWith('USD') ? rawSymbol : `${rawSymbol}USDT`;
-              const entry = Number(p?.entryPrice || 0);
-              const unrealized = Number(p?.unRealizedProfit || 0);
-              const sideRaw = String(p?.positionSide || '').toUpperCase();
-              const inferredSide: 'LONG' | 'SHORT' = sideRaw === 'SHORT' || rawAmt < 0 ? 'SHORT' : 'LONG';
-
-              allPositions[normalized] = {
-                amount: contracts,
-                total: contracts,
-                side: inferredSide,
-                entryPrice: Number.isFinite(entry) && entry > 0 ? entry : undefined,
-                unrealizedPnl: Number.isFinite(unrealized) ? unrealized : undefined,
-              };
+        for (const fetcher of positionRiskFetchers) {
+          try {
+            const rows = await fetcher();
+            if (Array.isArray(rows) && rows.length > 0) {
+              rows.forEach(upsertPosition);
+              break;
             }
+          } catch {
+            // Try the next position endpoint variant.
           }
-        } catch {
-          // UM position risk endpoint may be unavailable for some accounts.
         }
 
         totalUnrealizedPnl = Object.values(allPositions).reduce((sum, p) => {
@@ -506,9 +498,16 @@ async function startServer() {
           const allowedQuotes = new Set(liveQuoteAllowlist);
           const filteredCandidates = candidates.filter((m: any) => {
             const q = (m?.quote || '').toUpperCase();
-            return (m?.contract || m?.swap || m?.future) && allowedQuotes.has(q);
+            const isContract = m?.contract || m?.swap || m?.future || m?.type === 'swap';
+            const hasAllowedQuote = allowedQuotes.has(q);
+            const isActive = m?.active !== false;
+            return isContract && hasAllowedQuote && isActive;
           });
-          const resolved = filteredCandidates[0] || candidates.find((m: any) => m?.contract && m?.linear) || candidates[0];
+          const resolved = filteredCandidates[0] || candidates.find((m: any) => m?.contract && m?.linear && m?.active !== false) || null;
+          
+          if (!resolved) {
+            console.log(`[TradeEdge] Market validation failed for ${raw}: candidates=${candidates.length}, filtered=${filteredCandidates.length}, allowed_quotes=[${liveQuoteAllowlist.join(',')}]`);
+          }
 
           if (resolved?.symbol) {
             ccxtSymbol = resolved.symbol;
@@ -518,7 +517,7 @@ async function startServer() {
           } else {
             unsupportedSymbolSkips.set(raw, {
               count: (unsupportedSymbolSkips.get(raw)?.count || 0) + 1,
-              until: Date.now() + (1000 * 60 * 15),
+              until: Date.now() + (1000 * 60 * 3),
               reason: 'unsupported market mapping',
             });
             throw new Error(`UNSUPPORTED MARKET: ${raw} not tradable on allowed quotes [${liveQuoteAllowlist.join(', ')}]`);

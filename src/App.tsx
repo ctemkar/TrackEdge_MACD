@@ -738,9 +738,17 @@ export default function App() {
       };
       const isLikelyBinanceFuturesSymbol = (v: string) => {
         const up = v.toUpperCase();
-        return up.endsWith('USDT') || up.endsWith('USDC') || up.endsWith('FDUSD');
+        const validSuffixes = /^[A-Z0-9]+?(USDT|USDC|FDUSD|BTC|ETH|BNB)$/;
+        return validSuffixes.test(up) && up.length < 20 && !/[^A-Z0-9]/.test(up);
       };
       const isLiveBinance = isRealMode && serverConfig?.exchange === 'binance';
+      if (isLiveBinance && marketPicks.length > 0) {
+        const beforeFilter = marketPicks.length;
+        marketPicks = marketPicks.filter(p => isLikelyBinanceFuturesSymbol(p.symbol));
+        if (marketPicks.length < beforeFilter) {
+          console.log(`[Scanner] Filtered ${beforeFilter - marketPicks.length} non-futures symbols`);
+        }
+      }
       const baseSymbol = isRealMode ? liveNormalized(symbol) : symbol;
       const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
       const symbolsToScan = Array.from(new Set([baseSymbol, ...candidateValues]));
