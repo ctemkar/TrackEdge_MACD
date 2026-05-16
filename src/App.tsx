@@ -558,7 +558,7 @@ export default function App() {
 
       if (currentAutoTrade) {
         const potentialBuys = results
-          .filter(r => r.signal.overall === 'BUY' && r.signal.score >= 6)
+          .filter(r => r.signal.overall === 'BUY' && r.signal.score >= 5)
           .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
           .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now());
 
