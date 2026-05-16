@@ -1054,18 +1054,6 @@ export default function App() {
               </div>
             </div>
 
-                <div className="mt-3 mb-4">
-                  <div className="flex justify-between text-[8px] font-mono uppercase opacity-50 mb-1">
-                    <span>{scanning ? 'Scan Progress' : 'Scanner Ready'}</span>
-                    <span>{scanning ? `${scanProgress.current} / ${scanProgress.total || 1}` : `${availableSymbols.length} assets`}</span>
-                  </div>
-                  <div className="h-1 w-full bg-gray-100 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-[#F27D26]"
-                      style={{ width: scanning ? `${(scanProgress.current / (scanProgress.total || 1)) * 100}%` : `${availableSymbols.length > 0 ? 100 : 0}%` }}
-                    />
-                  </div>
-                </div>
           </section>
 
           {/* Risk Management Card */}
