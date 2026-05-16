@@ -895,9 +895,7 @@ export default function App() {
                   Market Protocol
                 </h2>
                 <span className="text-[8px] font-mono mt-1 uppercase opacity-40">
-                  {scanning
-                    ? `Scanner Active: ${scanProgress.current} / ${scanProgress.total}`
-                    : `Scanner IDLE: Monitoring ${availableSymbols.length} Assets`}
+                  Scanner Online: Monitoring {availableSymbols.length} Assets
                 </span>
               </div>
               <div className="flex items-center gap-2">
@@ -1297,29 +1295,6 @@ export default function App() {
                <Zap size={60} />
              </div>
              
-             {scanning ? (
-               <div className="flex items-center gap-6 relative z-10 w-full">
-                  <div className="flex items-center gap-3">
-                    <Loader2 size={16} className="text-[#F27D26] opacity-30" />
-                    <div className="flex flex-col">
-                      <span className="text-[10px] font-black uppercase tracking-widest text-[#F27D26]">Scanner Active</span>
-                      <span className="text-[8px] font-mono opacity-40 uppercase">Mapping Market Vectors...</span>
-                    </div>
-                  </div>
-                  <div className="flex-grow flex flex-col gap-1 max-w-md">
-                     <div className="flex justify-between text-[8px] font-mono uppercase opacity-60">
-                        <span>Scanned: {scanProgress.current} / {scanProgress.total} Assets</span>
-                        <span>{Math.round((scanProgress.current / (scanProgress.total || 1)) * 100)}%</span>
-                     </div>
-                     <div className="w-full bg-white/10 h-1 rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-[#F27D26]"
-                          style={{ width: `${(scanProgress.current / (scanProgress.total || 1)) * 100}%` }}
-                        />
-                     </div>
-                  </div>
-               </div>
-             ) : (
                <div className="flex items-center gap-8 relative z-10">
                   <div className="flex items-center gap-3">
                      <div className="flex flex-col">
@@ -1365,7 +1340,6 @@ export default function App() {
                      </div>
                   </div>
                </div>
-             )}
 
              <div className="hidden md:flex items-center gap-6 relative z-10">
                 <div className="flex flex-col items-end">
