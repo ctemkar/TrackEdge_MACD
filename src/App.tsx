@@ -121,6 +121,7 @@ export default function App() {
   } | null>(null);
   const [isBotActive, setIsBotActive] = useState(false);
   const [scanExecutionStats, setScanExecutionStats] = useState({ cycleId: 0, attempted: 0, filled: 0, failed: 0, skipped: 0 });
+  const [executionFeedback, setExecutionFeedback] = useState<{ type: 'info' | 'success' | 'warning', message: string } | null>(null);
   const tradeLockout = React.useRef<Set<string>>(new Set());
   const isSyncingRef = React.useRef(false);
   const scanningRef = React.useRef(false);
@@ -311,6 +312,7 @@ export default function App() {
     
     if (tradeSymbol.includes('undefined') || price <= 0) {
        addLog(`TRADE ABORTED: Invalid symbol or price [${tradeSymbol} @ ${price}]`, 'warning');
+      setExecutionFeedback({ type: 'warning', message: `${type} blocked: invalid symbol/price (${tradeSymbol}).` });
       pushTradeEvent({ type, symbol: tradeSymbol || 'UNKNOWN', price: price || 0, amount: 0, time: new Date().toISOString(), reason: 'SKIP: Invalid symbol/price', status: 'SKIPPED', cycleId: eventCycleId });
        return;
     }
@@ -320,12 +322,14 @@ export default function App() {
       : holdings.some(h => h.symbol === tradeSymbol);
     const isRealShortEntry = isRealMode && type === 'SELL' && !targetId && !isHeld;
     if (type === 'SELL' && !isHeld && !isRealShortEntry) {
+      setExecutionFeedback({ type: 'warning', message: `SELL skipped for ${tradeSymbol}: no open position to close.` });
       pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: No open position to close', status: 'SKIPPED', cycleId: eventCycleId });
       return;
     }
 
     const lockKey = `${type}_${tradeSymbol}_${targetId || 'all'}`;
     if (tradeLockout.current.has(lockKey)) {
+      setExecutionFeedback({ type: 'warning', message: `${type} skipped for ${tradeSymbol}: duplicate order lockout.` });
       pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: Duplicate order lockout', status: 'SKIPPED', cycleId: eventCycleId });
       return;
     }
@@ -334,6 +338,7 @@ export default function App() {
 
 
     if (isRealMode) {
+      setExecutionFeedback({ type: 'info', message: `Submitting ${type} ${tradeSymbol} at $${formatPrice(price)}...` });
       addLog(`EXECUTING REAL ${type}: ${tradeSymbol} @ $${price} [${reason}]`, 'info');
       let existingHolding = holdings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
       let heldAmount = existingHolding?.amount || 0;
@@ -358,11 +363,13 @@ export default function App() {
           amount = heldAmount;
         } else if (type === 'BUY' || openingShort) {
           const slotsAvailable = Math.max(1, maxConcurrentTrades - holdings.length);
-          const currentBalance = Math.max(0, balance);
-          let allocation = Math.min(currentBalance, currentBalance / slotsAvailable);
+          const tradableCapital = isRealMode
+            ? Math.max(0, availableFunds * 0.95) // keep a safety buffer for fees/funding/margin movement
+            : Math.max(0, balance);
+          let allocation = Math.min(tradableCapital, tradableCapital / slotsAvailable);
           const minLiveNotional = 80;
 
-          if (isRealMode && allocation < minLiveNotional && currentBalance >= minLiveNotional) {
+          if (isRealMode && allocation < minLiveNotional && tradableCapital >= minLiveNotional) {
             allocation = minLiveNotional;
           }
 
@@ -388,6 +395,11 @@ export default function App() {
           return;
         }
 
+        const requestedPositionSide: 'LONG' | 'SHORT' = closingExisting
+          ? (heldSide === 'SHORT' ? 'SHORT' : 'LONG')
+          : (openingShort ? 'SHORT' : 'LONG');
+        const reduceOnly = closingExisting;
+
         const resp = await fetch('/api/binance/order', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -395,7 +407,9 @@ export default function App() {
             symbol: tradeSymbol,
             side: type,
             type: 'MARKET',
-            amount: amount > 0 ? amount : undefined
+            amount: amount > 0 ? amount : undefined,
+            positionSide: requestedPositionSide,
+            reduceOnly,
           })
         });
 
@@ -436,6 +450,7 @@ export default function App() {
           }
 
           addLog(`REAL ${type} SUCCESS: ${tradeSymbol}`, 'success');
+          setExecutionFeedback({ type: 'success', message: `${type} confirmed on exchange for ${tradeSymbol}.` });
           setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 5) }));
           setTimeout(syncRealBalance, 1500); 
         } else {
@@ -447,6 +462,7 @@ export default function App() {
 
         if (softSkip) {
           addLog(`REAL ${type} SKIPPED: ${msg}`, 'warning');
+          setExecutionFeedback({ type: 'warning', message: `${type} skipped for ${tradeSymbol}: ${msg}` });
           pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${msg}`, status: 'SKIPPED', cycleId: eventCycleId });
           setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 2) }));
           return;
@@ -473,6 +489,7 @@ export default function App() {
 
         if (verified) {
           addLog(`REAL ${type} VERIFIED: ${tradeSymbol} (post-error exchange state confirms fill)`, 'success');
+          setExecutionFeedback({ type: 'success', message: `${type} verified for ${tradeSymbol} after exchange resync.` });
           pushTradeEvent({
             type,
             symbol: tradeSymbol,
@@ -488,6 +505,7 @@ export default function App() {
         }
 
         addLog(`REAL ${type} FAILED: ${msg}`, 'warning');
+  setExecutionFeedback({ type: 'warning', message: `${type} failed for ${tradeSymbol}: ${msg}` });
         pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `FAILED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
         setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 2) }));
         return;
@@ -522,6 +540,7 @@ export default function App() {
         setHoldings(prev => [...prev, { id: holdingId, symbol: tradeSymbol, amount, side: 'LONG', entryPrice: price, time }]);
         pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason, status: 'FILLED', cycleId: eventCycleId });
         addLog(`PAPER BUY: ${tradeSymbol} @ $${price} [${reason}]`, 'success');
+        setExecutionFeedback({ type: 'success', message: `Paper BUY filled for ${tradeSymbol}.` });
       } else {
         // If targetId is provided, close ONLY that one. Otherwise close ALL for this symbol.
         const holdingsToClose = targetId 
@@ -579,6 +598,7 @@ export default function App() {
           });
           
           addLog(`PAPER SELL: ${tradeSymbol} @ $${price} | P&L: ${pnlPct.toFixed(2)}% [${reason}]`, pnl >= 0 ? 'success' : 'warning');
+          setExecutionFeedback({ type: 'success', message: `Paper SELL filled for ${tradeSymbol}.` });
         }
       }
     }
@@ -742,25 +762,35 @@ export default function App() {
         return validSuffixes.test(up) && up.length < 20 && !/[^A-Z0-9]/.test(up);
       };
       const isLiveBinance = isRealMode && serverConfig?.exchange === 'binance';
-      if (isLiveBinance && marketPicks.length > 0) {
-        const beforeFilter = marketPicks.length;
-        marketPicks = marketPicks.filter(p => isLikelyBinanceFuturesSymbol(p.symbol));
-        if (marketPicks.length < beforeFilter) {
-          console.log(`[Scanner] Filtered ${beforeFilter - marketPicks.length} non-futures symbols`);
-        }
-      }
       const baseSymbol = isRealMode ? liveNormalized(symbol) : symbol;
       const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
-      const symbolsToScan = Array.from(new Set([baseSymbol, ...candidateValues]));
+      let symbolsToScan = Array.from(new Set([baseSymbol, ...candidateValues]));
+
+      if (isLiveBinance) {
+        const beforeFilter = symbolsToScan.length;
+        symbolsToScan = symbolsToScan.filter(v => hasAllowedQuote(v) && isLikelyBinanceFuturesSymbol(v));
+        if (symbolsToScan.length < beforeFilter) {
+          console.log(`[Scanner] Filtered ${beforeFilter - symbolsToScan.length} non-futures symbols from scan universe`);
+        }
+      }
+
+      if (symbolsToScan.length === 0) {
+        setScanProgress({ current: 0, total: 0 });
+        addLog('Scanner idle: no symbols available to scan.', 'warning');
+        return;
+      }
       
-      setScanProgress({ current: 0, total: symbolsToScan.length });
+      const totalToScan = symbolsToScan.length;
+      setScanProgress({ current: 0, total: totalToScan });
       
       let lastLoggedCount = 0;
       const results = await scanMarket(symbolsToScan, (current, total) => {
-        setScanProgress({ current, total });
+        const safeTotal = total > 0 ? total : totalToScan;
+        const safeCurrent = Math.min(Math.max(current, 0), safeTotal);
+        setScanProgress({ current: safeCurrent, total: safeTotal });
         // Log every 50 assets to keep "pulse" visible
-        if (current >= lastLoggedCount + 50 || current === total) {
-          lastLoggedCount = current;
+        if (safeCurrent >= lastLoggedCount + 50 || safeCurrent === safeTotal) {
+          lastLoggedCount = safeCurrent;
         }
       });
 
@@ -1035,6 +1065,11 @@ export default function App() {
     return sum + (move * h.amount);
   }, 0);
   const displayedUnrealizedRisk = isRealMode ? liveUnrealizedPnl : unrealizedRisk;
+  const scanDisplayTotal = scanProgress.total > 0 ? scanProgress.total : availableSymbols.length;
+  const scanProgressPct = scanProgress.total > 0
+    ? Math.min(100, Math.max(0, (scanProgress.current / scanProgress.total) * 100))
+    : 0;
+  const isScanPreparing = scanning && scanProgress.total === 0;
   
   // Anti-Glitich: If equity is non-finite or impossible, it's a data core issue
   // We cap at $100,000,000 to allow "Whale" mode while still blocking glitches
@@ -1042,6 +1077,9 @@ export default function App() {
   
   const pnl = equity - benchmarkCapital;
   const pnlPercent = benchmarkCapital > 0 ? (pnl / benchmarkCapital) * 100 : 0;
+  const totalPnl = pnl;
+  const openPnl = displayedUnrealizedRisk;
+  const realizedPnl = totalPnl - openPnl;
   const investedPct = equity > 0 ? (totalInvested / equity) * 100 : 0;
   const displayedAvailableFunds = isRealMode ? availableFunds : balance;
 
@@ -1192,7 +1230,9 @@ export default function App() {
                 </h2>
                 <span className="text-[8px] font-mono mt-1 uppercase opacity-40">
                   {scanning
-                    ? `Scanner Active: ${scanProgress.current} / ${scanProgress.total} Assets`
+                    ? (isScanPreparing
+                      ? `Scanner Active: Preparing ${scanDisplayTotal} Assets`
+                      : `Scanner Active: ${scanProgress.current} / ${scanProgress.total} Assets`)
                     : `Scanner Online: Monitoring ${availableSymbols.length} Assets`}
                 </span>
               </div>
@@ -1211,12 +1251,12 @@ export default function App() {
             <div className="mt-3 mb-4">
               <div className="flex justify-between text-[8px] font-mono uppercase opacity-50 mb-1">
                 <span>{scanning ? 'Scan Progress' : 'Idle'}</span>
-                <span>{scanning ? `${scanProgress.current}/${scanProgress.total} scanned (${scanProgress.total > 0 ? Math.round((scanProgress.current / scanProgress.total) * 100) : 0}%)` : `${availableSymbols.length} assets`}</span>
+                <span>{scanning ? (isScanPreparing ? `Preparing scan...` : `${scanProgress.current}/${scanProgress.total} scanned (${Math.round(scanProgressPct)}%)`) : `${availableSymbols.length} assets`}</span>
               </div>
               <div className="h-1 w-full bg-gray-100 rounded-full overflow-hidden">
                 <div
                   className="h-full bg-[#F27D26]"
-                  style={{ width: scanning ? `${scanProgress.total > 0 ? (scanProgress.current / scanProgress.total) * 100 : 0}%` : `${Math.min(100, Math.max(0, availableSymbols.length > 0 ? 100 : 0))}%` }}
+                  style={{ width: scanning ? `${isScanPreparing ? 8 : scanProgressPct}%` : `${Math.min(100, Math.max(0, availableSymbols.length > 0 ? 100 : 0))}%` }}
                 />
               </div>
             </div>
@@ -1668,6 +1708,25 @@ export default function App() {
           </div>
 
           {/* Metrics Dashboard */}
+          {executionFeedback && (
+            <section className={`mb-6 border-2 px-4 py-3 text-[10px] font-mono uppercase tracking-wider ${
+              executionFeedback.type === 'success'
+                ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
+                : executionFeedback.type === 'warning'
+                  ? 'bg-amber-50 border-amber-300 text-amber-800'
+                  : 'bg-sky-50 border-sky-300 text-sky-800'
+            }`}>
+              <div className="flex items-center justify-between gap-3">
+                <span>{executionFeedback.message}</span>
+                <button
+                  onClick={() => setExecutionFeedback(null)}
+                  className="text-[9px] font-black opacity-60 hover:opacity-100"
+                >
+                  DISMISS
+                </button>
+              </div>
+            </section>
+          )}
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
             <MetricBox 
               icon={<Wallet className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
@@ -1688,10 +1747,17 @@ export default function App() {
             />
             <MetricBox 
               icon={<TrendingUp className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
-              label="Total Performance"
-              value={`${pnl >= 0 ? '+' : ''}${pnl.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-              trend={pnl >= 0 ? 'up' : 'down'}
-              subValue={`${pnlPercent.toFixed(2)}% ROE`}
+              label="Current P&L"
+              value={`${openPnl >= 0 ? '+' : '-'}$${Math.abs(openPnl).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+              trend={openPnl >= 0 ? 'up' : 'down'}
+              subValue="Unrealized (Open Positions)"
+            />
+            <MetricBox 
+              icon={<DollarSign className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
+              label="Total P&L"
+              value={`${totalPnl >= 0 ? '+' : ''}$${Math.abs(totalPnl).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+              trend={totalPnl >= 0 ? 'up' : 'down'}
+              subValue={`Realized: ${realizedPnl >= 0 ? '+' : '-'}$${Math.abs(realizedPnl).toFixed(2)} | Open: ${openPnl >= 0 ? '+' : '-'}$${Math.abs(openPnl).toFixed(2)}`}
             />
             <MetricBox 
               icon={<Activity className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
@@ -1876,6 +1942,37 @@ export default function App() {
                         )}
                       </tbody>
                    </table>
+                </div>
+             </section>
+
+             <section className="bg-white border-2 border-[#141414] shadow-[8px_8px_0px_0px_#141414] overflow-hidden flex flex-col h-[400px]">
+                <div className="bg-gray-50 border-b border-[#141414]/10 p-4 flex items-center justify-between">
+                   <div className="flex items-center gap-2">
+                     <Activity size={14} className="opacity-40" />
+                     <h3 className="font-mono text-[10px] uppercase tracking-widest font-bold">Command Logs</h3>
+                   </div>
+                   <button onClick={() => setSystemLogs([])} className="text-[9px] font-bold opacity-30 hover:opacity-100 uppercase transition-opacity">Clear All</button>
+                </div>
+                <div className="flex-grow overflow-y-auto custom-scrollbar p-3 space-y-2">
+                  {systemLogs.length === 0 ? (
+                    <div className="h-full flex items-center justify-center text-[10px] opacity-30 italic">No command logs yet.</div>
+                  ) : (
+                    systemLogs.map((log, i) => (
+                      <div key={i} className={`border px-3 py-2 text-[10px] font-mono ${
+                        log.type === 'success'
+                          ? 'border-emerald-200 bg-emerald-50/60 text-emerald-900'
+                          : log.type === 'warning'
+                            ? 'border-amber-200 bg-amber-50/60 text-amber-900'
+                            : 'border-gray-200 bg-gray-50/60 text-gray-800'
+                      }`}>
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="font-black uppercase opacity-70">{log.type}</span>
+                          <span className="opacity-50">{log.time}</span>
+                        </div>
+                        <div className="leading-relaxed">{log.message}</div>
+                      </div>
+                    ))
+                  )}
                 </div>
              </section>
 

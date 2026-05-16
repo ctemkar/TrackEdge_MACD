@@ -420,7 +420,7 @@ async function startServer() {
         throw new Error('REAL TRADING DISABLED: Set ENABLE_REAL_TRADING=true.');
       }
 
-      const { symbol, side, amount } = req.body;
+      const { symbol, side, amount, positionSide, reduceOnly } = req.body;
       const client = getExchange();
       
       let ccxtSymbol = symbol.toUpperCase();
@@ -561,11 +561,40 @@ async function startServer() {
             throw new Error(`ORDER SIZE UNDERFLOW: ${ccxtSymbol} size invalid after precision/limits`);
           }
 
-          order = await client.createMarketOrder(
-            ccxtSymbol, 
-            side.toLowerCase(), 
-            finalAmount
-          );
+          const requestedPositionSide = String(positionSide || '').toUpperCase();
+          const validPositionSide = requestedPositionSide === 'LONG' || requestedPositionSide === 'SHORT'
+            ? requestedPositionSide
+            : undefined;
+          const wantsReduceOnly = reduceOnly === true;
+
+          const orderParams: Record<string, any> = {};
+          if (validPositionSide) orderParams.positionSide = validPositionSide;
+          if (wantsReduceOnly) orderParams.reduceOnly = true;
+
+          const submitMarketOrder = async (params: Record<string, any>) => {
+            return await client.createMarketOrder(
+              ccxtSymbol,
+              side.toLowerCase(),
+              finalAmount,
+              params
+            );
+          };
+
+          try {
+            order = await submitMarketOrder(orderParams);
+          } catch (primaryErr: any) {
+            const primaryMsg = String(primaryErr?.message || '');
+            const isPositionModeMismatch = /position side does not match|positionSide|hedge mode/i.test(primaryMsg);
+
+            if (isPositionModeMismatch && orderParams.positionSide) {
+              // Retry once for one-way mode accounts that reject LONG/SHORT positionSide.
+              const retryParams = { ...orderParams };
+              delete retryParams.positionSide;
+              order = await submitMarketOrder(retryParams);
+            } else {
+              throw primaryErr;
+            }
+          }
       }
       
       res.json({ status: 'success', order });
