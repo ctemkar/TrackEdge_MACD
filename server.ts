@@ -504,9 +504,6 @@ async function startServer() {
       let totalUnrealizedPnl = 0;
 
       if (client.id === 'binance') {
-        let authFailureDetected = false;
-        let authFailureReason = '';
-
         const upsertPosition = (input: any) => {
           const rawAmt = Number(input?.contracts ?? input?.positionAmt ?? input?.info?.positionAmt ?? 0);
           const contracts = Math.abs(rawAmt);
@@ -573,10 +570,6 @@ async function startServer() {
         if (binanceKey && binanceSecret) {
           const httpPositionResult = await fetchBinancePositionsViaHttp(binanceKey, binanceSecret);
           const httpPositions = httpPositionResult.positions;
-          if (httpPositionResult.authError) {
-            authFailureDetected = true;
-            authFailureReason = httpPositionResult.message || 'Binance futures positionRisk authentication failed (-2015).';
-          }
           if (httpPositions.length > 0) {
             console.log(`[TradeEdge Sync] Successfully fetched ${httpPositions.length} positions via direct HTTP API`);
             httpPositions.forEach(upsertPosition);
@@ -642,10 +635,6 @@ async function startServer() {
             }
           } catch (e: any) {
             console.warn(`[TradeEdge Sync] fetchPositions failed: ${e?.message || 'unknown error'}`);
-            if (isBinanceAuthErrorMessage(String(e?.message || ''))) {
-              authFailureDetected = true;
-              authFailureReason = String(e?.message || authFailureReason || 'Binance futures permissions failed while fetching positions.');
-            }
           }
         }
 
@@ -670,26 +659,8 @@ async function startServer() {
               }
             } catch (e: any) {
               console.warn(`[TradeEdge Sync] ${name} failed: ${e?.message || 'unknown error'}`);
-              if (isBinanceAuthErrorMessage(String(e?.message || ''))) {
-                authFailureDetected = true;
-                authFailureReason = String(e?.message || authFailureReason || 'Binance futures permissions failed while reading position risk.');
-              }
             }
           }
-        }
-
-        if (authFailureDetected) {
-          rateLimitState.authFailCount += 1;
-          const blockMs = Math.min(rateLimitState.authFailCount * 2 * 60 * 1000, MAX_AUTH_BLOCK_MS);
-          rateLimitState.authBlockedUntil = Date.now() + blockMs;
-          const retryAt = new Date(rateLimitState.authBlockedUntil).toISOString();
-          console.error(`[TradeEdge Auth] Binance futures auth/permission failure detected. Blocking live sync until ${retryAt}.`);
-          return res.status(401).json({
-            status: 'auth_failed',
-            message: authFailureReason || 'Binance futures API key is invalid or missing required permissions (-2015).',
-            blockedUntil: rateLimitState.authBlockedUntil,
-            retryAfterMs: blockMs,
-          });
         }
         
         if (!positionsFetched && Object.keys(allPositions).length === 0) {
