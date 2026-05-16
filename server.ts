@@ -16,28 +16,46 @@ async function startServer() {
 
   // Exchange Client (Lazy Init)
   let exchangeInstance: ccxt.Exchange | null = null;
-  const hasConfiguredKeys = () => !!((process.env.BINANCE_API_KEY && process.env.BINANCE_API_SECRET) || (process.env.GEMINI_LIVE_API_KEY && process.env.GEMINI_LIVE_API_SECRET) || (process.env.GEMINI_API_KEY && process.env.GEMINI_API_SECRET));
-  const preferGemini = () => process.env.EXCHANGE === 'gemini';
+  const hasConfiguredKeys = () => !!(
+    (process.env.BINANCE_API_KEY && process.env.BINANCE_API_SECRET) ||
+    (process.env.BINANCE_KEY && process.env.BINANCE_SECRET) ||
+    (process.env.GEMINI_LIVE_API_KEY && process.env.GEMINI_LIVE_API_SECRET) ||
+    (process.env.GEMINI_API_KEY && process.env.GEMINI_API_SECRET) ||
+    (process.env.GEMINI_KEY && process.env.GEMINI_SECRET)
+  );
+  const preferGemini = () => (process.env.EXCHANGE || '').toLowerCase() === 'gemini';
   const getExchange = () => {
     if (!exchangeInstance) {
-      const bKey = (process.env.BINANCE_API_KEY || '').trim();
-      const bSecret = (process.env.BINANCE_API_SECRET || '').trim();
-      const gKey = (process.env.GEMINI_LIVE_API_KEY || process.env.GEMINI_API_KEY || '').trim();
-      const gSecret = (process.env.GEMINI_LIVE_API_SECRET || process.env.GEMINI_API_SECRET || '').trim();
+      const bKey = (process.env.BINANCE_API_KEY || process.env.BINANCE_KEY || '').trim();
+      const bSecret = (process.env.BINANCE_API_SECRET || process.env.BINANCE_SECRET || '').trim();
+      const gKey = (process.env.GEMINI_LIVE_API_KEY || process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '').trim();
+      const gSecret = (process.env.GEMINI_LIVE_API_SECRET || process.env.GEMINI_API_SECRET || process.env.GEMINI_SECRET || '').trim();
 
       // Signature of Gemini v1 API keys is starting with 'account-'
       const isGeminiKey = (k: string) => k.toLowerCase().startsWith('account-');
       
-      const hasGemini = gKey.length > 5 || isGeminiKey(gKey) || isGeminiKey(bKey);
-      const forceGemini = process.env.EXCHANGE === 'gemini';
-      
-      const useGemini = forceGemini || hasGemini;
+      const hasBinanceCreds = bKey.length > 5 && bSecret.length > 5;
+      const hasGeminiCreds = gKey.length > 5 && gSecret.length > 5;
+      const exchangePreference = (process.env.EXCHANGE || '').toLowerCase();
+
+      // Selection order:
+      // 1) Explicit EXCHANGE env var.
+      // 2) Default to Binance when both are available.
+      // 3) Fallback to Gemini only when Binance is not configured.
+      let useGemini = false;
+      if (exchangePreference === 'gemini') {
+        useGemini = true;
+      } else if (exchangePreference === 'binance') {
+        useGemini = false;
+      } else {
+        useGemini = !hasBinanceCreds && hasGeminiCreds;
+      }
       
       const apiKey = useGemini ? (isGeminiKey(gKey) || gKey.length > 5 ? gKey : bKey) : bKey;
       const secret = useGemini ? (isGeminiKey(gKey) || gKey.length > 5 ? gSecret : bSecret) : bSecret;
       
       if (!apiKey || !secret || apiKey.length < 5) {
-        throw new Error('Valid Exchange API Keys required. Add BINANCE_API_KEY/SECRET or GEMINI_LIVE_API_KEY/SECRET in Settings.');
+        throw new Error('Valid Exchange API Keys required. Add BINANCE_KEY/SECRET, BINANCE_API_KEY/SECRET, GEMINI_KEY/SECRET, or GEMINI_LIVE_API_KEY/SECRET in .env.');
       }
 
       if (useGemini) {
@@ -112,7 +130,13 @@ async function startServer() {
       outboundIp,
       config: {
         realTradingEnabled: process.env.ENABLE_REAL_TRADING === 'true',
-        hasKeys: !!((process.env.BINANCE_API_KEY && process.env.BINANCE_API_SECRET) || (process.env.GEMINI_LIVE_API_KEY && process.env.GEMINI_LIVE_API_SECRET) || (process.env.GEMINI_API_KEY && process.env.GEMINI_API_SECRET))
+        hasKeys: !!(
+          (process.env.BINANCE_API_KEY && process.env.BINANCE_API_SECRET) ||
+          (process.env.BINANCE_KEY && process.env.BINANCE_SECRET) ||
+          (process.env.GEMINI_LIVE_API_KEY && process.env.GEMINI_LIVE_API_SECRET) ||
+          (process.env.GEMINI_API_KEY && process.env.GEMINI_API_SECRET) ||
+          (process.env.GEMINI_KEY && process.env.GEMINI_SECRET)
+        )
       }
     });
   });
