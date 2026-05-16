@@ -514,7 +514,6 @@ export default function App() {
     scanningRef.current = true;
     setScanning(true);
     setIsBotActive(true);
-    addLog('PROTOCOL SCAN: Evaluating market vectors for high-probability entries...', 'info');
     try {
       setScanProgress({ current: 0, total: 1 }); // Initial state to show bar
       const allSymbols = await fetchAllSymbols();
@@ -522,7 +521,6 @@ export default function App() {
       const symbolsToScan = Array.from(new Set([symbol, ...allValues])); // Removed slice to allow all assets (e.g. 750+) to be scanned
       
       setScanProgress({ current: 0, total: symbolsToScan.length });
-      addLog(`PROTOCOL SCAN: Evaluating ${symbolsToScan.length} market nodes...`, 'info');
       
       let lastLoggedCount = 0;
       const results = await scanMarket(symbolsToScan, (current, total) => {
@@ -532,9 +530,6 @@ export default function App() {
           lastLoggedCount = current;
         }
       });
-
-      const scanSummary = results.filter(r => r.signal.score >= 7).length;
-      addLog(`SCAN COMPLETE: Verified ${results.length} nodes. Found ${scanSummary} entries meeting threshold (Score 7+).`, 'success');
 
       setMarketPicks(results);
       // Wait a moment before resetting progress to let the user see "Complete" in the UI
@@ -551,21 +546,19 @@ export default function App() {
             const price = scanResult.lastPrice;
             const slTrigger = price <= holding.entryPrice * (1 - stopLossPercent / 100);
             const tpTrigger = price >= holding.entryPrice * (1 + takeProfitPercent / 100);
-            const strategyExit = scanResult.signal.overall === 'SELL';
 
             if (slTrigger) {
               executeTrade('SELL', holding.symbol, price, 'AUTO_EXIT: PORTFOLIO STOP LOSS');
             } else if (tpTrigger) {
               executeTrade('SELL', holding.symbol, price, 'AUTO_EXIT: PORTFOLIO TAKE PROFIT');
             }
-            // Removed aggressive strategyExit flip to respect user's 15%/5% TP/SL preference
           }
         });
       }
 
       if (currentAutoTrade) {
         const potentialBuys = results
-          .filter(r => r.signal.overall === 'BUY' && r.signal.score >= 7) // Increased to 7 but added feedback
+          .filter(r => r.signal.overall === 'BUY' && r.signal.score >= 7)
           .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
           .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now());
 
@@ -575,14 +568,9 @@ export default function App() {
           
           if (toBuy.length > 0) {
             toBuy.forEach(pick => {
-              addLog(`AUTONOMOUS ENGAGEMENT: Targeting ${pick.symbol} (Signal Confidence: ${pick.signal.score}/10)`, 'success');
               executeTrade('BUY', pick.symbol, pick.lastPrice, `AI DISCOVERY: CONFIDENCE ${pick.signal.score}/10`);
             });
-          } else if (results.length > 0) {
-             addLog("SCAN SUMMARY: Market pulse weak. No entry vectors meeting required strategy threshold (Score 7+).", 'info');
           }
-        } else {
-          addLog(`SYSTEM FULL: Autonomous engine paused. Active Slots: ${currentHoldings.length}/${currentMaxTrades}. Increase 'Capital Concentration' slider to unlock more parallel trades.`, 'info');
         }
       }
     } catch (error) {
@@ -680,8 +668,6 @@ export default function App() {
             const lastPrice = candles[candles.length - 1].close;
             const prevPrice = holdingPrices[h.symbol] || h.entryPrice;
             
-            // Sanity Check: Reject 0 or impossible swings
-            // If prevPrice is the default placeholder <= 1, we allow the jump to reality
             const priceDelta = prevPrice > 1 ? Math.abs((lastPrice - prevPrice) / prevPrice) : 0;
             
             if (lastPrice > 0 && isFinite(lastPrice) && (priceDelta < 3.0 || prevPrice <= 1)) {
@@ -700,11 +686,11 @@ export default function App() {
       }
     };
 
-    const interval = setInterval(pollHoldingPrices, 3000); // 3-second live tick for portfolio
+    const interval = setInterval(pollHoldingPrices, 3000);
     pollHoldingPrices();
 
     return () => clearInterval(interval);
-  }, [holdings.length]); // Re-run poll when number of holdings changes
+  }, [holdings.length]);
 
   useEffect(() => {
     if (holdings.length > 0) {
@@ -767,23 +753,19 @@ export default function App() {
     }
   }, [isDataBroken]);
 
-  if (loading && data.length === 0) {
-    return (
-      <div className="min-h-screen bg-[#141414] text-[#E4E3E0] flex items-center justify-center font-mono">
-        <div className="flex flex-col items-center gap-4">
-          <Activity className="animate-spin text-[#F27D26]" size={48} />
-          <p className="text-sm tracking-widest uppercase opacity-50">Calibrating Indicators...</p>
-        </div>
-      </div>
-    );
-  }
+  const showInitialLoading = loading && data.length === 0;
 
   return (
-    <div className="min-h-screen bg-[#E4E3E0] text-[#141414] p-4 md:p-8 font-sans selection:bg-[#F27D26] selection:text-white">
+    <div className="min-h-screen bg-[#E4E3E0] text-[#141414] p-4 md:p-8 font-sans selection:bg-[#F27D26] selection:text-white overflow-x-hidden">
+      {showInitialLoading && (
+        <div className="max-w-7xl mx-auto mb-4 flex items-center gap-3 rounded-sm border border-[#141414]/10 bg-white/60 px-4 py-2 font-mono text-[10px] uppercase tracking-[0.25em] opacity-70">
+          <Activity size={14} className="text-[#F27D26]" />
+          Calibrating indicators...
+        </div>
+      )}
       <header className="max-w-7xl mx-auto mb-8 flex flex-col md:flex-row md:items-end justify-between gap-4 border-b border-[#141414] pb-4">
         <div className="flex flex-col">
           <div className="flex items-center gap-2 mb-1">
-            <span className={`w-3 h-3 rounded-full ${isRealMode ? 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.6)]' : 'bg-[#F27D26]'}`} />
             <p className="text-[10px] font-mono uppercase tracking-[0.2em] opacity-60">
               {isRealMode ? 'LIVE FUTURES ACCOUNT ACTIVE' : 'PAPER TRADING ENGINE ACTIVE'}
             </p>
@@ -811,7 +793,7 @@ export default function App() {
                   disabled={isSyncing}
                   className={`px-4 py-1.5 text-[10px] font-black uppercase tracking-tighter transition-all flex items-center gap-2 ${isRealMode ? 'bg-rose-600 text-white shadow-lg' : 'text-white/40 hover:text-white'} ${isSyncing ? 'opacity-50 cursor-wait' : ''}`}
                 >
-                  {isSyncing ? <Loader2 size={10} className="animate-spin" /> : null}
+                  {isSyncing ? <Loader2 size={10} className="opacity-60" /> : null}
                   Live Futures
                 </button>
              </div>
@@ -912,26 +894,20 @@ export default function App() {
                   <Search size={14} className="text-[#F27D26]" />
                   Market Protocol
                 </h2>
-                <span className={`text-[8px] font-mono mt-1 uppercase transition-all duration-300 ${scanning ? 'text-[#F27D26] font-black' : 'opacity-40'}`}>
-                  {scanning ? (
-                    <span className="flex items-center gap-1">
-                      <span className="relative flex h-1.5 w-1.5 align-middle">
-                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#F27D26] opacity-75"></span>
-                        <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-[#F27D26]"></span>
-                      </span>
-                      MAPPING VECTORS: {scanProgress.current} / {scanProgress.total}
-                    </span>
-                  ) : `Scanner IDLE: Monitoring ${availableSymbols.length} Assets`}
+                <span className="text-[8px] font-mono mt-1 uppercase opacity-40">
+                  {scanning
+                    ? `Scanner Active: ${scanProgress.current} / ${scanProgress.total}`
+                    : `Scanner IDLE: Monitoring ${availableSymbols.length} Assets`}
                 </span>
               </div>
               <div className="flex items-center gap-2">
-                <span className="text-[9px] font-mono opacity-40">T-{nextScanSec}s</span>
+                <span className="text-[9px] font-mono opacity-40">Auto scan ready</span>
                 <button 
                   onClick={performScan} 
-                  className="hover:rotate-180 transition-transform duration-500 cursor-pointer"
+                  className="cursor-pointer"
                   disabled={scanning}
                 >
-                  {scanning ? <Loader2 size={14} className="animate-spin text-[#F27D26]" /> : <Zap size={14} className="text-[#F27D26]" />}
+                  <Zap size={14} className="text-[#F27D26]" />
                 </button>
               </div>
             </div>
@@ -996,7 +972,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className="mt-8 pt-6 border-t border-dashed border-[#141414]/20">
+            <div className="hidden mt-8 pt-6 border-t border-dashed border-[#141414]/20">
               {/* System Protocol Logs */}
               <div className="mt-4 bg-[#141414] p-3 rounded-sm">
                 <div className="flex justify-between items-center mb-2">
@@ -1234,7 +1210,7 @@ export default function App() {
                   )}
 
                     {syncError && (
-                      <div className="mb-4 p-3 bg-rose-600/20 border-2 border-rose-600 rounded-sm relative animate-pulse">
+                      <div className="mb-4 p-3 bg-rose-600/20 border-2 border-rose-600 rounded-sm relative">
                         <button 
                           onClick={() => setSyncError(null)}
                           className="absolute top-1 right-1 text-white/40 hover:text-white"
@@ -1324,7 +1300,7 @@ export default function App() {
              {scanning ? (
                <div className="flex items-center gap-6 relative z-10 w-full">
                   <div className="flex items-center gap-3">
-                    <Loader2 size={16} className="animate-spin text-[#F27D26]" />
+                    <Loader2 size={16} className="text-[#F27D26] opacity-30" />
                     <div className="flex flex-col">
                       <span className="text-[10px] font-black uppercase tracking-widest text-[#F27D26]">Scanner Active</span>
                       <span className="text-[8px] font-mono opacity-40 uppercase">Mapping Market Vectors...</span>
@@ -1336,10 +1312,9 @@ export default function App() {
                         <span>{Math.round((scanProgress.current / (scanProgress.total || 1)) * 100)}%</span>
                      </div>
                      <div className="w-full bg-white/10 h-1 rounded-full overflow-hidden">
-                        <motion.div 
-                          className="h-full bg-[#F27D26] shadow-[0_0_10px_#F27D26]"
-                          initial={{ width: 0 }}
-                          animate={{ width: `${(scanProgress.current / (scanProgress.total || 1)) * 100}%` }}
+                        <div
+                          className="h-full bg-[#F27D26]"
+                          style={{ width: `${(scanProgress.current / (scanProgress.total || 1)) * 100}%` }}
                         />
                      </div>
                   </div>
@@ -1510,7 +1485,7 @@ export default function App() {
                         <tr key={i} className="hover:bg-gray-50/50 transition-colors group cursor-pointer" onClick={() => setSymbol(h.symbol)}>
                           <td className="px-6 py-5">
                              <div className="flex items-center gap-2">
-                               <div className={`w-1.5 h-1.5 rounded-full ${h.symbol === symbol ? 'bg-[#F27D26] animate-pulse' : 'bg-gray-300'}`} />
+                               <div className={`w-1.5 h-1.5 rounded-full ${h.symbol === symbol ? 'bg-[#F27D26]' : 'bg-gray-300'}`} />
                                <span className="font-black text-sm uppercase tracking-tighter">{h.symbol.replace('USDT', '').replace('USD', '')}</span>
                              </div>
                           </td>
@@ -1605,32 +1580,6 @@ export default function App() {
                 </div>
              </section>
 
-             <section className="bg-[#141414] text-white p-6 shadow-xl relative overflow-hidden flex flex-col h-[400px]">
-                <div className="absolute top-0 right-0 p-4 opacity-5">
-                  <Activity size={100} strokeWidth={1} />
-                </div>
-                <div className="relative z-10 flex flex-col h-full">
-                  <h3 className="font-mono text-[10px] uppercase tracking-widest font-bold mb-4 border-b border-white/10 pb-2 flex items-center justify-between">
-                    System Protocol Logs
-                    <button onClick={() => setSystemLogs([])} className="text-[8px] opacity-40 hover:opacity-100">CLEAR</button>
-                  </h3>
-                  <div className="flex-grow overflow-y-auto custom-scrollbar space-y-2 pr-2">
-                    {systemLogs.length === 0 ? (
-                      <p className="text-[10px] font-mono opacity-30 italic">Awaiting telemetry...</p>
-                    ) : (
-                      systemLogs.map((log, i) => (
-                        <div key={i} className="text-[10px] font-mono border-l border-white/10 pl-3 py-0.5">
-                          <span className="opacity-30 mr-2">[{log.time}]</span>
-                          <span className={
-                            log.type === 'success' ? 'text-emerald-400' :
-                            log.type === 'warning' ? 'text-rose-400' : 'text-white/70'
-                          }>{log.message}</span>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </div>
-             </section>
           </div>
         </div>
       </div>
@@ -1648,10 +1597,7 @@ export default function App() {
       <footer className="max-w-7xl mx-auto mt-16 pt-8 border-t border-[#141414]/10 text-[10px] font-mono uppercase tracking-[0.4em] opacity-40 flex justify-between">
         <span>© 2026 TradeEdge Laboratory // Enterprise Core</span>
         <div className="flex items-center gap-4">
-          <span className="flex items-center gap-2">
-            <div className={`w-1.5 h-1.5 rounded-full ${serverStatus === 'OK' ? 'bg-emerald-500 shadow-[0_0_5px_#10b981]' : serverStatus === 'ERROR' ? 'bg-rose-500 shadow-[0_0_5px_#f43f5e]' : 'bg-gray-500'}`} />
-            BACKEND: {serverStatus}
-          </span>
+          <span>BACKEND: {serverStatus}</span>
           <span>Secure Ingress // Latency 14ms</span>
         </div>
       </footer>
