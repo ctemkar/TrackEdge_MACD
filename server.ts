@@ -18,6 +18,7 @@ async function startServer() {
   let exchangeInstance: ccxt.Exchange | null = null;
   const hasConfiguredKeys = () => !!(
     (process.env.BINANCE_API_KEY && process.env.BINANCE_API_SECRET) ||
+    (process.env.BINANCE_LIVE_API_KEY && process.env.BINANCE_LIVE_API_SECRET) ||
     (process.env.BINANCE_KEY && process.env.BINANCE_SECRET) ||
     (process.env.GEMINI_LIVE_API_KEY && process.env.GEMINI_LIVE_API_SECRET) ||
     (process.env.GEMINI_API_KEY && process.env.GEMINI_API_SECRET) ||
@@ -26,8 +27,8 @@ async function startServer() {
   const preferGemini = () => (process.env.EXCHANGE || '').toLowerCase() === 'gemini';
   const getExchange = () => {
     if (!exchangeInstance) {
-      const bKey = (process.env.BINANCE_API_KEY || process.env.BINANCE_KEY || '').trim();
-      const bSecret = (process.env.BINANCE_API_SECRET || process.env.BINANCE_SECRET || '').trim();
+      const bKey = (process.env.BINANCE_LIVE_API_KEY || process.env.BINANCE_API_KEY || process.env.BINANCE_KEY || '').trim();
+      const bSecret = (process.env.BINANCE_LIVE_API_SECRET || process.env.BINANCE_API_SECRET || process.env.BINANCE_SECRET || '').trim();
       const gKey = (process.env.GEMINI_LIVE_API_KEY || process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '').trim();
       const gSecret = (process.env.GEMINI_LIVE_API_SECRET || process.env.GEMINI_API_SECRET || process.env.GEMINI_SECRET || '').trim();
 
@@ -73,7 +74,8 @@ async function startServer() {
            enableRateLimit: true,
            options: { 
              defaultType: 'future',
-             adjustForTimeDifference: true 
+             adjustForTimeDifference: true,
+             portfolioMargin: true
            }
          });
       }
@@ -132,6 +134,7 @@ async function startServer() {
         realTradingEnabled: process.env.ENABLE_REAL_TRADING === 'true',
         hasKeys: !!(
           (process.env.BINANCE_API_KEY && process.env.BINANCE_API_SECRET) ||
+          (process.env.BINANCE_LIVE_API_KEY && process.env.BINANCE_LIVE_API_SECRET) ||
           (process.env.BINANCE_KEY && process.env.BINANCE_SECRET) ||
           (process.env.GEMINI_LIVE_API_KEY && process.env.GEMINI_LIVE_API_SECRET) ||
           (process.env.GEMINI_API_KEY && process.env.GEMINI_API_SECRET) ||
