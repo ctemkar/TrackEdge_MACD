@@ -1,0 +1,6 @@
+{
+  "name": "Remix: TradeEdge Lab",
+  "description": "Professional crypto trading dashboard with trend-following strategy, volume confirmation, and a dedicated strategy backtesting engine (Strategy Lab).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
