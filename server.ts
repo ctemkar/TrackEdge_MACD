@@ -231,7 +231,20 @@ async function startServer() {
       let cashTotal = 0;
       let portfolioMarginEquity: number | null = null;
       let uiAvailableBalance: number | null = null;
-      const allPositions: Record<string, { amount: number, total: number, side?: 'LONG' | 'SHORT', entryPrice?: number, unrealizedPnl?: number }> = {};
+      const allPositions: Record<string, {
+        amount: number,
+        total: number,
+        side?: 'LONG' | 'SHORT',
+        entryPrice?: number,
+        unrealizedPnl?: number,
+        exchange?: string,
+        symbol?: string,
+        contracts?: number,
+        markPrice?: number,
+        notional?: number,
+        initialMargin?: number,
+        leverage?: number,
+      }> = {};
 
       // CCXT standard: b.total contains all balances (coin: amount)
       const totalBalances = b.total || {};
@@ -285,11 +298,30 @@ async function startServer() {
           const inferredSide: 'LONG' | 'SHORT' = sideRaw === 'SHORT' || rawAmt < 0 ? 'SHORT' : 'LONG';
           const entry = Number(input?.entryPrice ?? input?.info?.entryPrice ?? 0);
           const unrealized = Number(input?.unrealizedPnl ?? input?.unRealizedProfit ?? input?.info?.unRealizedProfit ?? 0);
+          const mark = Number(input?.markPrice ?? input?.info?.markPrice ?? 0);
+          const leverage = Number(input?.leverage ?? input?.info?.leverage ?? 0);
+          const rawNotional = Number(input?.notional ?? input?.info?.notional ?? 0);
+          const notional = Number.isFinite(rawNotional) && rawNotional !== 0
+            ? Math.abs(rawNotional)
+            : ((Number.isFinite(mark) && mark > 0 ? mark : entry) * contracts);
+          const rawInitialMargin = Number(input?.initialMargin ?? input?.info?.initialMargin ?? 0);
+          const initialMargin = Number.isFinite(rawInitialMargin) && rawInitialMargin > 0
+            ? rawInitialMargin
+            : ((Number.isFinite(leverage) && leverage > 0 && Number.isFinite(notional) && notional > 0)
+              ? notional / leverage
+              : undefined);
 
           const symbolRaw = String(input?.symbol || input?.info?.symbol || '').toUpperCase();
           if (!symbolRaw) return;
           const compact = symbolRaw.replace('/', '').replace(':USDT', '').replace(':USD', '').replace(':', '');
           const normalized = compact.endsWith('USDT') || compact.endsWith('USD') ? compact : `${compact}USDT`;
+          const displaySymbol = String(input?.symbol || '').includes('/')
+            ? String(input?.symbol)
+            : (normalized.endsWith('USDT')
+              ? `${normalized.slice(0, -4)}/USDT:USDT`
+              : normalized.endsWith('USDC')
+                ? `${normalized.slice(0, -4)}/USDC:USDC`
+                : `${normalized}/USDT:USDT`);
 
           allPositions[normalized] = {
             amount: contracts,
@@ -297,6 +329,13 @@ async function startServer() {
             side: inferredSide,
             entryPrice: Number.isFinite(entry) && entry > 0 ? entry : undefined,
             unrealizedPnl: Number.isFinite(unrealized) ? unrealized : undefined,
+            exchange: 'Binance',
+            symbol: displaySymbol,
+            contracts,
+            markPrice: Number.isFinite(mark) && mark > 0 ? mark : undefined,
+            notional: Number.isFinite(notional) && notional > 0 ? notional : undefined,
+            initialMargin,
+            leverage: Number.isFinite(leverage) && leverage > 0 ? leverage : undefined,
           };
         };
 
@@ -529,6 +568,12 @@ async function startServer() {
             throw new Error(`INVALID ORDER SIZE: ${amount}`);
           }
 
+          const requestedPositionSide = String(positionSide || '').toUpperCase();
+          const validPositionSide = requestedPositionSide === 'LONG' || requestedPositionSide === 'SHORT'
+            ? requestedPositionSide
+            : undefined;
+          const wantsReduceOnly = reduceOnly === true;
+
           // Precision and exchange limits precheck before submit.
           try {
             finalAmount = parseFloat(client.amountToPrecision(ccxtSymbol, finalAmount));
@@ -544,10 +589,12 @@ async function startServer() {
 
           const ticker = await client.fetchTicker(ccxtSymbol);
           const last = Number(ticker?.last || ticker?.close || 0);
-          if (Number.isFinite(minCost) && minCost > 0 && Number.isFinite(last) && last > 0) {
+          const minUserNotional = Number(process.env.MIN_ORDER_NOTIONAL || 10);
+          const enforcedMinNotional = wantsReduceOnly ? minCost : Math.max(minCost, minUserNotional);
+          if (Number.isFinite(enforcedMinNotional) && enforcedMinNotional > 0 && Number.isFinite(last) && last > 0) {
             const cost = finalAmount * last;
-            if (cost < minCost) {
-              finalAmount = minCost / last;
+            if (cost < enforcedMinNotional) {
+              finalAmount = enforcedMinNotional / last;
             }
           }
 
@@ -561,11 +608,13 @@ async function startServer() {
             throw new Error(`ORDER SIZE UNDERFLOW: ${ccxtSymbol} size invalid after precision/limits`);
           }
 
-          const requestedPositionSide = String(positionSide || '').toUpperCase();
-          const validPositionSide = requestedPositionSide === 'LONG' || requestedPositionSide === 'SHORT'
-            ? requestedPositionSide
-            : undefined;
-          const wantsReduceOnly = reduceOnly === true;
+          if (!wantsReduceOnly && Number.isFinite(last) && last > 0) {
+            const finalNotional = finalAmount * last;
+            const minUserNotional = Number(process.env.MIN_ORDER_NOTIONAL || 10);
+            if (finalNotional < minUserNotional * 0.995) {
+              throw new Error(`MIN NOTIONAL ENFORCED: ${ccxtSymbol} order value $${finalNotional.toFixed(2)} is below $${minUserNotional.toFixed(2)}`);
+            }
+          }
 
           const orderParams: Record<string, any> = {};
           if (validPositionSide) orderParams.positionSide = validPositionSide;

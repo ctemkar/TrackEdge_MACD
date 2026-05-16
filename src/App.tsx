@@ -44,9 +44,15 @@ export default function App() {
   interface Holding {
     id: string;
     symbol: string;
+    displaySymbol?: string;
+    exchange?: string;
+    contracts?: number;
     amount: number;
     side: 'LONG' | 'SHORT';
     entryPrice: number;
+    markPrice?: number;
+    notional?: number;
+    initialMargin?: number;
     unrealizedPnl?: number;
     time: string;
   }
@@ -210,11 +216,18 @@ export default function App() {
         
         let freshHoldings: Holding[] = [];
         if (data.positions) {
+          const toCompactSymbol = (raw: string) => {
+            const up = String(raw || '').toUpperCase();
+            if (!up) return up;
+            return up.replace('/', '').replace(':USDT', 'USDT').replace(':USDC', 'USDC').replace(':USD', 'USD').replace(':', '');
+          };
+
           freshHoldings = Object.entries(data.positions).map(([coin, info]: [string, any]) => {
             const coinUpper = coin.toUpperCase();
-            let normalizedSymbol = coinUpper.endsWith('USD') || coinUpper.endsWith('USDT') 
-              ? coinUpper 
-              : (data.exchange === 'binance' ? `${coinUpper}USDT` : `${coinUpper}USD`);
+            const fromInfoSymbol = toCompactSymbol(info?.symbol || '');
+            let normalizedSymbol = fromInfoSymbol || (coinUpper.endsWith('USD') || coinUpper.endsWith('USDT') || coinUpper.endsWith('USDC')
+              ? coinUpper
+              : (data.exchange === 'binance' ? `${coinUpper}USDT` : `${coinUpper}USD`));
 
             // PRICE RESOLUTION: Do not default to 1 as it creates "Ghost Equity"
             const price = marketPicks.find(p => p.symbol === normalizedSymbol)?.lastPrice || 
@@ -230,9 +243,15 @@ export default function App() {
             return {
               id: `${normalizedSymbol}_${info.side || 'LONG'}`,
               symbol: normalizedSymbol,
+              displaySymbol: typeof info?.symbol === 'string' && info.symbol.includes('/') ? info.symbol : undefined,
+              exchange: info?.exchange || (data.exchange ? String(data.exchange).charAt(0).toUpperCase() + String(data.exchange).slice(1) : undefined),
+              contracts: Number(info?.contracts || info?.amount || 0) || undefined,
               amount: info.amount,
               side: info.side === 'SHORT' ? 'SHORT' : 'LONG',
               entryPrice: Number(info.entryPrice) > 0 ? Number(info.entryPrice) : price,
+              markPrice: Number(info.markPrice) > 0 ? Number(info.markPrice) : undefined,
+              notional: Number(info.notional) > 0 ? Number(info.notional) : undefined,
+              initialMargin: Number(info.initialMargin) > 0 ? Number(info.initialMargin) : undefined,
               unrealizedPnl: Number.isFinite(Number(info.unrealizedPnl)) ? Number(info.unrealizedPnl) : undefined,
               time: new Date().toISOString()
             };
@@ -363,15 +382,27 @@ export default function App() {
           amount = heldAmount;
         } else if (type === 'BUY' || openingShort) {
           const slotsAvailable = Math.max(1, maxConcurrentTrades - holdings.length);
+          const realFreeCapital = Math.max(0, availableFunds * 0.95);
+          const realFallbackCapital = isRealMode && holdings.length === 0 && realFreeCapital < 10 && balance >= 10
+            ? Math.max(0, Math.min(balance * 0.1, 50))
+            : 0;
           const tradableCapital = isRealMode
-            ? Math.max(0, availableFunds * 0.95) // keep a safety buffer for fees/funding/margin movement
+            ? Math.max(realFreeCapital, realFallbackCapital)
             : Math.max(0, balance);
           let allocation = Math.min(tradableCapital, tradableCapital / slotsAvailable);
           const minLiveNotional = 80;
 
+          // Avoid over-fragmenting capital across many slots; if we can fund at least one
+          // minimal order, keep per-trade allocation at $10+ instead of skipping every entry.
+          if (tradableCapital >= 10) {
+            allocation = Math.max(allocation, 10);
+          }
+
           if (isRealMode && allocation < minLiveNotional && tradableCapital >= minLiveNotional) {
             allocation = minLiveNotional;
           }
+
+          allocation = Math.min(allocation, tradableCapital);
 
           if (allocation < 10) {
             addLog(`TRADE ABORTED: Available allocation ($${allocation.toFixed(2)}) below minimum threshold ($10).`, 'warning');
@@ -440,13 +471,14 @@ export default function App() {
             });
           };
 
-          // Exchange can acknowledge an order while position state lags or rejects by mode/rules.
-          // Verify live position snapshot before classifying as FILLED.
+          // Exchange can acknowledge an order while position state lags.
+          // Retry verification briefly before classifying as FILLED/FAILED.
           let verified = false;
           try {
-            await new Promise(r => setTimeout(r, 900));
-            const verifyResp = await fetch('/api/binance/balance');
-            if (verifyResp.ok) {
+            for (let attempt = 0; attempt < 3 && !verified; attempt++) {
+              await new Promise(r => setTimeout(r, 900));
+              const verifyResp = await fetch('/api/binance/balance');
+              if (!verifyResp.ok) continue;
               const verify = await verifyResp.json();
               const positions = verify?.positions || {};
               const hasPosition = hasPositionForSymbol(positions, tradeSymbol);
@@ -899,6 +931,24 @@ export default function App() {
 
         if (currentHoldings.length < currentMaxTrades) {
           const availableSlots = currentMaxTrades - currentHoldings.length;
+          const realFreeCapital = Math.max(0, availableFunds * 0.95);
+          const realFallbackCapital = isRealMode && currentHoldings.length === 0 && realFreeCapital < 10 && balance >= 10
+            ? Math.max(0, Math.min(balance * 0.1, 50))
+            : 0;
+          const realTradableCapital = Math.max(realFreeCapital, realFallbackCapital);
+          if (isRealMode && realTradableCapital < 10) {
+            pushTradeEvent({
+              type: 'BUY',
+              symbol: 'SCAN',
+              price: 0,
+              amount: 0,
+              time: new Date().toISOString(),
+              reason: `SKIP: Free margin too low for minimum order ($${realFreeCapital.toFixed(2)} effective $${realTradableCapital.toFixed(2)} < $10.00)`,
+              status: 'SKIPPED',
+              cycleId,
+            });
+            return;
+          }
           const toTrade = entries.slice(0, availableSlots);
           
           if (toTrade.length > 0) {
@@ -940,7 +990,7 @@ export default function App() {
       setScanning(false);
       setTimeout(() => setIsBotActive(false), 2000);
     }
-  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushTradeEvent]);
+  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushTradeEvent, availableFunds, balance]);
  // Removed 'scanning' from dependencies
 
   const resetAccount = React.useCallback(() => {
@@ -1051,7 +1101,7 @@ export default function App() {
     pollHoldingPrices();
 
     return () => clearInterval(interval);
-  }, [holdings.length]);
+  }, [holdings]);
 
   useEffect(() => {
     if (holdings.length > 0) {
@@ -1109,13 +1159,16 @@ export default function App() {
   
   const equity = calculateEquity();
   const totalInvested = holdings.reduce((acc, h) => acc + (h.amount * h.entryPrice), 0);
-  const unrealizedRisk = holdings.reduce((sum, h) => {
+  const computedUnrealizedPnl = holdings.reduce((sum, h) => {
     if (Number.isFinite(h.unrealizedPnl)) return sum + Number(h.unrealizedPnl);
     const mark = holdingPrices[h.symbol] || h.entryPrice;
     const move = h.side === 'SHORT' ? (h.entryPrice - mark) : (mark - h.entryPrice);
     return sum + (move * h.amount);
   }, 0);
-  const displayedUnrealizedRisk = isRealMode ? liveUnrealizedPnl : unrealizedRisk;
+  const hasOpenPositions = holdings.length > 0;
+  const displayedUnrealizedRisk = isRealMode
+    ? (hasOpenPositions ? computedUnrealizedPnl : liveUnrealizedPnl)
+    : computedUnrealizedPnl;
   const scanDisplayTotal = scanProgress.total > 0 ? scanProgress.total : availableSymbols.length;
   const scanProgressPct = scanProgress.total > 0
     ? Math.min(100, Math.max(0, (scanProgress.current / scanProgress.total) * 100))
@@ -1859,19 +1912,23 @@ export default function App() {
               <table className="w-full text-left border-collapse">
                 <thead className="bg-gray-50 border-b-2 border-gray-100 uppercase font-mono text-[9px] opacity-40">
                   <tr>
-                    <th className="px-6 py-4 tracking-widest">Asset</th>
+                    <th className="px-6 py-4 tracking-widest">Exchange</th>
                     <th className="px-6 py-4 tracking-widest">Side</th>
-                    <th className="px-6 py-4 tracking-widest">Size/Qty</th>
+                    <th className="px-6 py-4 tracking-widest">Symbol</th>
+                    <th className="px-6 py-4 tracking-widest">Contracts</th>
                     <th className="px-6 py-4 tracking-widest">Entry Price</th>
-                    <th className="px-6 py-4 tracking-widest">Current Price</th>
+                    <th className="px-6 py-4 tracking-widest">Margin</th>
+                    <th className="px-6 py-4 tracking-widest">Notional</th>
+                    <th className="px-6 py-4 tracking-widest">Mark Price</th>
                     <th className="px-6 py-4 tracking-widest">Unrealized P&L</th>
+                    <th className="px-6 py-4 tracking-widest">P&L %</th>
                     <th className="px-6 py-4 text-right tracking-widest">Action Control</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
                   {holdings.length === 0 ? (
                     <tr>
-                      <td colSpan={7} className="px-6 py-16 text-center">
+                      <td colSpan={11} className="px-6 py-16 text-center">
                         <div className="flex flex-col items-center gap-2 opacity-30">
                           <Zap size={24} />
                           <p className="text-xs font-mono uppercase tracking-[0.2em]">Awaiting signal confluence. No open vectors.</p>
@@ -1880,40 +1937,57 @@ export default function App() {
                     </tr>
                   ) : (
                     holdings.map((h, i) => {
-                      const price = holdingPrices[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice) || h.entryPrice;
-                      const move = h.side === 'SHORT' ? (h.entryPrice - price) : (price - h.entryPrice);
-                      const pnlVal = move * h.amount;
-                      const pnlPctVal = h.entryPrice > 0 ? (move / h.entryPrice) * 100 : 0;
+                     const mark = h.markPrice || holdingPrices[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice) || h.entryPrice;
+                     const contracts = Number(h.contracts || h.amount || 0);
+                     const notional = Number(h.notional || (contracts * h.entryPrice) || 0);
+                     const margin = Number(h.initialMargin || (notional > 0 ? notional / 5 : 0) || 0);
+                     const move = h.side === 'SHORT' ? (h.entryPrice - mark) : (mark - h.entryPrice);
+                     const computedPnl = move * contracts;
+                     const pnlVal = Number.isFinite(Number(h.unrealizedPnl)) ? Number(h.unrealizedPnl) : computedPnl;
+                     const pnlPctVal = margin > 0 ? (pnlVal / margin) * 100 : 0;
                       const closeSide: 'BUY' | 'SELL' = h.side === 'SHORT' ? 'BUY' : 'SELL';
+                     const displaySymbol = h.displaySymbol || (h.symbol.endsWith('USDT')
+                      ? `${h.symbol.slice(0, -4)}/USDT:USDT`
+                      : h.symbol.endsWith('USDC')
+                        ? `${h.symbol.slice(0, -4)}/USDC:USDC`
+                        : h.symbol);
                       return (
                         <tr key={i} className="hover:bg-gray-50/50 transition-colors group cursor-pointer" onClick={() => setSymbol(h.symbol)}>
-                          <td className="px-6 py-5">
-                             <div className="flex items-center gap-2">
-                               <div className={`w-1.5 h-1.5 rounded-full ${h.symbol === symbol ? 'bg-[#F27D26]' : 'bg-gray-300'}`} />
-                               <span className="font-black text-sm uppercase tracking-tighter">{h.symbol.replace('USDT', '').replace('USD', '')}</span>
-                             </div>
+                        <td className="px-6 py-5 font-mono text-xs opacity-70">
+                         {h.exchange || 'Binance'}
                           </td>
                           <td className="px-6 py-5">
                               <span className={`text-[10px] font-black px-2 py-0.5 rounded-sm ${h.side === 'SHORT' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{h.side}</span>
                           </td>
+                        <td className="px-6 py-5 font-mono text-xs font-black uppercase tracking-tight">
+                          {displaySymbol}
+                        </td>
                           <td className="px-6 py-5 font-mono text-xs opacity-60">
-                             {h.amount < 0.01 ? h.amount.toFixed(6) : h.amount.toFixed(4)}
+                          {contracts < 1 ? contracts.toFixed(8) : contracts.toFixed(4)}
                           </td>
                           <td className="px-6 py-5 font-mono text-xs opacity-60">
                              ${formatPrice(h.entryPrice)}
                           </td>
                           <td className="px-6 py-5 font-mono text-xs font-bold">
-                             ${formatPrice(price)}
+                          ${margin.toFixed(2)}
+                        </td>
+                        <td className="px-6 py-5 font-mono text-xs font-bold">
+                          ${notional.toFixed(2)}
+                        </td>
+                        <td className="px-6 py-5 font-mono text-xs font-bold">
+                          ${formatPrice(mark)}
                           </td>
                           <td className={`px-6 py-5 font-black text-sm ${pnlVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                              {pnlVal >= 0 ? '+' : ''}${pnlVal.toFixed(2)}
-                             <span className="text-[10px] ml-2 opacity-60">({pnlPctVal.toFixed(2)}%)</span>
+                        </td>
+                        <td className={`px-6 py-5 font-black text-sm ${pnlPctVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                          {pnlPctVal >= 0 ? '+' : ''}{pnlPctVal.toFixed(2)}%
                           </td>
                           <td className="px-6 py-5 text-right">
                              <button 
                                onClick={(e) => {
                                  e.stopPropagation();
-                                 executeTrade(closeSide, h.symbol, price, 'MANUAL_DOCK_CONTROL', h.id);
+                            executeTrade(closeSide, h.symbol, mark, 'MANUAL_DOCK_CONTROL', h.id);
                                }}
                                className="bg-[#141414] text-white hover:bg-[#F27D26] px-4 py-1.5 text-[10px] font-black uppercase tracking-tighter transition-all"
                              >
