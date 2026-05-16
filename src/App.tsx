@@ -8,6 +8,7 @@ import { BacktestModule } from './components/BacktestModule';
 
 export default function App() {
   const AUTO_ENTRY_MIN_SCORE = 2;
+  const LIVE_QUOTE_ALLOWLIST = ['USDT', 'FDUSD', 'USDC', 'BUSD', 'TUSD', 'BTC', 'ETH', 'BNB'];
   const [activeTab, setActiveTab] = useState<'LIVE' | 'BACKTEST'>('LIVE');
   const [data, setData] = useState<Candle[]>([]);
   const [indicators, setIndicators] = useState<IndicatorResult | null>(null);
@@ -205,10 +206,7 @@ export default function App() {
         // In live mode with no open positions, keep baseline aligned to current equity
         // so performance starts near zero after mode switch or account sync.
         if (isRealMode && freshHoldings.length === 0 && currentEquity > 0) {
-          const baselineGap = Math.abs(benchmarkCapital - currentEquity);
-          if (!benchmarkCapital || baselineGap > currentEquity * 0.02) {
-            setBenchmarkCapital(currentEquity);
-          }
+          setBenchmarkCapital(currentEquity);
         }
 
         // GHOST BASIS RESET: If baseline is huge but equity is 0/small on first real sync, auto-correct
@@ -551,10 +549,12 @@ export default function App() {
       const allSymbols = await fetchAllSymbols();
       const allValues = allSymbols.map(s => s.value);
       const liveNormalized = (v: string) => (v.toUpperCase().endsWith('USD') && !v.toUpperCase().endsWith('USDT') ? `${v}T` : v);
+      const hasAllowedQuote = (v: string) => {
+        const up = v.toUpperCase();
+        return LIVE_QUOTE_ALLOWLIST.some(q => up.endsWith(q));
+      };
       const baseSymbol = isRealMode ? liveNormalized(symbol) : symbol;
-      const candidateValues = isRealMode
-        ? allValues.filter(v => v.toUpperCase().endsWith('USDT') || v.toUpperCase().endsWith('USD')).map(liveNormalized)
-        : allValues;
+      const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
       const symbolsToScan = Array.from(new Set([baseSymbol, ...candidateValues]));
       
       setScanProgress({ current: 0, total: symbolsToScan.length });
@@ -596,12 +596,14 @@ export default function App() {
       if (currentAutoTrade) {
         const potentialLongs = results
           .filter(r => r.signal.overall === 'BUY' && r.signal.score >= AUTO_ENTRY_MIN_SCORE)
+          .filter(r => !isRealMode || hasAllowedQuote(r.symbol))
           .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
           .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now());
 
         const potentialShorts = isRealMode
           ? results
               .filter(r => r.signal.overall === 'SELL' && r.signal.score >= AUTO_ENTRY_MIN_SCORE)
+              .filter(r => hasAllowedQuote(r.symbol))
               .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
               .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now())
           : [];
@@ -791,8 +793,9 @@ export default function App() {
   // We cap at $100,000,000 to allow "Whale" mode while still blocking glitches
   const isDataBroken = !isFinite(equity) || equity > 100000000 || equity < 0; 
   
-  const pnl = equity - benchmarkCapital;
-  const pnlPercent = benchmarkCapital > 0 ? (pnl / benchmarkCapital) * 100 : 0;
+  const isFlatLiveBook = isRealMode && holdings.length === 0;
+  const pnl = isFlatLiveBook ? 0 : (equity - benchmarkCapital);
+  const pnlPercent = isFlatLiveBook ? 0 : (benchmarkCapital > 0 ? (pnl / benchmarkCapital) * 100 : 0);
   const investedPct = benchmarkCapital > 0 ? (totalInvested / benchmarkCapital) * 100 : 0;
 
   // Auto-Recovery - Clean wipe if core state is corrupted
@@ -959,7 +962,7 @@ export default function App() {
             <div className="mt-3 mb-4">
               <div className="flex justify-between text-[8px] font-mono uppercase opacity-50 mb-1">
                 <span>{scanning ? 'Scan Progress' : 'Idle'}</span>
-                <span>{scanning ? `${Math.round((scanProgress.current / (scanProgress.total || 1)) * 100)}%` : `${availableSymbols.length} assets`}</span>
+                <span>{scanning ? `${scanProgress.current}/${scanProgress.total || 1} scanned (${Math.round((scanProgress.current / (scanProgress.total || 1)) * 100)}%)` : `${availableSymbols.length} assets`}</span>
               </div>
               <div className="h-1 w-full bg-gray-100 rounded-full overflow-hidden">
                 <div
@@ -968,8 +971,14 @@ export default function App() {
                 />
               </div>
             </div>
+          </section>
 
-             <div className="space-y-4">
+          <section className="bg-white border-2 border-[#141414] p-4 shadow-[8px_8px_0px_0px_#141414]">
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <h3 className="font-mono text-[10px] uppercase tracking-[0.24em] opacity-70">Signal Table</h3>
+                <span className="text-[8px] font-mono uppercase opacity-40">{Math.min(150, marketPicks.length)} shown</span>
+              </div>
               <div className="grid grid-cols-5 items-center border-b pb-2 text-[8px] font-mono opacity-40 uppercase tracking-widest px-2">
                 <span>Asset</span>
                 <span className="text-center">Trend/RSI</span>
@@ -977,7 +986,7 @@ export default function App() {
                 <span className="text-center">Signal</span>
                 <span className="text-right">Action</span>
               </div>
-              <div className="space-y-2 max-h-[400px] overflow-y-auto custom-scrollbar pr-2">
+              <div className="space-y-2 max-h-[520px] overflow-y-auto custom-scrollbar pr-2">
                 {marketPicks.slice(0, 150).map((pick) => (
                   <div key={pick.symbol} className="grid grid-cols-5 items-center group py-1.5 hover:bg-gray-50/50 px-2 border-b border-gray-50 transition-colors">
                     <button 
@@ -1028,32 +1037,6 @@ export default function App() {
                 ))}
               </div>
             </div>
-
-            <div className="hidden mt-8 pt-6 border-t border-dashed border-[#141414]/20">
-              {/* System Protocol Logs */}
-              <div className="mt-4 bg-[#141414] p-3 rounded-sm">
-                <div className="flex justify-between items-center mb-2">
-                  <p className="text-[10px] font-mono text-[#F27D26] font-bold uppercase tracking-widest">System Protocols</p>
-                  <button onClick={() => setSystemLogs([])} className="text-[8px] font-mono text-white/20 hover:text-white uppercase">Clear</button>
-                </div>
-                <div className="space-y-1.5 h-[120px] overflow-y-auto custom-scrollbar">
-                  {systemLogs.length === 0 ? (
-                    <p className="text-[10px] font-mono text-white/20 italic">Awaiting node telemetry...</p>
-                  ) : (
-                    systemLogs.map((log, i) => (
-                      <div key={i} className="text-[10px] font-mono leading-tight border-l border-white/10 pl-2">
-                        <span className="text-white/30 mr-2">[{log.time}]</span>
-                        <span className={
-                          log.type === 'success' ? 'text-emerald-400' :
-                          log.type === 'warning' ? 'text-rose-400' : 'text-white/70'
-                        }>{log.message}</span>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-            </div>
-
           </section>
 
           {/* Risk Management Card */}

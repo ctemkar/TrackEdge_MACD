@@ -11,6 +11,12 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
+  const liveQuoteAllowlist = (process.env.LIVE_QUOTE_ALLOWLIST || 'USDT,FDUSD,USDC,BUSD,TUSD,BTC,ETH,BNB')
+    .split(',')
+    .map(s => s.trim().toUpperCase())
+    .filter(Boolean);
+  const unsupportedSymbolSkips = new Map<string, { until: number; count: number; reason: string }>();
+
   app.use(cors());
   app.use(express.json());
 
@@ -391,26 +397,94 @@ async function startServer() {
           if (raw.endsWith('USD') && !raw.endsWith('USDT')) {
             raw = `${raw}T`;
           }
+
+          const skip = unsupportedSymbolSkips.get(raw);
+          if (skip && skip.until > Date.now()) {
+            throw new Error(`SYMBOL SKIPPED: ${raw} temporarily blocked (${skip.reason})`);
+          }
+
           const byId = (client as any).markets_by_id || {};
           const candidates = byId[raw] ? (Array.isArray(byId[raw]) ? byId[raw] : [byId[raw]]) : [];
-          const resolved = candidates.find((m: any) => m?.contract && m?.linear) || candidates[0];
+          const allowedQuotes = new Set(liveQuoteAllowlist);
+          const filteredCandidates = candidates.filter((m: any) => {
+            const q = (m?.quote || '').toUpperCase();
+            return (m?.contract || m?.swap || m?.future) && allowedQuotes.has(q);
+          });
+          const resolved = filteredCandidates[0] || candidates.find((m: any) => m?.contract && m?.linear) || candidates[0];
 
           if (resolved?.symbol) {
             ccxtSymbol = resolved.symbol;
           } else if (!ccxtSymbol.includes('/') && raw.endsWith('USDT')) {
             const base = raw.slice(0, -4);
             ccxtSymbol = `${base}/USDT:USDT`;
+          } else {
+            unsupportedSymbolSkips.set(raw, {
+              count: (unsupportedSymbolSkips.get(raw)?.count || 0) + 1,
+              until: Date.now() + (1000 * 60 * 15),
+              reason: 'unsupported market mapping',
+            });
+            throw new Error(`UNSUPPORTED MARKET: ${raw} not tradable on allowed quotes [${liveQuoteAllowlist.join(', ')}]`);
+          }
+
+          const market = (client as any).markets?.[ccxtSymbol] || resolved;
+          let finalAmount = Number(amount);
+          if (!Number.isFinite(finalAmount) || finalAmount <= 0) {
+            throw new Error(`INVALID ORDER SIZE: ${amount}`);
+          }
+
+          // Precision and exchange limits precheck before submit.
+          try {
+            finalAmount = parseFloat(client.amountToPrecision(ccxtSymbol, finalAmount));
+          } catch {
+            // keep numeric fallback and let limit checks below decide
+          }
+
+          const minAmount = Number(market?.limits?.amount?.min || 0);
+          const minCost = Number(market?.limits?.cost?.min || 0);
+          if (Number.isFinite(minAmount) && minAmount > 0 && finalAmount < minAmount) {
+            finalAmount = minAmount;
+          }
+
+          const ticker = await client.fetchTicker(ccxtSymbol);
+          const last = Number(ticker?.last || ticker?.close || 0);
+          if (Number.isFinite(minCost) && minCost > 0 && Number.isFinite(last) && last > 0) {
+            const cost = finalAmount * last;
+            if (cost < minCost) {
+              finalAmount = minCost / last;
+            }
+          }
+
+          try {
+            finalAmount = parseFloat(client.amountToPrecision(ccxtSymbol, finalAmount));
+          } catch {
+            // noop
+          }
+
+          if (!Number.isFinite(finalAmount) || finalAmount <= 0) {
+            throw new Error(`ORDER SIZE UNDERFLOW: ${ccxtSymbol} size invalid after precision/limits`);
           }
 
           order = await client.createMarketOrder(
             ccxtSymbol, 
             side.toLowerCase(), 
-            amount
+            finalAmount
           );
       }
       
       res.json({ status: 'success', order });
     } catch (error: any) {
+      const msg = String(error?.message || 'Unknown order failure');
+      const unsupported = msg.includes('does not have market symbol') || msg.includes('UNSUPPORTED MARKET') || msg.includes('SYMBOL SKIPPED');
+      if (unsupported) {
+        const raw = String(req.body?.symbol || '').toUpperCase().replace('/', '').replace(':', '');
+        if (raw) {
+          unsupportedSymbolSkips.set(raw, {
+            count: (unsupportedSymbolSkips.get(raw)?.count || 0) + 1,
+            until: Date.now() + (1000 * 60 * 15),
+            reason: 'unsupported market symbol',
+          });
+        }
+      }
       console.error(`[TradeEdge ERROR] Order Failed: ${error.message}`);
       res.status(500).json({ status: 'error', message: error.message });
     }
