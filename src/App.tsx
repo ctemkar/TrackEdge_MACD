@@ -41,7 +41,9 @@ export default function App() {
     id: string;
     symbol: string;
     amount: number;
+    side: 'LONG' | 'SHORT';
     entryPrice: number;
+    unrealizedPnl?: number;
     time: string;
   }
 
@@ -175,9 +177,12 @@ export default function App() {
             if (info.amount <= 0) return null;
 
             return {
+              id: `${normalizedSymbol}_${info.side || 'LONG'}`,
               symbol: normalizedSymbol,
               amount: info.amount,
-              entryPrice: price,
+              side: info.side === 'SHORT' ? 'SHORT' : 'LONG',
+              entryPrice: Number(info.entryPrice) > 0 ? Number(info.entryPrice) : price,
+              unrealizedPnl: Number.isFinite(Number(info.unrealizedPnl)) ? Number(info.unrealizedPnl) : undefined,
               time: new Date().toISOString()
             };
           }).filter((h): h is Holding => h !== null);
@@ -362,7 +367,7 @@ export default function App() {
         if (useBNBFees && serverConfig?.exchange !== 'gemini') commission *= 0.75; 
 
         setBalance(prev => prev - allocation);
-        setHoldings(prev => [...prev, { id: holdingId, symbol: tradeSymbol, amount, entryPrice: price, time }]);
+        setHoldings(prev => [...prev, { id: holdingId, symbol: tradeSymbol, amount, side: 'LONG', entryPrice: price, time }]);
         setTradeHistory(prev => [{ type, symbol: tradeSymbol, price, amount, time, reason }, ...prev]);
         addLog(`PAPER BUY: ${tradeSymbol} @ $${price} [${reason}]`, 'success');
       } else {
@@ -481,7 +486,11 @@ export default function App() {
   }, [isRealMode, balance, holdings.length, benchmarkCapital, addLog]);
 
   const currentHolding = holdings.find(h => h.symbol === symbol);
-  const stopLossPrice = (currentHolding && currentPrice) ? currentHolding.entryPrice * (1 - stopLossPercent / 100) : 0;
+  const stopLossPrice = (currentHolding && currentPrice)
+    ? (currentHolding.side === 'SHORT'
+      ? currentHolding.entryPrice * (1 + stopLossPercent / 100)
+      : currentHolding.entryPrice * (1 - stopLossPercent / 100))
+    : 0;
 
   const [scanProgress, setScanProgress] = useState({ current: 0, total: 0 });
 
@@ -496,12 +505,8 @@ export default function App() {
   useEffect(() => {
     if (!isRealMode || holdings.length === 0 || !benchmarkCapital) return;
 
-    const totalPositionsValue = holdings.reduce((sum, h) => {
-      const price = holdingPrices[h.symbol] || h.entryPrice;
-      return sum + (price * h.amount);
-    }, 0);
-    
-    const equity = balance + totalPositionsValue;
+    // In real mode, `balance` is synced to exchange equity and already includes positions.
+    const equity = balance;
     const currentDrawdown = ((benchmarkCapital - equity) / benchmarkCapital) * 100;
 
     if (currentDrawdown >= maxDrawdownPercent) {
@@ -510,7 +515,8 @@ export default function App() {
          // Force liquidate everything
          for (const h of holdings) {
             const price = holdingPrices[h.symbol] || h.entryPrice;
-            await executeTrade('SELL', h.symbol, price, 'EMERGENCY_SHIELD: MAX DRAWDOWN REACHED');
+          const closeSide: 'BUY' | 'SELL' = h.side === 'SHORT' ? 'BUY' : 'SELL';
+          await executeTrade(closeSide, h.symbol, price, 'EMERGENCY_SHIELD: MAX DRAWDOWN REACHED', h.id);
             await new Promise(r => setTimeout(r, 800));
          }
       };
@@ -581,13 +587,18 @@ export default function App() {
           const scanResult = results.find(r => r.symbol === holding.symbol);
           if (scanResult) {
             const price = scanResult.lastPrice;
-            const slTrigger = price <= holding.entryPrice * (1 - stopLossPercent / 100);
-            const tpTrigger = price >= holding.entryPrice * (1 + takeProfitPercent / 100);
+            const slTrigger = holding.side === 'SHORT'
+              ? price >= holding.entryPrice * (1 + stopLossPercent / 100)
+              : price <= holding.entryPrice * (1 - stopLossPercent / 100);
+            const tpTrigger = holding.side === 'SHORT'
+              ? price <= holding.entryPrice * (1 - takeProfitPercent / 100)
+              : price >= holding.entryPrice * (1 + takeProfitPercent / 100);
+            const exitSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
 
             if (slTrigger) {
-              executeTrade('SELL', holding.symbol, price, 'AUTO_EXIT: PORTFOLIO STOP LOSS');
+              executeTrade(exitSide, holding.symbol, price, 'AUTO_EXIT: PORTFOLIO STOP LOSS', holding.id);
             } else if (tpTrigger) {
-              executeTrade('SELL', holding.symbol, price, 'AUTO_EXIT: PORTFOLIO TAKE PROFIT');
+              executeTrade(exitSide, holding.symbol, price, 'AUTO_EXIT: PORTFOLIO TAKE PROFIT', holding.id);
             }
           }
         });
@@ -774,6 +785,10 @@ export default function App() {
   }, [currentPrice, strategy, autoTrade, holdings, symbol, executeTrade, stopLossPercent, takeProfitPercent, maxConcurrentTrades, holdingPrices, cooldowns, isRealMode]);
 
   const calculateEquity = () => {
+    if (isRealMode) {
+      return balance;
+    }
+
     const holdingsValue = holdings.reduce((acc, h) => {
       // Priority: Live Watcher -> Selected Symbol Cache -> Market Scan -> Entry
       const livePrice = holdingPrices[h.symbol];

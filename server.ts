@@ -230,7 +230,7 @@ async function startServer() {
       const cashKeys = ['USD', 'USDT', 'GUSD', 'USDC', 'DAI', 'BUSD'];
       let cashTotal = 0;
       let portfolioMarginEquity: number | null = null;
-      const allPositions: Record<string, { amount: number, total: number }> = {};
+      const allPositions: Record<string, { amount: number, total: number, side?: 'LONG' | 'SHORT', entryPrice?: number, unrealizedPnl?: number }> = {};
 
       // CCXT standard: b.total contains all balances (coin: amount)
       const totalBalances = b.total || {};
@@ -269,6 +269,37 @@ async function startServer() {
             amount: val,
             total: val 
           };
+        }
+      }
+
+      if (client.id === 'binance') {
+        try {
+          const fetchedPositions = await (client as any).fetchPositions?.();
+          if (Array.isArray(fetchedPositions)) {
+            for (const p of fetchedPositions) {
+              const contracts = Math.abs(Number(p?.contracts || p?.info?.positionAmt || 0));
+              if (!Number.isFinite(contracts) || contracts <= 0) continue;
+
+              const sideRaw = String(p?.side || '').toUpperCase();
+              const inferredSide: 'LONG' | 'SHORT' = sideRaw === 'SHORT' || Number(p?.info?.positionAmt || 0) < 0 ? 'SHORT' : 'LONG';
+              const entry = Number(p?.entryPrice || p?.info?.entryPrice || 0);
+              const unrealized = Number(p?.unrealizedPnl || p?.info?.unRealizedProfit || 0);
+
+              const symbolRaw = String(p?.symbol || p?.info?.symbol || '').toUpperCase();
+              const compact = symbolRaw.replace('/', '').replace(':USDT', '').replace(':USD', '').replace(':', '');
+              const normalized = compact.endsWith('USDT') || compact.endsWith('USD') ? compact : `${compact}USDT`;
+
+              allPositions[normalized] = {
+                amount: contracts,
+                total: contracts,
+                side: inferredSide,
+                entryPrice: Number.isFinite(entry) && entry > 0 ? entry : undefined,
+                unrealizedPnl: Number.isFinite(unrealized) ? unrealized : undefined,
+              };
+            }
+          }
+        } catch {
+          // If positions endpoint fails, keep balance-only response.
         }
       }
 
