@@ -728,7 +728,7 @@ export default function App() {
     setScanning(true);
     setIsBotActive(true);
     try {
-      setScanProgress({ current: 0, total: 1 }); // Initial state to show bar
+      setScanProgress({ current: 0, total: 0 });
       const allSymbols = await fetchAllSymbols();
       const allValues = allSymbols.map(s => s.value);
       const liveNormalized = (v: string) => (v.toUpperCase().endsWith('USD') && !v.toUpperCase().endsWith('USDT') ? `${v}T` : v);
@@ -1192,7 +1192,7 @@ export default function App() {
                 </h2>
                 <span className="text-[8px] font-mono mt-1 uppercase opacity-40">
                   {scanning
-                    ? `Scanner Active: ${scanProgress.current} / ${scanProgress.total || 1} Assets`
+                    ? `Scanner Active: ${scanProgress.current} / ${scanProgress.total} Assets`
                     : `Scanner Online: Monitoring ${availableSymbols.length} Assets`}
                 </span>
               </div>
@@ -1211,12 +1211,12 @@ export default function App() {
             <div className="mt-3 mb-4">
               <div className="flex justify-between text-[8px] font-mono uppercase opacity-50 mb-1">
                 <span>{scanning ? 'Scan Progress' : 'Idle'}</span>
-                <span>{scanning ? `${scanProgress.current}/${scanProgress.total || 1} scanned (${Math.round((scanProgress.current / (scanProgress.total || 1)) * 100)}%)` : `${availableSymbols.length} assets`}</span>
+                <span>{scanning ? `${scanProgress.current}/${scanProgress.total} scanned (${scanProgress.total > 0 ? Math.round((scanProgress.current / scanProgress.total) * 100) : 0}%)` : `${availableSymbols.length} assets`}</span>
               </div>
               <div className="h-1 w-full bg-gray-100 rounded-full overflow-hidden">
                 <div
                   className="h-full bg-[#F27D26]"
-                  style={{ width: scanning ? `${(scanProgress.current / (scanProgress.total || 1)) * 100}%` : `${Math.min(100, Math.max(0, availableSymbols.length > 0 ? 100 : 0))}%` }}
+                  style={{ width: scanning ? `${scanProgress.total > 0 ? (scanProgress.current / scanProgress.total) * 100 : 0}%` : `${Math.min(100, Math.max(0, availableSymbols.length > 0 ? 100 : 0))}%` }}
                 />
               </div>
             </div>
