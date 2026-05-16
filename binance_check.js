@@ -5,13 +5,14 @@ dotenv.config();
 async function main() {
     try {
         const exchange = new ccxt.binance({
-            apiKey: process.env.BINANCE_API_KEY,
-            secret: process.env.BINANCE_API_SECRET,
-            options: {
-                'defaultType': 'future',
-            },
+            apiKey: process.env.BINANCE_LIVE_API_KEY,
+            secret: process.env.BINANCE_LIVE_API_SECRET,
+            options: { 'defaultType': 'future' }
         });
 
+        // Try fetchBalance as a basic check
+        const balance = await exchange.fetchBalance();
+        
         // (1) fetchPositions
         const positions = await exchange.fetchPositions();
         const nonZeroPositions = positions.filter(p => parseFloat(p.contracts) !== 0).map(p => ({
