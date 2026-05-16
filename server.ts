@@ -230,6 +230,7 @@ async function startServer() {
       const cashKeys = ['USD', 'USDT', 'GUSD', 'USDC', 'DAI', 'BUSD'];
       let cashTotal = 0;
       let portfolioMarginEquity: number | null = null;
+      let uiAvailableBalance: number | null = null;
       const allPositions: Record<string, { amount: number, total: number, side?: 'LONG' | 'SHORT', entryPrice?: number, unrealizedPnl?: number }> = {};
 
       // CCXT standard: b.total contains all balances (coin: amount)
@@ -335,6 +336,34 @@ async function startServer() {
         if (portfolioMarginEquity && portfolioMarginEquity > cashTotal) {
           cashTotal = portfolioMarginEquity;
         }
+
+        const infoAvailable = Number(info.totalAvailableBalance);
+        const infoWithdrawable = Number(info.maxWithdrawAmount);
+        const pmAvailableCandidates = [
+          papiAvailableBalance,
+          infoAvailable,
+          infoWithdrawable,
+        ].filter(v => Number.isFinite(v) && (v as number) >= 0) as number[];
+
+        const primaryAvailable = pmAvailableCandidates.length > 0 ? pmAvailableCandidates[0] : NaN;
+        const hasOpenPositions = Object.keys(allPositions).length > 0;
+        const fallbackCash = portfolioMarginEquity && portfolioMarginEquity > 0 ? portfolioMarginEquity : cashTotal;
+
+        if (Number.isFinite(primaryAvailable)) {
+          // PM APIs can report a very low available value while account equity is high.
+          // If we are flat (or nearly flat) and the value is implausibly small, show fallback cash/equity.
+          if (!hasOpenPositions && fallbackCash > 0 && primaryAvailable < fallbackCash * 0.1) {
+            uiAvailableBalance = fallbackCash;
+          } else {
+            uiAvailableBalance = primaryAvailable;
+          }
+        } else {
+          uiAvailableBalance = fallbackCash;
+        }
+      }
+
+      if (uiAvailableBalance === null) {
+        uiAvailableBalance = cashTotal;
       }
       
       console.log(`[TradeEdge Sync] ${client.id.toUpperCase()} Summary: Cash=$${cashTotal}, Valid Positions=${Object.keys(allPositions).join(',')}`);
@@ -345,7 +374,7 @@ async function startServer() {
         account: client.id === 'gemini' ? (params.account || 'Primary') : 'Standard',
         balance: { USDT: cashTotal }, 
         equity: portfolioMarginEquity,
-        availableBalance: papiAvailableBalance,
+        availableBalance: uiAvailableBalance,
         positions: allPositions,
         raw: process.env.NODE_ENV === 'development' ? { info: balanceData.info } : undefined
       });

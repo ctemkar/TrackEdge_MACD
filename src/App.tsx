@@ -36,6 +36,10 @@ export default function App() {
     const saved = localStorage.getItem('te_balance');
     return saved ? (parseFloat(saved) || 800) : 800;
   });
+  const [availableFunds, setAvailableFunds] = useState(() => {
+    const saved = localStorage.getItem('te_available_funds');
+    return saved ? (parseFloat(saved) || 800) : 800;
+  });
   
   interface Holding {
     id: string;
@@ -179,8 +183,11 @@ export default function App() {
       if (data.status === 'success') {
         const liveEquity = Number(data.equity);
         const usdt = Number(data?.balance?.USDT || 0);
+        const liveAvailable = Number(data?.availableBalance);
         const syncedBalance = Number.isFinite(liveEquity) && liveEquity > 0 ? liveEquity : usdt;
+        const syncedAvailable = Number.isFinite(liveAvailable) && liveAvailable >= 0 ? liveAvailable : usdt;
         setBalance(syncedBalance);
+        setAvailableFunds(syncedAvailable);
         
         let freshHoldings: Holding[] = [];
         if (data.positions) {
@@ -231,12 +238,6 @@ export default function App() {
         if (currentEquity > 0 && (defaults.includes(benchmarkCapital) || (!isRealMode && !holdings.length))) {
           setBenchmarkCapital(currentEquity);
           addLog(`BASIS LOCKED: Tracking performance from $${currentEquity.toFixed(2)} baseline.`, 'info');
-        }
-
-        // In live mode with no open positions, keep baseline aligned to current equity
-        // so performance starts near zero after mode switch or account sync.
-        if (isRealMode && freshHoldings.length === 0 && currentEquity > 0) {
-          setBenchmarkCapital(currentEquity);
         }
 
         // GHOST BASIS RESET: If baseline is huge but equity is 0/small on first real sync, auto-correct
@@ -548,13 +549,14 @@ export default function App() {
   // Persistence Sync
   useEffect(() => {
     localStorage.setItem('te_balance', balance.toString());
+    localStorage.setItem('te_available_funds', availableFunds.toString());
     localStorage.setItem('te_holdings', JSON.stringify(holdings));
     localStorage.setItem('te_history', JSON.stringify(tradeHistory));
     localStorage.setItem('te_seed', seedCapital.toString());
     localStorage.setItem('te_benchmark_capital', benchmarkCapital.toString());
     localStorage.setItem('te_auto_trade', autoTrade.toString());
     localStorage.setItem('te_real_mode', isRealMode.toString());
-  }, [balance, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode]);
+  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode]);
 
   // Baseline Safety: If paper trading and baseline is from a ghost real-sync session, fix it.
   useEffect(() => {
@@ -563,6 +565,24 @@ export default function App() {
       setBenchmarkCapital(balance);
     }
   }, [isRealMode, balance, holdings.length, benchmarkCapital, addLog]);
+
+  useEffect(() => {
+    if (!isRealMode) {
+      setAvailableFunds(balance);
+    }
+  }, [isRealMode, balance]);
+
+  useEffect(() => {
+    if (!isRealMode) return;
+
+    // Keep live account metrics fresh after user has explicitly enabled Live mode.
+    syncRealBalance();
+    const timer = setInterval(() => {
+      syncRealBalance();
+    }, 15000);
+
+    return () => clearInterval(timer);
+  }, [isRealMode, syncRealBalance]);
 
   const currentHolding = holdings.find(h => h.symbol === symbol);
   const stopLossPrice = (currentHolding && currentPrice)
@@ -728,6 +748,7 @@ export default function App() {
 
   const resetAccount = React.useCallback(() => {
     setBalance(seedCapital);
+    setAvailableFunds(seedCapital);
     setBenchmarkCapital(seedCapital);
     setHoldings([]);
     setTradeHistory([]);
@@ -735,6 +756,7 @@ export default function App() {
     localStorage.clear();
     localStorage.setItem('te_seed', seedCapital.toString());
     localStorage.setItem('te_benchmark_capital', seedCapital.toString());
+    localStorage.setItem('te_available_funds', seedCapital.toString());
     addLog(`Laboratory reset: Initializing with $${seedCapital} capital.`, 'info');
   }, [seedCapital, addLog]);
 
@@ -890,15 +912,23 @@ export default function App() {
   
   const equity = calculateEquity();
   const totalInvested = holdings.reduce((acc, h) => acc + (h.amount * h.entryPrice), 0);
+  const unrealizedRisk = holdings.reduce((sum, h) => {
+    if (Number.isFinite(h.unrealizedPnl)) return sum + Number(h.unrealizedPnl);
+    const mark = holdingPrices[h.symbol] || h.entryPrice;
+    const move = h.side === 'SHORT' ? (h.entryPrice - mark) : (mark - h.entryPrice);
+    return sum + (move * h.amount);
+  }, 0);
   
   // Anti-Glitich: If equity is non-finite or impossible, it's a data core issue
   // We cap at $100,000,000 to allow "Whale" mode while still blocking glitches
   const isDataBroken = !isFinite(equity) || equity > 100000000 || equity < 0; 
   
-  const isFlatLiveBook = isRealMode && holdings.length === 0;
-  const pnl = isFlatLiveBook ? 0 : (equity - benchmarkCapital);
-  const pnlPercent = isFlatLiveBook ? 0 : (benchmarkCapital > 0 ? (pnl / benchmarkCapital) * 100 : 0);
-  const investedPct = benchmarkCapital > 0 ? (totalInvested / benchmarkCapital) * 100 : 0;
+  const pnl = equity - benchmarkCapital;
+  const pnlPercent = benchmarkCapital > 0 ? (pnl / benchmarkCapital) * 100 : 0;
+  const investedPct = equity > 0 ? (totalInvested / equity) * 100 : 0;
+  const displayedAvailableFunds = (isRealMode && holdings.length === 0 && balance > 0 && availableFunds < balance * 0.1)
+    ? balance
+    : (isRealMode ? availableFunds : balance);
 
   // Auto-Recovery - Clean wipe if core state is corrupted
   useEffect(() => {
@@ -1510,7 +1540,7 @@ export default function App() {
               trend={pnl >= 0 ? 'up' : 'down'}
               subValue={
                 <div className="flex items-center gap-2">
-                   <span className="opacity-60">CASH: ${balance.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                   <span className="opacity-60">CASH: ${displayedAvailableFunds.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                    <button 
                      onClick={(e) => { e.stopPropagation(); resetAccount(); }}
                      className="text-[8px] bg-white/5 hover:bg-white/10 px-2 py-0.5 rounded transition-colors uppercase font-bold"
@@ -1530,9 +1560,9 @@ export default function App() {
             <MetricBox 
               icon={<Activity className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Active Risk"
-              value={`$${holdings.reduce((sum, h) => sum + ((holdingPrices[h.symbol] || h.entryPrice) - h.entryPrice) * h.amount, 0).toFixed(2)}`}
+              value={`$${unrealizedRisk.toFixed(2)}`}
               subValue="Unrealized P&L"
-              trend={holdings.reduce((sum, h) => sum + ((holdingPrices[h.symbol] || h.entryPrice) - h.entryPrice) * h.amount, 0) >= 0 ? 'up' : 'down'}
+              trend={unrealizedRisk >= 0 ? 'up' : 'down'}
             />
             <MetricBox 
               icon={<Zap className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
@@ -1543,13 +1573,13 @@ export default function App() {
             <MetricBox 
               icon={<DollarSign className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Available Funds"
-              value={`$${balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+              value={`$${displayedAvailableFunds.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
               subValue={isRealMode ? "Live Exchange USD" : "Simulated Capital"}
             />
             <MetricBox 
               icon={<Activity className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Budget Efficiency"
-              value={`${(((equity - balance) / (equity || 1)) * 100).toFixed(1)}%`}
+              value={`${investedPct.toFixed(1)}%`}
               subValue="Asset Allocation %"
             />
           </div>
