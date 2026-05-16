@@ -28,8 +28,17 @@ export async function fetchAllSymbols(): Promise<{ label: string, value: string 
   try {
     const response = await fetch('/api/binance/proxy/exchangeInfo');
     const data = await response.json();
+    const allowedQuotes = new Set(['USDT', 'USDC']);
     return data.symbols
-      .filter((s: any) => s.status === 'TRADING')
+      .filter((s: any) => {
+        const status = String(s?.status || '').toUpperCase();
+        const contractType = String(s?.contractType || '').toUpperCase();
+        const quote = String(s?.quoteAsset || '').toUpperCase();
+        const symbol = String(s?.symbol || '').toUpperCase();
+        const isPerpOrUnknown = !contractType || contractType === 'PERPETUAL';
+        const hasAllowedQuote = quote ? allowedQuotes.has(quote) : (symbol.endsWith('USDT') || symbol.endsWith('USDC'));
+        return status === 'TRADING' && isPerpOrUnknown && hasAllowedQuote;
+      })
       .map((s: any) => ({
         label: s.symbol,
         value: s.symbol
@@ -44,7 +53,7 @@ export async function fetchTopSymbolsByVolume(limit: number = 20): Promise<strin
     const response = await fetch('/api/binance/proxy/ticker24hr');
     const data = await response.json();
     return data
-      .filter((s: any) => ['USDT', 'USD', 'GUSD', 'USDC', 'DAI'].some(q => s.symbol.endsWith(q)))
+      .filter((s: any) => ['USDT', 'USDC'].some(q => String(s?.symbol || '').toUpperCase().endsWith(q)))
       .sort((a: any, b: any) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
       .slice(0, limit)
       .map((s: any) => s.symbol);
@@ -54,10 +63,10 @@ export async function fetchTopSymbolsByVolume(limit: number = 20): Promise<strin
   }
 }
 export function subscribeToTicker(symbol: string, onUpdate: (price: number) => void) {
-  const isBinanceSymbol = symbol.endsWith('USDT') && !symbol.includes('/');
+  const isBinanceSymbol = (symbol.endsWith('USDT') || symbol.endsWith('USDC')) && !symbol.includes('/');
   
   if (isBinanceSymbol) {
-    const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@ticker`);
+    const ws = new WebSocket(`wss://fstream.binance.com/ws/${symbol.toLowerCase()}@ticker`);
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
       onUpdate(parseFloat(data.c));

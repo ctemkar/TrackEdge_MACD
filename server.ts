@@ -4,6 +4,7 @@ import { createServer as createViteServer } from 'vite';
 import * as ccxt from 'ccxt';
 import dotenv from 'dotenv';
 import cors from 'cors';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -15,10 +16,54 @@ async function startServer() {
     .split(',')
     .map(s => s.trim().toUpperCase())
     .filter(Boolean);
+  const liveFuturesQuoteAllowlist = (process.env.LIVE_FUTURES_QUOTE_ALLOWLIST || 'USDT,USDC')
+    .split(',')
+    .map(s => s.trim().toUpperCase())
+    .filter(Boolean);
   const unsupportedSymbolSkips = new Map<string, { until: number; count: number; reason: string }>();
 
   app.use(cors());
   app.use(express.json());
+
+  // Direct Binance API helper for positions (bypasses CCXT method issues)
+  const fetchBinancePositionsViaHttp = async (apiKey: string, apiSecret: string): Promise<any[]> => {
+    try {
+      const timestamp = Date.now();
+      const params = new URLSearchParams({ timestamp: String(timestamp) });
+      const queryString = params.toString();
+      
+      const signature = crypto
+        .createHmac('sha256', apiSecret)
+        .update(queryString)
+        .digest('hex');
+      
+      const url = `https://fapi.binance.com/fapi/v2/positionRisk?${queryString}&signature=${signature}`;
+      
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'X-MBX-APIKEY': apiKey,
+          'Content-Type': 'application/json',
+        },
+      });
+      
+      if (!response.ok) {
+        const text = await response.text();
+        console.warn(`[TradeEdge] Binance /fapi/v2/positionRisk returned ${response.status}: ${text.substring(0, 100)}`);
+        return [];
+      }
+      
+      const data = await response.json();
+      if (Array.isArray(data)) {
+        console.log(`[TradeEdge] Direct Binance HTTP: Got ${data.length} positions from /fapi/v2/positionRisk`);
+        return data;
+      }
+      return [];
+    } catch (e: any) {
+      console.warn(`[TradeEdge] Direct Binance HTTP request failed: ${e?.message}`);
+      return [];
+    }
+  };
 
   // Exchange Client (Lazy Init)
   let exchangeInstance: ccxt.Exchange | null = null;
@@ -159,6 +204,112 @@ async function startServer() {
         )
       }
     });
+  });
+
+  app.post('/api/binance/transfer', async (req, res) => {
+    try {
+      if (process.env.ENABLE_REAL_TRADING !== 'true') {
+        throw new Error('REAL TRADING DISABLED: Set ENABLE_REAL_TRADING=true.');
+      }
+
+      const client = getExchange();
+      if (client.id !== 'binance') {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Transfer API currently supports Binance only.',
+        });
+      }
+
+      const rawAmount = Number(req.body?.amount);
+      const asset = String(req.body?.asset || 'USDT').toUpperCase();
+      const direction = String(req.body?.direction || 'SPOT_TO_UM').toUpperCase();
+
+      if (!Number.isFinite(rawAmount) || rawAmount <= 0) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Invalid amount. Provide a positive numeric amount.',
+        });
+      }
+
+      const transferTypeMap: Record<string, string> = {
+        SPOT_TO_UM: 'MAIN_UMFUTURE',
+        UM_TO_SPOT: 'UMFUTURE_MAIN',
+      };
+
+      const type = transferTypeMap[direction];
+      if (!type) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Invalid direction. Use SPOT_TO_UM or UM_TO_SPOT.',
+        });
+      }
+
+      const apiKey = (process.env.BINANCE_LIVE_API_KEY || process.env.BINANCE_API_KEY || process.env.BINANCE_KEY || '').trim();
+      const apiSecret = (process.env.BINANCE_LIVE_API_SECRET || process.env.BINANCE_API_SECRET || process.env.BINANCE_SECRET || '').trim();
+      if (!apiKey || !apiSecret) {
+        throw new Error('Binance API keys are missing. Check your .env credentials.');
+      }
+
+      const amount = Number(rawAmount.toFixed(8));
+      const timestamp = Date.now();
+      const recvWindow = 5000;
+      const params = new URLSearchParams({
+        type,
+        asset,
+        amount: amount.toString(),
+        timestamp: String(timestamp),
+        recvWindow: String(recvWindow),
+      });
+      const queryString = params.toString();
+      const signature = crypto
+        .createHmac('sha256', apiSecret)
+        .update(queryString)
+        .digest('hex');
+
+      const url = `https://api.binance.com/sapi/v1/asset/transfer?${queryString}&signature=${signature}`;
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'X-MBX-APIKEY': apiKey,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+      });
+
+      const text = await response.text();
+      const parsed = (() => {
+        try {
+          return JSON.parse(text);
+        } catch {
+          return { raw: text };
+        }
+      })();
+
+      if (!response.ok) {
+        const errMsg = parsed?.msg || parsed?.raw || `Binance transfer failed (${response.status})`;
+        return res.status(500).json({
+          status: 'error',
+          message: errMsg,
+          code: parsed?.code,
+          direction,
+          asset,
+          amount,
+        });
+      }
+
+      res.json({
+        status: 'success',
+        transfer: {
+          direction,
+          type,
+          asset,
+          amount,
+          tranId: parsed?.tranId,
+        },
+        raw: parsed,
+      });
+    } catch (error: any) {
+      res.status(500).json({ status: 'error', message: error?.message || 'Transfer failed' });
+    }
   });
 
   app.get('/api/binance/balance', async (req, res) => {
@@ -339,37 +490,149 @@ async function startServer() {
           };
         };
 
-        try {
-          const fetchedPositions = await (client as any).fetchPositions?.(undefined, { type: 'future' });
-          if (Array.isArray(fetchedPositions)) {
-            fetchedPositions.forEach(upsertPosition);
+        let positionsFetched = false;
+        
+        // PRIMARY: Try direct Binance HTTP API (most reliable)
+        const binanceKey = (process.env.BINANCE_LIVE_API_KEY || process.env.BINANCE_API_KEY || process.env.BINANCE_KEY || '').trim();
+        const binanceSecret = (process.env.BINANCE_LIVE_API_SECRET || process.env.BINANCE_API_SECRET || process.env.BINANCE_SECRET || '').trim();
+        
+        if (binanceKey && binanceSecret) {
+          const httpPositions = await fetchBinancePositionsViaHttp(binanceKey, binanceSecret);
+          if (httpPositions.length > 0) {
+            console.log(`[TradeEdge Sync] Successfully fetched ${httpPositions.length} positions via direct HTTP API`);
+            httpPositions.forEach(upsertPosition);
+            positionsFetched = true;
+          } else {
+            console.warn(`[TradeEdge Sync] Direct HTTP API returned 0 positions (may lack permissions)`);
           }
-        } catch (e: any) {
-          console.warn(`[TradeEdge Sync] fetchPositions failed: ${e?.message || 'unknown error'}`);
+        }
+        
+        // FALLBACK: Parse UM (Unified Margin) positions from fetchBalance info
+        if (!positionsFetched && Array.isArray(b.info)) {
+          const umAssets = b.info.filter((row: any) => {
+            const umBal = Number(row?.umWalletBalance || 0);
+            const umPnl = Number(row?.umUnrealizedPNL || 0);
+            return umBal !== 0 || umPnl !== 0;
+          });
+          
+          if (umAssets.length > 0) {
+            console.log(`[TradeEdge Sync] Found ${umAssets.length} assets with UM positions in fetchBalance info`);
+            umAssets.forEach((asset: any) => {
+              const symbol = String(asset.asset || '').toUpperCase();
+              const umBal = Number(asset.umWalletBalance || 0);
+              const umPnl = Number(asset.umUnrealizedPNL || 0);
+              if (symbol && (umBal !== 0 || umPnl !== 0)) {
+                console.log(`[TradeEdge Sync] UM Asset: ${symbol} balance=${umBal} pnl=${umPnl}`);
+                upsertPosition({
+                  symbol: `${symbol}/USDT:USDT`,
+                  positionAmt: umBal,
+                  positionSide: umBal < 0 ? 'SHORT' : 'LONG',
+                  contracts: Math.abs(umBal),
+                  unrealizedPnl: umPnl,
+                  info: {
+                    symbol: `${symbol}/USDT:USDT`,
+                    positionAmt: umBal,
+                    positionSide: umBal < 0 ? 'SHORT' : 'LONG',
+                    unRealizedProfit: umPnl,
+                  }
+                });
+              }
+            });
+            positionsFetched = true;
+          }
+        }
+        
+        // FALLBACK: Try CCXT methods if HTTP didn't work
+        if (!positionsFetched) {
+          try {
+            const fetchedPositions = await (client as any).fetchPositions?.(undefined, { type: 'future' });
+            if (Array.isArray(fetchedPositions) && fetchedPositions.length > 0) {
+              console.log(`[TradeEdge Sync] fetchPositions returned ${fetchedPositions.length} positions`);
+              fetchedPositions.forEach(upsertPosition);
+              positionsFetched = true;
+            } else {
+              console.warn(`[TradeEdge Sync] fetchPositions returned empty or not array`);
+            }
+          } catch (e: any) {
+            console.warn(`[TradeEdge Sync] fetchPositions failed: ${e?.message || 'unknown error'}`);
+          }
         }
 
-        const positionRiskFetchers = [
-          async () => await (client as any).fapiPrivateV2GetPositionRisk?.(),
-          async () => await (client as any).fapiPrivateGetPositionRisk?.(),
-          async () => await (client as any).papiGetUmPositionRisk?.(),
-        ];
+        if (!positionsFetched) {
+          const positionRiskFetchers = [
+            { name: 'fapiPrivateV2GetPositionRisk', fn: async () => await (client as any).fapiPrivateV2GetPositionRisk?.() },
+            { name: 'fapiPrivateGetPositionRisk', fn: async () => await (client as any).fapiPrivateGetPositionRisk?.() },
+            { name: 'papiGetUmPositionRisk', fn: async () => await (client as any).papiGetUmPositionRisk?.() },
+            { name: 'privateGetUmPositionRisk', fn: async () => await (client as any).privateGetUmPositionRisk?.() },
+          ];
 
-        for (const fetcher of positionRiskFetchers) {
-          try {
-            const rows = await fetcher();
-            if (Array.isArray(rows) && rows.length > 0) {
-              rows.forEach(upsertPosition);
-              break;
+          for (const { name, fn } of positionRiskFetchers) {
+            try {
+              const rows = await fn();
+              if (Array.isArray(rows) && rows.length > 0) {
+                console.log(`[TradeEdge Sync] ${name} returned ${rows.length} positions`);
+                rows.forEach(upsertPosition);
+                positionsFetched = true;
+                break;
+              } else {
+                console.warn(`[TradeEdge Sync] ${name} returned empty or not array`);
+              }
+            } catch (e: any) {
+              console.warn(`[TradeEdge Sync] ${name} failed: ${e?.message || 'unknown error'}`);
             }
-          } catch {
-            // Try the next position endpoint variant.
           }
+        }
+        
+        if (!positionsFetched && Object.keys(allPositions).length === 0) {
+          console.warn(`[TradeEdge Sync] WARNING: No positions fetched from any endpoint. Attempting direct account info query...`);
+          try {
+            const acctInfo = await (client as any).privateGetAccount?.();
+            if (acctInfo && Array.isArray(acctInfo.positions)) {
+              console.log(`[TradeEdge Sync] Found ${acctInfo.positions.length} positions in account info`);
+              acctInfo.positions.forEach((p: any) => {
+                if (Number(p.positionAmt || 0) !== 0) {
+                  upsertPosition(p);
+                }
+              });
+              positionsFetched = true;
+            }
+          } catch (e: any) {
+            console.warn(`[TradeEdge Sync] Direct account query failed: ${e?.message}`);
+          }
+        }
+        
+        if (!positionsFetched && Object.keys(allPositions).length === 0) {
+          console.warn(`[TradeEdge Sync] WARNING: No positions fetched from any endpoint. Account may be flat or API keys lack futures permissions.`);
+          try {
+            const acct = await (client as any).fetchAccount?.();
+            if (acct && typeof acct === 'object') {
+              console.log(`[TradeEdge Sync] fetchAccount returned account info.`);
+              const acctStr = JSON.stringify(acct).substring(0, 300);
+              console.log(`[TradeEdge Sync] Account data (truncated): ${acctStr}`);
+            }
+          } catch (fallbackErr: any) {
+            console.warn(`[TradeEdge Sync] Fallback fetchAccount failed: ${fallbackErr?.message}`);
+          }
+        } else if (positionsFetched || Object.keys(allPositions).length > 0) {
+          console.log(`[TradeEdge Sync] Total positions loaded: ${Object.keys(allPositions).length}`);
         }
 
         totalUnrealizedPnl = Object.values(allPositions).reduce((sum, p) => {
           const u = Number((p as any)?.unrealizedPnl);
           return Number.isFinite(u) ? sum + u : sum;
         }, 0);
+
+        // ALSO add UM unrealized PnL from the account info (UM = Unified Margin positions in futures)
+        if (Array.isArray(b.info) && totalUnrealizedPnl === 0) {
+          const umPnlSum = b.info.reduce((sum: number, row: any) => {
+            const umPnl = Number(row?.umUnrealizedPNL || 0);
+            return sum + (Number.isFinite(umPnl) ? umPnl : 0);
+          }, 0);
+          if (umPnlSum !== 0) {
+            console.log(`[TradeEdge Sync] UM Account unrealized PnL: ${umPnlSum}`);
+            totalUnrealizedPnl = umPnlSum;
+          }
+        }
       }
 
       if (client.id === 'binance') {
@@ -434,7 +697,8 @@ async function startServer() {
         uiAvailableBalance = cashTotal;
       }
       
-      console.log(`[TradeEdge Sync] ${client.id.toUpperCase()} Summary: Cash=$${cashTotal}, Valid Positions=${Object.keys(allPositions).join(',')}`);
+      const positionKeys = Object.keys(allPositions);
+      console.log(`[TradeEdge Sync] ${client.id.toUpperCase()} Summary: Cash=$${cashTotal.toFixed(2)}, Positions=${positionKeys.length}, Valid=${positionKeys.join(',')}`);
       
       res.json({ 
         status: 'success', 
@@ -443,9 +707,14 @@ async function startServer() {
         balance: { USDT: cashTotal }, 
         equity: portfolioMarginEquity,
         availableBalance: uiAvailableBalance,
-        unrealizedPnl: totalUnrealizedPnl,
+        unrealizedPnl: Number.isFinite(totalUnrealizedPnl) ? totalUnrealizedPnl : 0,
         positions: allPositions,
-        raw: process.env.NODE_ENV === 'development' ? { info: balanceData.info } : undefined
+        raw: { info: balanceData.info },
+        _debug: process.env.NODE_ENV === 'development' ? { 
+          positionsCount: Object.keys(allPositions).length, 
+          totalUnrealizedPnl,
+          info: balanceData.info 
+        } : undefined
       });
     } catch (error: any) {
       console.error(`[TradeEdge Sync Error] ${error.message}`);
@@ -534,7 +803,7 @@ async function startServer() {
 
           const byId = (client as any).markets_by_id || {};
           const candidates = byId[raw] ? (Array.isArray(byId[raw]) ? byId[raw] : [byId[raw]]) : [];
-          const allowedQuotes = new Set(liveQuoteAllowlist);
+          const allowedQuotes = new Set(liveFuturesQuoteAllowlist);
           const filteredCandidates = candidates.filter((m: any) => {
             const q = (m?.quote || '').toUpperCase();
             const isContract = m?.contract || m?.swap || m?.future || m?.type === 'swap';
@@ -545,7 +814,7 @@ async function startServer() {
           const resolved = filteredCandidates[0] || candidates.find((m: any) => m?.contract && m?.linear && m?.active !== false) || null;
           
           if (!resolved) {
-            console.log(`[TradeEdge] Market validation failed for ${raw}: candidates=${candidates.length}, filtered=${filteredCandidates.length}, allowed_quotes=[${liveQuoteAllowlist.join(',')}]`);
+            console.log(`[TradeEdge] Market validation failed for ${raw}: candidates=${candidates.length}, filtered=${filteredCandidates.length}, allowed_quotes=[${liveFuturesQuoteAllowlist.join(',')}]`);
           }
 
           if (resolved?.symbol) {
@@ -559,7 +828,7 @@ async function startServer() {
               until: Date.now() + (1000 * 60 * 3),
               reason: 'unsupported market mapping',
             });
-            throw new Error(`UNSUPPORTED MARKET: ${raw} not tradable on allowed quotes [${liveQuoteAllowlist.join(', ')}]`);
+            throw new Error(`UNSUPPORTED MARKET: ${raw} not tradable on futures quotes [${liveFuturesQuoteAllowlist.join(', ')}]`);
           }
 
           const market = (client as any).markets?.[ccxtSymbol] || resolved;
@@ -710,8 +979,8 @@ async function startServer() {
         const mapped = ohlcv.map(c => [c[0], c[1].toString(), c[2].toString(), c[3].toString(), c[4].toString(), c[5].toString(), c[0], "0", 1, "0", "0", "0"]);
         return res.json(mapped);
       } else {
-        // Binance default
-        const binanceUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+        // Binance futures default (USD-M)
+        const binanceUrl = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
         const response = await fetch(binanceUrl);
         if (response.ok) return res.json(await response.json());
         throw new Error('Binance fetch failed');
@@ -741,7 +1010,7 @@ async function startServer() {
         });
         return res.json({ symbols });
       } else {
-        const url = 'https://api.binance.com/api/v3/exchangeInfo';
+        const url = 'https://fapi.binance.com/fapi/v1/exchangeInfo';
         const response = await fetch(url);
         if (response.ok) return res.json(await response.json());
         throw new Error('Binance exchangeInfo failed');
@@ -765,7 +1034,7 @@ async function startServer() {
         }));
         return res.json(mapped);
       } else {
-        const url = 'https://api.binance.com/api/v3/ticker/24hr';
+        const url = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
         const response = await fetch(url);
         if (response.ok) return res.json(await response.json());
         throw new Error('Binance ticker failed');

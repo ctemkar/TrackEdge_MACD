@@ -222,6 +222,12 @@ export default function App() {
             return up.replace('/', '').replace(':USDT', 'USDT').replace(':USDC', 'USDC').replace(':USD', 'USD').replace(':', '');
           };
 
+          const positionCount = Object.keys(data.positions).length;
+          console.log(`[TradeEdge SYNC] Backend returned ${positionCount} positions`);
+          if (positionCount > 0) {
+            console.log(`[TradeEdge SYNC] Position keys: ${Object.keys(data.positions).join(', ')}`);
+          }
+
           freshHoldings = Object.entries(data.positions).map(([coin, info]: [string, any]) => {
             const coinUpper = coin.toUpperCase();
             const fromInfoSymbol = toCompactSymbol(info?.symbol || '');
@@ -258,6 +264,10 @@ export default function App() {
           }).filter((h): h is Holding => h !== null);
 
           setHoldings(freshHoldings);
+          console.log(`[TradeEdge SYNC] Frontend holdings updated: ${freshHoldings.length} positions ready for Active Positions Engine`);
+          if (freshHoldings.length > 0) {
+            console.log(`[TradeEdge SYNC] Holdings: ${freshHoldings.map(h => `${h.symbol}(${h.side})`).join(', ')}`);
+          }
         }
 
         const totalPositionsValue = freshHoldings.reduce((sum, h) => {
@@ -471,30 +481,41 @@ export default function App() {
             });
           };
 
-          // Exchange can acknowledge an order while position state lags.
-          // Retry verification briefly before classifying as FILLED/FAILED.
+          // STRICT: Only mark FILLED if live position actually exists on exchange now.
+          // No retries, no assumptions. If position doesn't match, order failed at exchange level.
           let verified = false;
+          let verifyAttempts = 0;
           try {
-            for (let attempt = 0; attempt < 3 && !verified; attempt++) {
-              await new Promise(r => setTimeout(r, 900));
+            while (verifyAttempts < 4 && !verified) {
+              await new Promise(r => setTimeout(r, 600 + verifyAttempts * 400));
               const verifyResp = await fetch('/api/binance/balance');
-              if (!verifyResp.ok) continue;
-              const verify = await verifyResp.json();
-              const positions = verify?.positions || {};
-              const hasPosition = hasPositionForSymbol(positions, tradeSymbol);
-              if (closingExisting) verified = !hasPosition;
-              else if (type === 'BUY' || openingShort) verified = hasPosition;
+              if (verifyResp.ok) {
+                const verify = await verifyResp.json();
+                const positions = verify?.positions || {};
+                const hasPosition = hasPositionForSymbol(positions, tradeSymbol);
+                if (closingExisting) {
+                  verified = !hasPosition;
+                } else if (type === 'BUY' || openingShort) {
+                  verified = hasPosition;
+                }
+                if (verified) {
+                  console.log(`[TradeEdge] VERIFIED: ${type} ${tradeSymbol} - Position confirmed after attempt ${verifyAttempts + 1}`);
+                  break;
+                }
+              }
+              verifyAttempts++;
             }
-          } catch {
-            // Fall through to unverified handling below.
+          } catch (e) {
+            console.warn(`[TradeEdge] Verification fetch failed: ${e}`);
           }
 
-          if (!verified && (type === 'BUY' || openingShort || closingExisting)) {
-            const msg = 'Exchange acknowledged order but no matching live position update was detected.';
-            addLog(`REAL ${type} UNVERIFIED: ${tradeSymbol} - ${msg}`, 'warning');
-            setExecutionFeedback({ type: 'warning', message: `${type} unverified for ${tradeSymbol}: ${msg}` });
+          if (!verified) {
+            const msg = 'Exchange order response received but NO live position detected. Order may have failed or not reached exchange.';
+            addLog(`REAL ${type} FAILED: ${tradeSymbol} - ${msg}`, 'warning');
+            setExecutionFeedback({ type: 'warning', message: `${type} failed for ${tradeSymbol}: Position not found.` });
             pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `FAILED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
-            setTimeout(syncRealBalance, 1200);
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 2) }));
+            setTimeout(syncRealBalance, 1500);
             return;
           }
 
