@@ -273,6 +273,8 @@ async function startServer() {
         }
       }
 
+      let totalUnrealizedPnl = 0;
+
       if (client.id === 'binance') {
         try {
           const fetchedPositions = await (client as any).fetchPositions?.();
@@ -297,11 +299,46 @@ async function startServer() {
                 entryPrice: Number.isFinite(entry) && entry > 0 ? entry : undefined,
                 unrealizedPnl: Number.isFinite(unrealized) ? unrealized : undefined,
               };
+              if (Number.isFinite(unrealized)) totalUnrealizedPnl += unrealized;
             }
           }
         } catch {
           // If positions endpoint fails, keep balance-only response.
         }
+
+        try {
+          const umRisk = await (client as any).papiGetUmPositionRisk?.();
+          if (Array.isArray(umRisk)) {
+            for (const p of umRisk) {
+              const rawAmt = Number(p?.positionAmt || 0);
+              const contracts = Math.abs(rawAmt);
+              if (!Number.isFinite(contracts) || contracts <= 0) continue;
+
+              const rawSymbol = String(p?.symbol || '').toUpperCase();
+              if (!rawSymbol) continue;
+              const normalized = rawSymbol.endsWith('USDT') || rawSymbol.endsWith('USD') ? rawSymbol : `${rawSymbol}USDT`;
+              const entry = Number(p?.entryPrice || 0);
+              const unrealized = Number(p?.unRealizedProfit || 0);
+              const sideRaw = String(p?.positionSide || '').toUpperCase();
+              const inferredSide: 'LONG' | 'SHORT' = sideRaw === 'SHORT' || rawAmt < 0 ? 'SHORT' : 'LONG';
+
+              allPositions[normalized] = {
+                amount: contracts,
+                total: contracts,
+                side: inferredSide,
+                entryPrice: Number.isFinite(entry) && entry > 0 ? entry : undefined,
+                unrealizedPnl: Number.isFinite(unrealized) ? unrealized : undefined,
+              };
+            }
+          }
+        } catch {
+          // UM position risk endpoint may be unavailable for some accounts.
+        }
+
+        totalUnrealizedPnl = Object.values(allPositions).reduce((sum, p) => {
+          const u = Number((p as any)?.unrealizedPnl);
+          return Number.isFinite(u) ? sum + u : sum;
+        }, 0);
       }
 
       if (client.id === 'binance') {
@@ -375,6 +412,7 @@ async function startServer() {
         balance: { USDT: cashTotal }, 
         equity: portfolioMarginEquity,
         availableBalance: uiAvailableBalance,
+        unrealizedPnl: totalUnrealizedPnl,
         positions: allPositions,
         raw: process.env.NODE_ENV === 'development' ? { info: balanceData.info } : undefined
       });

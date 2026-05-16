@@ -108,6 +108,7 @@ export default function App() {
   const [isDefensiveMode, setIsDefensiveMode] = useState(false);
   const [systemLogs, setSystemLogs] = useState<{ time: string, message: string, type: 'info' | 'success' | 'warning' }[]>([]);
   const [holdingPrices, setHoldingPrices] = useState<Record<string, number>>({});
+  const [liveUnrealizedPnl, setLiveUnrealizedPnl] = useState(0);
   const [cooldowns, setCooldowns] = useState<Record<string, number>>({});
   const [isSyncing, setIsSyncing] = useState(false);
   const [serverStatus, setServerStatus] = useState<'IDLE' | 'OK' | 'ERROR'>('IDLE');
@@ -201,8 +202,10 @@ export default function App() {
         const liveAvailable = Number(data?.availableBalance);
         const syncedBalance = Number.isFinite(liveEquity) && liveEquity > 0 ? liveEquity : usdt;
         const syncedAvailable = Number.isFinite(liveAvailable) && liveAvailable >= 0 ? liveAvailable : usdt;
+        const syncedUnrealized = Number(data?.unrealizedPnl);
         setBalance(syncedBalance);
         setAvailableFunds(syncedAvailable);
+        setLiveUnrealizedPnl(Number.isFinite(syncedUnrealized) ? syncedUnrealized : 0);
         
         let freshHoldings: Holding[] = [];
         if (data.positions) {
@@ -303,6 +306,8 @@ export default function App() {
 
   const executeTrade = React.useCallback(async (type: 'BUY' | 'SELL', tradeSymbol: string, price: number, reason: string = 'Strategy Match', targetId?: string, cycleId?: number) => {
     if (loading || !price) return;
+    const time = new Date().toISOString();
+    const eventCycleId = typeof cycleId === 'number' ? cycleId : undefined;
     
     if (tradeSymbol.includes('undefined') || price <= 0) {
        addLog(`TRADE ABORTED: Invalid symbol or price [${tradeSymbol} @ ${price}]`, 'warning');
@@ -327,17 +332,23 @@ export default function App() {
     tradeLockout.current.add(lockKey);
     setTimeout(() => tradeLockout.current.delete(lockKey), 5000);
 
-    const time = new Date().toISOString();
-    const eventCycleId = typeof cycleId === 'number' ? cycleId : undefined;
-    
+
     if (isRealMode) {
       addLog(`EXECUTING REAL ${type}: ${tradeSymbol} @ $${price} [${reason}]`, 'info');
+      let existingHolding = holdings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
+      let heldAmount = existingHolding?.amount || 0;
+      let heldSide = existingHolding?.side;
+      let openingShort = type === 'SELL' && (!existingHolding || heldAmount <= 0);
+      let closingExisting = Boolean(existingHolding) && (
+        (heldSide === 'LONG' && type === 'SELL') ||
+        (heldSide === 'SHORT' && type === 'BUY')
+      );
       try {
-        const existingHolding = holdings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
-        const heldAmount = existingHolding?.amount || 0;
-        const heldSide = existingHolding?.side;
-        const openingShort = type === 'SELL' && (!existingHolding || heldAmount <= 0);
-        const closingExisting = Boolean(existingHolding) && (
+        existingHolding = holdings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
+        heldAmount = existingHolding?.amount || 0;
+        heldSide = existingHolding?.side;
+        openingShort = type === 'SELL' && (!existingHolding || heldAmount <= 0);
+        closingExisting = Boolean(existingHolding) && (
           (heldSide === 'LONG' && type === 'SELL') ||
           (heldSide === 'SHORT' && type === 'BUY')
         );
@@ -431,8 +442,53 @@ export default function App() {
           throw new Error(result.message || 'Order failed');
         }
       } catch (e: any) {
-        addLog(`REAL ${type} FAILED: ${e.message}`, 'warning');
-        pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `FAILED: ${e.message}`, status: 'FAILED', cycleId: eventCycleId });
+        const msg = String(e?.message || 'Unknown order failure');
+        const softSkip = /(SYMBOL SKIPPED|UNSUPPORTED MARKET|INVALID ORDER SIZE|ORDER SIZE UNDERFLOW|allocation below|Unable to size|No open position|Duplicate order lockout)/i.test(msg);
+
+        if (softSkip) {
+          addLog(`REAL ${type} SKIPPED: ${msg}`, 'warning');
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${msg}`, status: 'SKIPPED', cycleId: eventCycleId });
+          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 2) }));
+          return;
+        }
+
+        // Some exchange/network errors can occur after order placement.
+        // Re-sync once and verify position state before marking FAILED.
+        let verified = false;
+        try {
+          const verifyResp = await fetch('/api/binance/balance');
+          if (verifyResp.ok) {
+            const verify = await verifyResp.json();
+            const positions = verify?.positions || {};
+            const hasPosition = Boolean(positions[tradeSymbol]);
+            if (closingExisting) {
+              verified = !hasPosition;
+            } else if (type === 'BUY' || openingShort) {
+              verified = hasPosition;
+            }
+          }
+        } catch {
+          // Keep original failure classification below.
+        }
+
+        if (verified) {
+          addLog(`REAL ${type} VERIFIED: ${tradeSymbol} (post-error exchange state confirms fill)`, 'success');
+          pushTradeEvent({
+            type,
+            symbol: tradeSymbol,
+            price,
+            amount: heldAmount || 0,
+            time,
+            reason: `VERIFIED AFTER ERROR: ${msg}`,
+            status: 'FILLED',
+            cycleId: eventCycleId,
+          });
+          setTimeout(syncRealBalance, 1500);
+          return;
+        }
+
+        addLog(`REAL ${type} FAILED: ${msg}`, 'warning');
+        pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `FAILED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
         setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 2) }));
         return;
       }
@@ -970,6 +1026,7 @@ export default function App() {
     const move = h.side === 'SHORT' ? (h.entryPrice - mark) : (mark - h.entryPrice);
     return sum + (move * h.amount);
   }, 0);
+  const displayedUnrealizedRisk = isRealMode ? liveUnrealizedPnl : unrealizedRisk;
   
   // Anti-Glitich: If equity is non-finite or impossible, it's a data core issue
   // We cap at $100,000,000 to allow "Whale" mode while still blocking glitches
@@ -1631,9 +1688,9 @@ export default function App() {
             <MetricBox 
               icon={<Activity className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Active Risk"
-              value={`$${unrealizedRisk.toFixed(2)}`}
+              value={`$${displayedUnrealizedRisk.toFixed(2)}`}
               subValue="Unrealized P&L"
-              trend={unrealizedRisk >= 0 ? 'up' : 'down'}
+              trend={displayedUnrealizedRisk >= 0 ? 'up' : 'down'}
             />
             <MetricBox 
               icon={<Zap className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
