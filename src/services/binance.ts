@@ -2,8 +2,11 @@ import { Candle } from './indicators';
 
 export async function fetchBinanceData(symbol: string = 'BTCUSD', interval: string = '15m', limit: number = 500): Promise<Candle[]> {
   try {
-    // If symbol is passed without quote, default to USD for Gemini compatibility
-    const targetSymbol = symbol === 'BTC' ? 'BTCUSD' : symbol;
+    // Normalize to futures-style symbols (BTCUSDT) so proxy/futures endpoints remain valid.
+    const raw = String(symbol || 'BTCUSDT').toUpperCase();
+    const targetSymbol = raw === 'BTC'
+      ? 'BTCUSDT'
+      : (raw.endsWith('USD') && !raw.endsWith('USDT') ? `${raw}T` : raw);
     const response = await fetch(`/api/binance/proxy/klines?symbol=${targetSymbol}&interval=${interval}&limit=${limit}`);
     const data = await response.json();
     if (!Array.isArray(data)) {

@@ -24,6 +24,14 @@ async function startServer() {
 
   app.use(cors());
   app.use(express.json());
+  app.use((req, res, next) => {
+    res.on('finish', () => {
+      if (res.statusCode >= 500) {
+        console.warn(`[TradeEdge HTTP ${res.statusCode}] ${req.method} ${req.originalUrl}`);
+      }
+    });
+    next();
+  });
 
   // Direct Binance API helper for positions (bypasses CCXT method issues)
   const fetchBinancePositionsViaHttp = async (apiKey: string, apiSecret: string): Promise<any[]> => {
@@ -831,6 +839,16 @@ async function startServer() {
             throw new Error(`UNSUPPORTED MARKET: ${raw} not tradable on futures quotes [${liveFuturesQuoteAllowlist.join(', ')}]`);
           }
 
+          const marketStatus = String((resolved as any)?.info?.status || '').toUpperCase();
+          if (marketStatus && marketStatus !== 'TRADING') {
+            unsupportedSymbolSkips.set(raw, {
+              count: (unsupportedSymbolSkips.get(raw)?.count || 0) + 1,
+              until: Date.now() + (1000 * 60 * 10),
+              reason: `non-trading status ${marketStatus}`,
+            });
+            throw new Error(`SYMBOL NOT TRADING: ${raw} status=${marketStatus}`);
+          }
+
           const market = (client as any).markets?.[ccxtSymbol] || resolved;
           let finalAmount = Number(amount);
           if (!Number.isFinite(finalAmount) || finalAmount <= 0) {
@@ -952,7 +970,8 @@ async function startServer() {
       const ticker = await client.fetchTicker(target);
       res.json({ status: 'success', price: ticker.last || ticker.close });
     } catch (error: any) {
-      res.status(500).json({ status: 'error', message: error.message });
+      // Fail soft for polling callers to avoid noisy 500 floods in UI.
+      res.json({ status: 'error', price: null, message: error.message });
     }
   });
 
@@ -983,10 +1002,12 @@ async function startServer() {
         const binanceUrl = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
         const response = await fetch(binanceUrl);
         if (response.ok) return res.json(await response.json());
-        throw new Error('Binance fetch failed');
+        // Some symbols intermittently return non-200; return empty candles so scanner continues.
+        return res.json([]);
       }
     } catch (error: any) {
-      res.status(500).json({ status: 'error', message: error.message });
+      // Fail soft for scanner: empty candles means "skip symbol" without UI/network error storms.
+      res.json([]);
     }
   });
 

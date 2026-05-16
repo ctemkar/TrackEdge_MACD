@@ -8,7 +8,7 @@ import { BacktestModule } from './components/BacktestModule';
 
 export default function App() {
   const AUTO_ENTRY_MIN_SCORE = 2;
-  const LIVE_QUOTE_ALLOWLIST = ['USDT', 'FDUSD', 'USDC', 'BUSD', 'TUSD', 'BTC', 'ETH', 'BNB'];
+  const LIVE_QUOTE_ALLOWLIST = ['USDT', 'USDC'];
   const [activeTab, setActiveTab] = useState<'LIVE' | 'BACKTEST'>('LIVE');
   const [data, setData] = useState<Candle[]>([]);
   const [indicators, setIndicators] = useState<IndicatorResult | null>(null);
@@ -19,7 +19,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
   const [marketPicks, setMarketPicks] = useState<MarketScanResult[]>([]);
-  const [symbol, setSymbol] = useState('BTCUSD');
+  const [symbol, setSymbol] = useState('BTCUSDT');
   const [availableSymbols, setAvailableSymbols] = useState<{ label: string, value: string }[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [stopLossPercent, setStopLossPercent] = useState(5);
@@ -128,10 +128,13 @@ export default function App() {
   const [isBotActive, setIsBotActive] = useState(false);
   const [scanExecutionStats, setScanExecutionStats] = useState({ cycleId: 0, attempted: 0, filled: 0, failed: 0, skipped: 0 });
   const [executionFeedback, setExecutionFeedback] = useState<{ type: 'info' | 'success' | 'warning', message: string } | null>(null);
+  const [entryLockUntil, setEntryLockUntil] = useState(0);
   const tradeLockout = React.useRef<Set<string>>(new Set());
   const isSyncingRef = React.useRef(false);
   const scanningRef = React.useRef(false);
   const currentScanCycleRef = React.useRef(0);
+  const entryLockUntilRef = React.useRef(0);
+  const lastScanSkipLogRef = React.useRef<Record<string, number>>({});
   
   // Refs for scan logic to avoid dependency loops
   const holdingsRef = React.useRef(holdings);
@@ -143,6 +146,10 @@ export default function App() {
     autoTradeRef.current = autoTrade;
     maxConcurrentTradesRef.current = maxConcurrentTrades;
   }, [holdings, autoTrade, maxConcurrentTrades]);
+
+  React.useEffect(() => {
+    entryLockUntilRef.current = entryLockUntil;
+  }, [entryLockUntil]);
 
   const [seedCapital, setSeedCapital] = useState(() => {
     const saved = localStorage.getItem('te_seed');
@@ -174,6 +181,25 @@ export default function App() {
       });
     }
   }, []);
+
+  const pushScanSkipEvent = React.useCallback((reason: string, cycleId: number) => {
+    const now = Date.now();
+    const lastTs = lastScanSkipLogRef.current[reason] || 0;
+    // Prevent execution history spam for repeating scan-level skips.
+    if (now - lastTs < 45000) return;
+    lastScanSkipLogRef.current[reason] = now;
+
+    pushTradeEvent({
+      type: 'BUY',
+      symbol: 'SCAN',
+      price: 0,
+      amount: 0,
+      time: new Date().toISOString(),
+      reason,
+      status: 'SKIPPED',
+      cycleId,
+    });
+  }, [pushTradeEvent]);
 
   const syncRealBalance = React.useCallback(async () => {
     if (isSyncingRef.current) return false;
@@ -234,6 +260,12 @@ export default function App() {
             let normalizedSymbol = fromInfoSymbol || (coinUpper.endsWith('USD') || coinUpper.endsWith('USDT') || coinUpper.endsWith('USDC')
               ? coinUpper
               : (data.exchange === 'binance' ? `${coinUpper}USDT` : `${coinUpper}USD`));
+
+            // STRICT VALIDATION: Reject malformed symbols (repeated quote assets like USDTUSDTUSDT)
+            if (!/^[A-Z0-9]+(USDT|USDC|USD)$/.test(normalizedSymbol) || /USDT.*USDT|USDC.*USDC/.test(normalizedSymbol)) {
+              console.warn(`[TradeEdge] Rejecting malformed symbol: "${normalizedSymbol}" (doesn't match valid trading pair format)`);
+              return null;
+            }
 
             // PRICE RESOLUTION: Do not default to 1 as it creates "Ghost Equity"
             const price = marketPicks.find(p => p.symbol === normalizedSymbol)?.lastPrice || 
@@ -356,6 +388,14 @@ export default function App() {
       return;
     }
 
+    // Reject malformed symbols (e.g., USDTUSDTUSDT, symbols with repeated quotes)
+    if (/USDT.*USDT|USDC.*USDC/.test(tradeSymbol)) {
+      addLog(`TRADE ABORTED: Malformed symbol "${tradeSymbol}" (repeated quote asset)`, 'warning');
+      setExecutionFeedback({ type: 'warning', message: `${type} blocked: invalid symbol "${tradeSymbol}".` });
+      pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: Malformed symbol', status: 'SKIPPED', cycleId: eventCycleId });
+      return;
+    }
+
     const lockKey = `${type}_${tradeSymbol}_${targetId || 'all'}`;
     if (tradeLockout.current.has(lockKey)) {
       setExecutionFeedback({ type: 'warning', message: `${type} skipped for ${tradeSymbol}: duplicate order lockout.` });
@@ -363,7 +403,7 @@ export default function App() {
       return;
     }
     tradeLockout.current.add(lockKey);
-    setTimeout(() => tradeLockout.current.delete(lockKey), 5000);
+    setTimeout(() => tradeLockout.current.delete(lockKey), 15000);
 
 
     if (isRealMode) {
@@ -377,6 +417,29 @@ export default function App() {
         (heldSide === 'LONG' && type === 'SELL') ||
         (heldSide === 'SHORT' && type === 'BUY')
       );
+
+      const entryLockActive = entryLockUntilRef.current > Date.now();
+      if ((type === 'BUY' || openingShort) && !closingExisting && entryLockActive) {
+        const remainingSec = Math.max(1, Math.ceil((entryLockUntilRef.current - Date.now()) / 1000));
+        const lockMsg = `ENTRY LOCK ACTIVE (${remainingSec}s): waiting for successful exits before new positions.`;
+        addLog(lockMsg, 'warning');
+        setExecutionFeedback({ type: 'warning', message: lockMsg });
+        pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${lockMsg}`, status: 'SKIPPED', cycleId: eventCycleId });
+        return;
+      }
+
+      const lockEntries = (ms: number, why: string) => {
+        const until = Date.now() + ms;
+        setEntryLockUntil(prev => Math.max(prev, until));
+        addLog(`ENTRY LOCK: ${why}`, 'warning');
+      };
+
+      const clearEntryLock = () => {
+        if (entryLockUntilRef.current > Date.now()) {
+          setEntryLockUntil(0);
+        }
+      };
+
       try {
         existingHolding = holdings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
         heldAmount = existingHolding?.amount || 0;
@@ -441,20 +504,33 @@ export default function App() {
           : (openingShort ? 'SHORT' : 'LONG');
         const reduceOnly = closingExisting;
 
-        const resp = await fetch('/api/binance/order', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            symbol: tradeSymbol,
-            side: type,
-            type: 'MARKET',
-            amount: amount > 0 ? amount : undefined,
-            positionSide: requestedPositionSide,
-            reduceOnly,
-          })
-        });
+        const submitOrderOnce = async () => {
+          const resp = await fetch('/api/binance/order', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              symbol: tradeSymbol,
+              side: type,
+              type: 'MARKET',
+              amount: amount > 0 ? amount : undefined,
+              positionSide: requestedPositionSide,
+              reduceOnly,
+            })
+          });
+          return await resp.json();
+        };
 
-        const result = await resp.json();
+        let result: any = null;
+        const submitAttempts = closingExisting ? 3 : 1;
+        for (let attempt = 1; attempt <= submitAttempts; attempt++) {
+          result = await submitOrderOnce();
+          if (result?.status === 'success') break;
+          if (attempt < submitAttempts) {
+            await new Promise(r => setTimeout(r, 500));
+            addLog(`EXIT RETRY ${attempt}/${submitAttempts - 1}: ${tradeSymbol}`, 'warning');
+          }
+        }
+
         if (result.status === 'success') {
           const normalizeLiveSymbol = (rawSymbol: string) => {
             const compact = String(rawSymbol || '')
@@ -514,9 +590,16 @@ export default function App() {
             addLog(`REAL ${type} FAILED: ${tradeSymbol} - ${msg}`, 'warning');
             setExecutionFeedback({ type: 'warning', message: `${type} failed for ${tradeSymbol}: Position not found.` });
             pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `FAILED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
+            if (closingExisting) {
+              lockEntries(5 * 60 * 1000, `Close verification failed for ${tradeSymbol}. New entries paused for 5m.`);
+            }
             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 2) }));
             setTimeout(syncRealBalance, 1500);
             return;
+          }
+
+          if (closingExisting) {
+            clearEntryLock();
           }
 
           const closingLong = heldSide === 'LONG' && type === 'SELL';
@@ -594,6 +677,9 @@ export default function App() {
         if (verified) {
           addLog(`REAL ${type} VERIFIED: ${tradeSymbol} (post-error exchange state confirms fill)`, 'success');
           setExecutionFeedback({ type: 'success', message: `${type} verified for ${tradeSymbol} after exchange resync.` });
+          if (closingExisting) {
+            clearEntryLock();
+          }
           pushTradeEvent({
             type,
             symbol: tradeSymbol,
@@ -611,6 +697,9 @@ export default function App() {
         addLog(`REAL ${type} FAILED: ${msg}`, 'warning');
   setExecutionFeedback({ type: 'warning', message: `${type} failed for ${tradeSymbol}: ${msg}` });
         pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `FAILED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
+        if (closingExisting) {
+          lockEntries(5 * 60 * 1000, `Close order failed for ${tradeSymbol}. New entries paused for 5m.`);
+        }
         setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 2) }));
         return;
       }
@@ -719,16 +808,23 @@ export default function App() {
     addLog(`LIQUIDATION START: Closing ${holdings.length} vectors...`, 'warning');
     
     const currentPositions = [...holdings];
+    let attempted = 0;
     for (const h of currentPositions) {
       const price = holdingPrices[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice);
       if (price) {
         const closeSide: 'BUY' | 'SELL' = h.side === 'SHORT' ? 'BUY' : 'SELL';
+        attempted++;
         await executeTrade(closeSide, h.symbol, price, 'EMERGENCY_LIQUIDATION', h.id);
         await new Promise(r => setTimeout(r, 600));
       }
     }
-    
-    addLog(`LIQUIDATION COMPLETE. All positions closed.`, 'success');
+
+    const unresolved = holdingsRef.current.length;
+    if (unresolved > 0) {
+      addLog(`LIQUIDATION INCOMPLETE: ${attempted} close orders sent, ${unresolved} positions still open.`, 'warning');
+    } else {
+      addLog(`LIQUIDATION COMPLETE. All positions closed.`, 'success');
+    }
   }, [holdings, holdingPrices, symbol, currentPrice, executeTrade, addLog]);
 
   useEffect(() => {
@@ -905,6 +1001,13 @@ export default function App() {
       const currentAutoTrade = autoTradeRef.current;
       const currentHoldings = holdingsRef.current;
       const currentMaxTrades = maxConcurrentTradesRef.current;
+      const entryLockActive = entryLockUntilRef.current > Date.now();
+
+      if (currentAutoTrade && isRealMode && entryLockActive) {
+        const remainingSec = Math.max(1, Math.ceil((entryLockUntilRef.current - Date.now()) / 1000));
+        pushScanSkipEvent(`SKIP: Entry lock active (${remainingSec}s remaining) after close-order failures`, cycleId);
+        return;
+      }
 
       if (currentAutoTrade && currentHoldings.length > 0) {
         currentHoldings.forEach(holding => {
@@ -958,16 +1061,9 @@ export default function App() {
             : 0;
           const realTradableCapital = Math.max(realFreeCapital, realFallbackCapital);
           if (isRealMode && realTradableCapital < 10) {
-            pushTradeEvent({
-              type: 'BUY',
-              symbol: 'SCAN',
-              price: 0,
-              amount: 0,
-              time: new Date().toISOString(),
-              reason: `SKIP: Free margin too low for minimum order ($${realFreeCapital.toFixed(2)} effective $${realTradableCapital.toFixed(2)} < $10.00)`,
-              status: 'SKIPPED',
-              cycleId,
-            });
+            const marginLockUntil = Date.now() + (2 * 60 * 1000);
+            setEntryLockUntil(prev => Math.max(prev, marginLockUntil));
+            pushScanSkipEvent(`SKIP: Free margin too low for minimum order ($${realFreeCapital.toFixed(2)} effective $${realTradableCapital.toFixed(2)} < $10.00)`, cycleId);
             return;
           }
           const toTrade = entries.slice(0, availableSlots);
@@ -978,28 +1074,10 @@ export default function App() {
               executeTrade(side, pick.symbol, pick.lastPrice, `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`, undefined, cycleId);
             });
           } else {
-            pushTradeEvent({
-              type: 'BUY',
-              symbol: 'SCAN',
-              price: 0,
-              amount: 0,
-              time: new Date().toISOString(),
-              reason: `SKIP: No eligible entries (BUY=${potentialLongs.length}, SELL=${potentialShorts.length}, slots=${availableSlots})`,
-              status: 'SKIPPED',
-              cycleId,
-            });
+            pushScanSkipEvent(`SKIP: No eligible entries (BUY=${potentialLongs.length}, SELL=${potentialShorts.length}, slots=${availableSlots})`, cycleId);
           }
         } else {
-          pushTradeEvent({
-            type: 'BUY',
-            symbol: 'SCAN',
-            price: 0,
-            amount: 0,
-            time: new Date().toISOString(),
-            reason: `SKIP: No free slots (${currentHoldings.length}/${currentMaxTrades})`,
-            status: 'SKIPPED',
-            cycleId,
-          });
+          pushScanSkipEvent(`SKIP: No free slots (${currentHoldings.length}/${currentMaxTrades})`, cycleId);
         }
 
       }
@@ -1011,7 +1089,7 @@ export default function App() {
       setScanning(false);
       setTimeout(() => setIsBotActive(false), 2000);
     }
-  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushTradeEvent, availableFunds, balance]);
+  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance]);
  // Removed 'scanning' from dependencies
 
   const resetAccount = React.useCallback(() => {
@@ -1207,6 +1285,14 @@ export default function App() {
   const realizedPnl = totalPnl - openPnl;
   const investedPct = equity > 0 ? (totalInvested / equity) * 100 : 0;
   const displayedAvailableFunds = isRealMode ? availableFunds : balance;
+  const entryLockActive = entryLockUntil > Date.now();
+  const visibleTradeHistory = tradeHistory.filter(t => {
+    // Hide SCAN skips
+    if (t.symbol === 'SCAN' && t.status === 'SKIPPED') return false;
+    // Hide malformed/truncated symbols (TUSDT, USDTUSDTUSDT, etc)
+    if (!/^[A-Z0-9]+(USDT|USDC|USD)$/.test(t.symbol) || /USDT.*USDT|USDC.*USDC/.test(t.symbol)) return false;
+    return true;
+  });
 
   // Auto-Recovery - Clean wipe if core state is corrupted
   useEffect(() => {
@@ -1460,7 +1546,7 @@ export default function App() {
                     <div className="flex justify-end">
                       <button 
                         onClick={() => executeTrade('BUY', pick.symbol, pick.lastPrice, `AI_DISCOVERY_${pick.signal.score}`)}
-                        disabled={holdings.length >= maxConcurrentTrades || holdings.some(h => h.symbol === pick.symbol)}
+                        disabled={entryLockActive || holdings.length >= maxConcurrentTrades || holdings.some(h => h.symbol === pick.symbol)}
                         className="text-[#141414] hover:bg-[#F27D26] hover:text-white border border-[#141414]/10 text-[7px] px-2 py-0.5 font-bold uppercase transition-all disabled:opacity-0"
                       >
                         Execute
@@ -1885,17 +1971,12 @@ export default function App() {
               subValue={`Realized: ${realizedPnl >= 0 ? '+' : '-'}$${Math.abs(realizedPnl).toFixed(2)} | Open: ${openPnl >= 0 ? '+' : '-'}$${Math.abs(openPnl).toFixed(2)}`}
             />
             <MetricBox 
-              icon={<Activity className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
-              label="Active Risk"
-              value={`$${displayedUnrealizedRisk.toFixed(2)}`}
-              subValue="Unrealized P&L"
-              trend={displayedUnrealizedRisk >= 0 ? 'up' : 'down'}
-            />
-            <MetricBox 
               icon={<Zap className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Network Status"
               value={isSyncing ? "SYNCING..." : (isRealMode ? "LIVE" : "PAPER")}
-              subValue={serverConfig?.exchange ? `${serverConfig.exchange.toUpperCase()} | ${holdings.length}/${maxConcurrentTrades} SLOTS` : "SIMULATION"}
+              subValue={serverConfig?.exchange
+                ? `${serverConfig.exchange.toUpperCase()} | ${holdings.length}/${maxConcurrentTrades} SLOTS${entryLockActive ? ' | ENTRY LOCK' : ''}`
+                : "SIMULATION"}
             />
             <MetricBox 
               icon={<DollarSign className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
@@ -1927,7 +2008,7 @@ export default function App() {
                   LIQUIDATE ALL POSITIONS
                 </button>
                </div>
-            </div>
+              </div>
             
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
@@ -2044,10 +2125,10 @@ export default function App() {
                          </tr>
                       </thead>
                       <tbody className="divide-y divide-gray-50">
-                        {tradeHistory.length === 0 ? (
+                        {visibleTradeHistory.length === 0 ? (
                           <tr><td colSpan={3} className="px-4 py-12 text-center text-[10px] opacity-30 italic">No historical nodes recorded.</td></tr>
                         ) : (
-                          tradeHistory.map((trade, i) => (
+                          visibleTradeHistory.map((trade, i) => (
                             <tr key={i} className="hover:bg-gray-50/30 transition-colors">
                                <td className="px-4 py-3">
                                   <div className="flex flex-col">
