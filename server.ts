@@ -168,6 +168,8 @@ async function startServer() {
       }
 
       let balanceData: any;
+      let papiActualEquity: number | null = null;
+      let papiAvailableBalance: number | null = null;
       if (client.id === 'gemini') {
         try {
           // Fetch all possible sub-accounts for Gemini
@@ -203,6 +205,18 @@ async function startServer() {
         } catch (e) {
           console.warn(`[TradeEdge Sync] ${client.id} targeting ${params.account || 'default'} failed, fallback to default account.`);
           balanceData = await client.fetchBalance({});
+        }
+
+        try {
+          const papiAccount = await (client as any).papiGetAccount?.();
+          if (papiAccount) {
+            const actual = Number(papiAccount.actualEquity || papiAccount.accountEquity);
+            const available = Number(papiAccount.totalAvailableBalance || papiAccount.virtualMaxWithdrawAmount);
+            if (Number.isFinite(actual) && actual > 0) papiActualEquity = actual;
+            if (Number.isFinite(available) && available >= 0) papiAvailableBalance = available;
+          }
+        } catch {
+          // Not all accounts expose PAPI totals; fallback to fetchBalance-derived fields.
         }
       }
 
@@ -261,6 +275,7 @@ async function startServer() {
             .sort((a: any, c: any) => Number(c.totalWalletBalance || 0) - Number(a.totalWalletBalance || 0))[0] ||
           {};
         const pmCandidates = [
+          papiActualEquity,
           Number(info.totalWalletBalance),
           Number(info.totalMarginBalance),
           Number(info.totalCrossWalletBalance),
@@ -293,6 +308,7 @@ async function startServer() {
         account: client.id === 'gemini' ? (params.account || 'Primary') : 'Standard',
         balance: { USDT: cashTotal }, 
         equity: portfolioMarginEquity,
+        availableBalance: papiAvailableBalance,
         positions: allPositions,
         raw: process.env.NODE_ENV === 'development' ? { info: balanceData.info } : undefined
       });
@@ -370,6 +386,22 @@ async function startServer() {
           console.log(`[TradeEdge GEMINI] Executing: ${side} ${orderAmount} @ ${limitPrice}`);
           order = await client.createOrder(ccxtSymbol, 'limit', side.toLowerCase(), orderAmount, limitPrice);
       } else {
+          await client.loadMarkets();
+          let raw = ccxtSymbol.toUpperCase().replace('/', '').replace(':', '');
+          if (raw.endsWith('USD') && !raw.endsWith('USDT')) {
+            raw = `${raw}T`;
+          }
+          const byId = (client as any).markets_by_id || {};
+          const candidates = byId[raw] ? (Array.isArray(byId[raw]) ? byId[raw] : [byId[raw]]) : [];
+          const resolved = candidates.find((m: any) => m?.contract && m?.linear) || candidates[0];
+
+          if (resolved?.symbol) {
+            ccxtSymbol = resolved.symbol;
+          } else if (!ccxtSymbol.includes('/') && raw.endsWith('USDT')) {
+            const base = raw.slice(0, -4);
+            ccxtSymbol = `${base}/USDT:USDT`;
+          }
+
           order = await client.createMarketOrder(
             ccxtSymbol, 
             side.toLowerCase(), 

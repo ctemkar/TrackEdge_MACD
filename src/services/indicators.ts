@@ -131,6 +131,14 @@ export function evaluateStrategy(candles: Candle[], indicators: IndicatorResult)
   } else if (sellSignal) {
     overall = 'SELL';
     score = 10;
+  } else if (macdMode === 'BULLISH' && emaCrossover === 'BULLISH') {
+    // Momentum continuation long setup when MACD line is above signal.
+    overall = 'BUY';
+    score = 6;
+  } else if (macdMode === 'BEARISH' && emaCrossover === 'BEARISH') {
+    // Momentum continuation short setup when MACD line is below signal.
+    overall = 'SELL';
+    score = 6;
   } else {
     // Secondary setup recognition - Not trades, just context
     if (trend !== 'NEUTRAL') score += 1;

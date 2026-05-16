@@ -7,6 +7,7 @@ import { scanMarket, MarketScanResult } from './services/scanner';
 import { BacktestModule } from './components/BacktestModule';
 
 export default function App() {
+  const AUTO_ENTRY_MIN_SCORE = 2;
   const [activeTab, setActiveTab] = useState<'LIVE' | 'BACKTEST'>('LIVE');
   const [data, setData] = useState<Candle[]>([]);
   const [indicators, setIndicators] = useState<IndicatorResult | null>(null);
@@ -264,12 +265,11 @@ export default function App() {
        return;
     }
 
-    if (type === 'SELL') {
-      const isHeld = targetId 
-        ? holdings.some(h => h.id === targetId)
-        : holdings.some(h => h.symbol === tradeSymbol);
-      if (!isHeld) return;
-    }
+    const isHeld = targetId 
+      ? holdings.some(h => h.id === targetId)
+      : holdings.some(h => h.symbol === tradeSymbol);
+    const isRealShortEntry = isRealMode && type === 'SELL' && !targetId && !isHeld;
+    if (type === 'SELL' && !isHeld && !isRealShortEntry) return;
 
     const lockKey = `${type}_${tradeSymbol}_${targetId || 'all'}`;
     if (tradeLockout.current.has(lockKey)) return;
@@ -281,27 +281,38 @@ export default function App() {
     if (isRealMode) {
       addLog(`EXECUTING REAL ${type}: ${tradeSymbol} @ $${price} [${reason}]`, 'info');
       try {
-        const slotsAvailable = Math.max(1, maxConcurrentTrades - holdings.length);
-        const currentBalance = Math.max(0, balance);
-        let allocation = Math.min(currentBalance, currentBalance / slotsAvailable);
-        
-        if (allocation < 10) {
-           addLog(`TRADE ABORTED: Available allocation ($${allocation.toFixed(2)}) below minimum threshold ($10).`, 'warning');
-           return;
-        }
-        
-        if (isDefensiveMode && type === 'BUY') {
-          allocation *= 0.5;
-          addLog(`ADAPTIVE DEFENSE: Reducing trade allocation by 50% for ${tradeSymbol}`, 'info');
+        const heldAmount = holdings.find(h => h.symbol === tradeSymbol)?.amount || 0;
+        const openingShort = type === 'SELL' && heldAmount <= 0;
+        let amount = 0;
+
+        if (type === 'BUY' || openingShort) {
+          const slotsAvailable = Math.max(1, maxConcurrentTrades - holdings.length);
+          const currentBalance = Math.max(0, balance);
+          let allocation = Math.min(currentBalance, currentBalance / slotsAvailable);
+          const minLiveNotional = 80;
+
+          if (isRealMode && allocation < minLiveNotional && currentBalance >= minLiveNotional) {
+            allocation = minLiveNotional;
+          }
+
+          if (allocation < 10) {
+            addLog(`TRADE ABORTED: Available allocation ($${allocation.toFixed(2)}) below minimum threshold ($10).`, 'warning');
+            return;
+          }
+
+          if (isDefensiveMode) {
+            allocation *= 0.5;
+            addLog(`ADAPTIVE DEFENSE: Reducing trade allocation by 50% for ${tradeSymbol}`, 'info');
+          }
+
+          amount = allocation / price;
+        } else {
+          amount = heldAmount;
         }
 
-        const amount = type === 'BUY' 
-          ? allocation / price 
-          : (holdings.find(h => h.symbol === tradeSymbol)?.amount || 0);
-
-        if (amount <= 0 && type === 'BUY') {
-           addLog(`TRADE ABORTED: Insufficient $USDT Balance to buy ${tradeSymbol}`, 'warning');
-           return;
+        if (amount <= 0) {
+          addLog(`TRADE ABORTED: Unable to size order for ${tradeSymbol}.`, 'warning');
+          return;
         }
 
         const resp = await fetch('/api/binance/order', {
@@ -318,12 +329,14 @@ export default function App() {
         const result = await resp.json();
         if (result.status === 'success') {
           addLog(`REAL ${type} SUCCESS: ${tradeSymbol}`, 'success');
+          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 5) }));
           setTimeout(syncRealBalance, 1500); 
         } else {
           throw new Error(result.message || 'Order failed');
         }
       } catch (e: any) {
         addLog(`REAL ${type} FAILED: ${e.message}`, 'warning');
+        setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 2) }));
         return;
       }
     } else {
@@ -537,7 +550,12 @@ export default function App() {
       setScanProgress({ current: 0, total: 1 }); // Initial state to show bar
       const allSymbols = await fetchAllSymbols();
       const allValues = allSymbols.map(s => s.value);
-      const symbolsToScan = Array.from(new Set([symbol, ...allValues])); // Removed slice to allow all assets (e.g. 750+) to be scanned
+      const liveNormalized = (v: string) => (v.toUpperCase().endsWith('USD') && !v.toUpperCase().endsWith('USDT') ? `${v}T` : v);
+      const baseSymbol = isRealMode ? liveNormalized(symbol) : symbol;
+      const candidateValues = isRealMode
+        ? allValues.filter(v => v.toUpperCase().endsWith('USDT') || v.toUpperCase().endsWith('USD')).map(liveNormalized)
+        : allValues;
+      const symbolsToScan = Array.from(new Set([baseSymbol, ...candidateValues]));
       
       setScanProgress({ current: 0, total: symbolsToScan.length });
       
@@ -576,18 +594,31 @@ export default function App() {
       }
 
       if (currentAutoTrade) {
-        const potentialBuys = results
-          .filter(r => r.signal.overall === 'BUY' && r.signal.score >= 5)
+        const potentialLongs = results
+          .filter(r => r.signal.overall === 'BUY' && r.signal.score >= AUTO_ENTRY_MIN_SCORE)
           .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
           .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now());
 
+        const potentialShorts = isRealMode
+          ? results
+              .filter(r => r.signal.overall === 'SELL' && r.signal.score >= AUTO_ENTRY_MIN_SCORE)
+              .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
+              .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now())
+          : [];
+
+        const entries = [
+          ...potentialLongs.map(pick => ({ side: 'BUY' as const, pick })),
+          ...potentialShorts.map(pick => ({ side: 'SELL' as const, pick })),
+        ].sort((a, b) => b.pick.signal.score - a.pick.signal.score);
+
         if (currentHoldings.length < currentMaxTrades) {
           const availableSlots = currentMaxTrades - currentHoldings.length;
-          const toBuy = potentialBuys.slice(0, availableSlots);
+          const toTrade = entries.slice(0, availableSlots);
           
-          if (toBuy.length > 0) {
-            toBuy.forEach(pick => {
-              executeTrade('BUY', pick.symbol, pick.lastPrice, `AI DISCOVERY: CONFIDENCE ${pick.signal.score}/10`);
+          if (toTrade.length > 0) {
+            toTrade.forEach(({ side, pick }) => {
+              const entryType = side === 'BUY' ? 'LONG' : 'SHORT';
+              executeTrade(side, pick.symbol, pick.lastPrice, `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`);
             });
           }
         }
@@ -731,14 +762,14 @@ export default function App() {
     }
     
     // 4. Current Symbol Auto-Buy (if not held and slot available)
-    if (holdings.length < maxConcurrentTrades && strategy && strategy.overall === 'BUY' && autoTrade && currentPrice && strategy.score >= 5) {
+    if (!isRealMode && holdings.length < maxConcurrentTrades && strategy && strategy.overall === 'BUY' && autoTrade && currentPrice && strategy.score >= AUTO_ENTRY_MIN_SCORE) {
       const isAlreadyHeld = holdings.some(h => h.symbol === symbol);
       const isOnCooldown = cooldowns[symbol] && cooldowns[symbol] > Date.now();
       if (!isAlreadyHeld && !isOnCooldown) {
         executeTrade('BUY', symbol, currentPrice, `AUTO_ENTRY: CROSSOVER SIGNAL [${strategy.score}/10]`);
       }
     }
-  }, [currentPrice, strategy, autoTrade, holdings, symbol, executeTrade, stopLossPercent, takeProfitPercent, maxConcurrentTrades, holdingPrices, cooldowns]);
+  }, [currentPrice, strategy, autoTrade, holdings, symbol, executeTrade, stopLossPercent, takeProfitPercent, maxConcurrentTrades, holdingPrices, cooldowns, isRealMode]);
 
   const calculateEquity = () => {
     const holdingsValue = holdings.reduce((acc, h) => {
