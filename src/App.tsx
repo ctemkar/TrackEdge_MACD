@@ -63,6 +63,7 @@ export default function App() {
     pnl?: number;
     pnlPct?: number;
     status?: ExecutionStatus;
+    cycleId?: number;
   }
 
   const [holdings, setHoldings] = useState<Holding[]>(() => {
@@ -118,9 +119,11 @@ export default function App() {
     type?: string
   } | null>(null);
   const [isBotActive, setIsBotActive] = useState(false);
+  const [scanExecutionStats, setScanExecutionStats] = useState({ cycleId: 0, attempted: 0, filled: 0, failed: 0, skipped: 0 });
   const tradeLockout = React.useRef<Set<string>>(new Set());
   const isSyncingRef = React.useRef(false);
   const scanningRef = React.useRef(false);
+  const currentScanCycleRef = React.useRef(0);
   
   // Refs for scan logic to avoid dependency loops
   const holdingsRef = React.useRef(holdings);
@@ -149,7 +152,19 @@ export default function App() {
   }, []);
 
   const pushTradeEvent = React.useCallback((event: TradeEvent) => {
-    setTradeHistory(prev => [{ ...event, status: event.status || 'FILLED' }, ...prev]);
+    const normalized = { ...event, status: event.status || 'FILLED' };
+    setTradeHistory(prev => [normalized, ...prev]);
+
+    if (typeof normalized.cycleId === 'number' && normalized.cycleId > 0) {
+      setScanExecutionStats(prev => {
+        if (normalized.cycleId !== prev.cycleId) return prev;
+        const next = { ...prev, attempted: prev.attempted + 1 };
+        if (normalized.status === 'FILLED') next.filled += 1;
+        else if (normalized.status === 'FAILED') next.failed += 1;
+        else next.skipped += 1;
+        return next;
+      });
+    }
   }, []);
 
   const syncRealBalance = React.useCallback(async () => {
@@ -286,12 +301,12 @@ export default function App() {
     }
   }, []);
 
-  const executeTrade = React.useCallback(async (type: 'BUY' | 'SELL', tradeSymbol: string, price: number, reason: string = 'Strategy Match', targetId?: string) => {
+  const executeTrade = React.useCallback(async (type: 'BUY' | 'SELL', tradeSymbol: string, price: number, reason: string = 'Strategy Match', targetId?: string, cycleId?: number) => {
     if (loading || !price) return;
     
     if (tradeSymbol.includes('undefined') || price <= 0) {
        addLog(`TRADE ABORTED: Invalid symbol or price [${tradeSymbol} @ ${price}]`, 'warning');
-       pushTradeEvent({ type, symbol: tradeSymbol || 'UNKNOWN', price: price || 0, amount: 0, time: new Date().toISOString(), reason: 'SKIP: Invalid symbol/price', status: 'SKIPPED' });
+      pushTradeEvent({ type, symbol: tradeSymbol || 'UNKNOWN', price: price || 0, amount: 0, time: new Date().toISOString(), reason: 'SKIP: Invalid symbol/price', status: 'SKIPPED', cycleId: eventCycleId });
        return;
     }
 
@@ -300,19 +315,20 @@ export default function App() {
       : holdings.some(h => h.symbol === tradeSymbol);
     const isRealShortEntry = isRealMode && type === 'SELL' && !targetId && !isHeld;
     if (type === 'SELL' && !isHeld && !isRealShortEntry) {
-      pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: No open position to close', status: 'SKIPPED' });
+      pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: No open position to close', status: 'SKIPPED', cycleId: eventCycleId });
       return;
     }
 
     const lockKey = `${type}_${tradeSymbol}_${targetId || 'all'}`;
     if (tradeLockout.current.has(lockKey)) {
-      pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: Duplicate order lockout', status: 'SKIPPED' });
+      pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: Duplicate order lockout', status: 'SKIPPED', cycleId: eventCycleId });
       return;
     }
     tradeLockout.current.add(lockKey);
     setTimeout(() => tradeLockout.current.delete(lockKey), 5000);
 
     const time = new Date().toISOString();
+    const eventCycleId = typeof cycleId === 'number' ? cycleId : undefined;
     
     if (isRealMode) {
       addLog(`EXECUTING REAL ${type}: ${tradeSymbol} @ $${price} [${reason}]`, 'info');
@@ -341,7 +357,7 @@ export default function App() {
 
           if (allocation < 10) {
             addLog(`TRADE ABORTED: Available allocation ($${allocation.toFixed(2)}) below minimum threshold ($10).`, 'warning');
-            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: 'SKIP: Allocation below $10 minimum', status: 'SKIPPED' });
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: 'SKIP: Allocation below $10 minimum', status: 'SKIPPED', cycleId: eventCycleId });
             return;
           }
 
@@ -357,7 +373,7 @@ export default function App() {
 
         if (amount <= 0) {
           addLog(`TRADE ABORTED: Unable to size order for ${tradeSymbol}.`, 'warning');
-          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: 'SKIP: Unable to size order', status: 'SKIPPED' });
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: 'SKIP: Unable to size order', status: 'SKIPPED', cycleId: eventCycleId });
           return;
         }
 
@@ -393,6 +409,7 @@ export default function App() {
               pnl: realized,
               pnlPct: realizedPct,
               status: 'FILLED',
+              cycleId: eventCycleId,
             });
           } else {
             pushTradeEvent({
@@ -403,6 +420,7 @@ export default function App() {
               time,
               reason,
               status: 'FILLED',
+              cycleId: eventCycleId,
             });
           }
 
@@ -414,7 +432,7 @@ export default function App() {
         }
       } catch (e: any) {
         addLog(`REAL ${type} FAILED: ${e.message}`, 'warning');
-        pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `FAILED: ${e.message}`, status: 'FAILED' });
+        pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `FAILED: ${e.message}`, status: 'FAILED', cycleId: eventCycleId });
         setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 2) }));
         return;
       }
@@ -422,7 +440,7 @@ export default function App() {
       if (type === 'BUY') {
         if (holdings.length >= maxConcurrentTrades) {
           addLog(`BUY SKIPPED: Max concurrent trades (${maxConcurrentTrades}) reached.`, 'warning');
-          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: Max concurrent trades (${maxConcurrentTrades}) reached`, status: 'SKIPPED' });
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: Max concurrent trades (${maxConcurrentTrades}) reached`, status: 'SKIPPED', cycleId: eventCycleId });
           return;
         }
 
@@ -432,7 +450,7 @@ export default function App() {
         
         if (allocation < 10) {
           addLog(`PAPER TRADE SKIPPED: Insufficient balance for minimum $10 allocation.`, 'warning');
-          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: 'SKIP: Insufficient balance for $10 minimum', status: 'SKIPPED' });
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: 'SKIP: Insufficient balance for $10 minimum', status: 'SKIPPED', cycleId: eventCycleId });
           return;
         }
 
@@ -446,7 +464,7 @@ export default function App() {
 
         setBalance(prev => prev - allocation);
         setHoldings(prev => [...prev, { id: holdingId, symbol: tradeSymbol, amount, side: 'LONG', entryPrice: price, time }]);
-        pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason, status: 'FILLED' });
+        pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason, status: 'FILLED', cycleId: eventCycleId });
         addLog(`PAPER BUY: ${tradeSymbol} @ $${price} [${reason}]`, 'success');
       } else {
         // If targetId is provided, close ONLY that one. Otherwise close ALL for this symbol.
@@ -500,7 +518,8 @@ export default function App() {
             reason, 
             pnl, 
             pnlPct,
-            status: 'FILLED'
+            status: 'FILLED',
+            cycleId: eventCycleId,
           });
           
           addLog(`PAPER SELL: ${tradeSymbol} @ $${price} | P&L: ${pnlPct.toFixed(2)}% [${reason}]`, pnl >= 0 ? 'success' : 'warning');
@@ -646,6 +665,9 @@ export default function App() {
   // Market Scanner Logic
   const performScan = React.useCallback(async () => {
     if (scanningRef.current) return;
+    const cycleId = Date.now();
+    currentScanCycleRef.current = cycleId;
+    setScanExecutionStats({ cycleId, attempted: 0, filled: 0, failed: 0, skipped: 0 });
     scanningRef.current = true;
     setScanning(true);
     setIsBotActive(true);
@@ -658,6 +680,11 @@ export default function App() {
         const up = v.toUpperCase();
         return LIVE_QUOTE_ALLOWLIST.some(q => up.endsWith(q));
       };
+      const isLikelyBinanceFuturesSymbol = (v: string) => {
+        const up = v.toUpperCase();
+        return up.endsWith('USDT') || up.endsWith('USDC') || up.endsWith('FDUSD');
+      };
+      const isLiveBinance = isRealMode && serverConfig?.exchange === 'binance';
       const baseSymbol = isRealMode ? liveNormalized(symbol) : symbol;
       const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
       const symbolsToScan = Array.from(new Set([baseSymbol, ...candidateValues]));
@@ -695,9 +722,9 @@ export default function App() {
             const exitSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
 
             if (slTrigger) {
-              executeTrade(exitSide, holding.symbol, price, 'AUTO_EXIT: PORTFOLIO STOP LOSS', holding.id);
+              executeTrade(exitSide, holding.symbol, price, 'AUTO_EXIT: PORTFOLIO STOP LOSS', holding.id, cycleId);
             } else if (tpTrigger) {
-              executeTrade(exitSide, holding.symbol, price, 'AUTO_EXIT: PORTFOLIO TAKE PROFIT', holding.id);
+              executeTrade(exitSide, holding.symbol, price, 'AUTO_EXIT: PORTFOLIO TAKE PROFIT', holding.id, cycleId);
             }
           }
         });
@@ -707,6 +734,7 @@ export default function App() {
         const potentialLongs = results
           .filter(r => r.signal.overall === 'BUY' && r.signal.score >= AUTO_ENTRY_MIN_SCORE)
           .filter(r => !isRealMode || hasAllowedQuote(r.symbol))
+          .filter(r => !isLiveBinance || isLikelyBinanceFuturesSymbol(r.symbol))
           .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
           .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now());
 
@@ -714,6 +742,7 @@ export default function App() {
           ? results
               .filter(r => r.signal.overall === 'SELL' && r.signal.score >= AUTO_ENTRY_MIN_SCORE)
               .filter(r => hasAllowedQuote(r.symbol))
+              .filter(r => !isLiveBinance || isLikelyBinanceFuturesSymbol(r.symbol))
               .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
               .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now())
           : [];
@@ -730,10 +759,33 @@ export default function App() {
           if (toTrade.length > 0) {
             toTrade.forEach(({ side, pick }) => {
               const entryType = side === 'BUY' ? 'LONG' : 'SHORT';
-              executeTrade(side, pick.symbol, pick.lastPrice, `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`);
+              executeTrade(side, pick.symbol, pick.lastPrice, `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`, undefined, cycleId);
+            });
+          } else {
+            pushTradeEvent({
+              type: 'BUY',
+              symbol: 'SCAN',
+              price: 0,
+              amount: 0,
+              time: new Date().toISOString(),
+              reason: `SKIP: No eligible entries (BUY=${potentialLongs.length}, SELL=${potentialShorts.length}, slots=${availableSlots})`,
+              status: 'SKIPPED',
+              cycleId,
             });
           }
+        } else {
+          pushTradeEvent({
+            type: 'BUY',
+            symbol: 'SCAN',
+            price: 0,
+            amount: 0,
+            time: new Date().toISOString(),
+            reason: `SKIP: No free slots (${currentHoldings.length}/${currentMaxTrades})`,
+            status: 'SKIPPED',
+            cycleId,
+          });
         }
+
       }
     } catch (error) {
       console.error('Scan failed', error);
@@ -743,7 +795,7 @@ export default function App() {
       setScanning(false);
       setTimeout(() => setIsBotActive(false), 2000);
     }
-  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog]);
+  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushTradeEvent]);
  // Removed 'scanning' from dependencies
 
   const resetAccount = React.useCallback(() => {
@@ -1101,6 +1153,25 @@ export default function App() {
                   className="h-full bg-[#F27D26]"
                   style={{ width: scanning ? `${(scanProgress.current / (scanProgress.total || 1)) * 100}%` : `${Math.min(100, Math.max(0, availableSymbols.length > 0 ? 100 : 0))}%` }}
                 />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-4 gap-2 text-[8px] font-mono uppercase">
+              <div className="border border-gray-200 px-2 py-1">
+                <span className="opacity-50">Attempted</span>
+                <p className="font-black text-[10px]">{scanExecutionStats.attempted}</p>
+              </div>
+              <div className="border border-emerald-200 bg-emerald-50/50 px-2 py-1">
+                <span className="opacity-50">Filled</span>
+                <p className="font-black text-[10px] text-emerald-700">{scanExecutionStats.filled}</p>
+              </div>
+              <div className="border border-rose-200 bg-rose-50/50 px-2 py-1">
+                <span className="opacity-50">Failed</span>
+                <p className="font-black text-[10px] text-rose-700">{scanExecutionStats.failed}</p>
+              </div>
+              <div className="border border-amber-200 bg-amber-50/50 px-2 py-1">
+                <span className="opacity-50">Skipped</span>
+                <p className="font-black text-[10px] text-amber-700">{scanExecutionStats.skipped}</p>
               </div>
             </div>
           </section>

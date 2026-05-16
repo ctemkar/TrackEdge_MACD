@@ -6,6 +6,9 @@ export async function fetchBinanceData(symbol: string = 'BTCUSD', interval: stri
     const targetSymbol = symbol === 'BTC' ? 'BTCUSD' : symbol;
     const response = await fetch(`/api/binance/proxy/klines?symbol=${targetSymbol}&interval=${interval}&limit=${limit}`);
     const data = await response.json();
+    if (!Array.isArray(data)) {
+      return [];
+    }
     
     return data.map((d: any) => ({
       time: d[0] / 1000,
