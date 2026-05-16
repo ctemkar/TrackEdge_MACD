@@ -17,6 +17,7 @@ async function startServer() {
   // Exchange Client (Lazy Init)
   let exchangeInstance: ccxt.Exchange | null = null;
   const hasConfiguredKeys = () => !!(
+    (process.env.BINANCE_LIVE_API_KEY && process.env.BINANCE_LIVE_API_SECRET) ||
     (process.env.BINANCE_API_KEY && process.env.BINANCE_API_SECRET) ||
     (process.env.BINANCE_KEY && process.env.BINANCE_SECRET) ||
     (process.env.GEMINI_LIVE_API_KEY && process.env.GEMINI_LIVE_API_SECRET) ||
@@ -26,8 +27,8 @@ async function startServer() {
   const preferGemini = () => (process.env.EXCHANGE || '').toLowerCase() === 'gemini';
   const getExchange = () => {
     if (!exchangeInstance) {
-      const bKey = (process.env.BINANCE_API_KEY || process.env.BINANCE_KEY || '').trim();
-      const bSecret = (process.env.BINANCE_API_SECRET || process.env.BINANCE_SECRET || '').trim();
+      const bKey = (process.env.BINANCE_LIVE_API_KEY || process.env.BINANCE_API_KEY || process.env.BINANCE_KEY || '').trim();
+      const bSecret = (process.env.BINANCE_LIVE_API_SECRET || process.env.BINANCE_API_SECRET || process.env.BINANCE_SECRET || '').trim();
       const gKey = (process.env.GEMINI_LIVE_API_KEY || process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '').trim();
       const gSecret = (process.env.GEMINI_LIVE_API_SECRET || process.env.GEMINI_API_SECRET || process.env.GEMINI_SECRET || '').trim();
 
@@ -73,9 +74,21 @@ async function startServer() {
            enableRateLimit: true,
            options: { 
              defaultType: 'future',
-             adjustForTimeDifference: true 
+              adjustForTimeDifference: true,
+              portfolioMargin: true
            }
          });
+
+         const livePapiBase = (process.env.BINANCE_LIVE_BASE_URL || '').trim();
+         if (livePapiBase) {
+           (exchangeInstance as any).urls = {
+             ...(exchangeInstance as any).urls,
+             api: {
+               ...((exchangeInstance as any).urls?.api || {}),
+               papi: livePapiBase,
+             },
+           };
+         }
       }
     }
     return exchangeInstance;
@@ -131,6 +144,7 @@ async function startServer() {
       config: {
         realTradingEnabled: process.env.ENABLE_REAL_TRADING === 'true',
         hasKeys: !!(
+          (process.env.BINANCE_LIVE_API_KEY && process.env.BINANCE_LIVE_API_SECRET) ||
           (process.env.BINANCE_API_KEY && process.env.BINANCE_API_SECRET) ||
           (process.env.BINANCE_KEY && process.env.BINANCE_SECRET) ||
           (process.env.GEMINI_LIVE_API_KEY && process.env.GEMINI_LIVE_API_SECRET) ||
@@ -195,6 +209,7 @@ async function startServer() {
       const b = balanceData as any;
       const cashKeys = ['USD', 'USDT', 'GUSD', 'USDC', 'DAI', 'BUSD'];
       let cashTotal = 0;
+      let portfolioMarginEquity: number | null = null;
       const allPositions: Record<string, { amount: number, total: number }> = {};
 
       // CCXT standard: b.total contains all balances (coin: amount)
@@ -236,6 +251,39 @@ async function startServer() {
           };
         }
       }
+
+      if (client.id === 'binance') {
+        const infoRows = Array.isArray(b.info) ? b.info : [b.info || {}];
+        const info =
+          infoRows.find((row: any) => (row?.asset || '').toUpperCase() === 'USDT') ||
+          infoRows
+            .filter((row: any) => Number.isFinite(Number(row?.totalWalletBalance)))
+            .sort((a: any, c: any) => Number(c.totalWalletBalance || 0) - Number(a.totalWalletBalance || 0))[0] ||
+          {};
+        const pmCandidates = [
+          Number(info.totalWalletBalance),
+          Number(info.totalMarginBalance),
+          Number(info.totalCrossWalletBalance),
+          Number(info.totalInitialMargin),
+          Number(info.totalAvailableBalance),
+        ].filter(v => Number.isFinite(v) && v > 0);
+
+        if (pmCandidates.length > 0) {
+          portfolioMarginEquity = pmCandidates[0];
+        }
+
+        if (!portfolioMarginEquity && Array.isArray(info.assets)) {
+          const usdtAsset = info.assets.find((a: any) => (a?.asset || '').toUpperCase() === 'USDT');
+          const fromAsset = Number(usdtAsset?.marginBalance || usdtAsset?.walletBalance || usdtAsset?.availableBalance);
+          if (Number.isFinite(fromAsset) && fromAsset > 0) {
+            portfolioMarginEquity = fromAsset;
+          }
+        }
+
+        if (portfolioMarginEquity && portfolioMarginEquity > cashTotal) {
+          cashTotal = portfolioMarginEquity;
+        }
+      }
       
       console.log(`[TradeEdge Sync] ${client.id.toUpperCase()} Summary: Cash=$${cashTotal}, Valid Positions=${Object.keys(allPositions).join(',')}`);
       
@@ -244,6 +292,7 @@ async function startServer() {
         exchange: client.id, 
         account: client.id === 'gemini' ? (params.account || 'Primary') : 'Standard',
         balance: { USDT: cashTotal }, 
+        equity: portfolioMarginEquity,
         positions: allPositions,
         raw: process.env.NODE_ENV === 'development' ? { info: balanceData.info } : undefined
       });

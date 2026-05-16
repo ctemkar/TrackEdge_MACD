@@ -148,8 +148,10 @@ export default function App() {
       
       const data = await resp.json();
       if (data.status === 'success') {
-        const usdt = data.balance['USDT'] || 0;
-        setBalance(usdt);
+        const liveEquity = Number(data.equity);
+        const usdt = Number(data?.balance?.USDT || 0);
+        const syncedBalance = Number.isFinite(liveEquity) && liveEquity > 0 ? liveEquity : usdt;
+        setBalance(syncedBalance);
         
         let freshHoldings: Holding[] = [];
         if (data.positions) {
@@ -185,14 +187,27 @@ export default function App() {
            const price = marketPicks.find(p => p.symbol === h.symbol)?.lastPrice || holdingPrices[h.symbol] || h.entryPrice;
            return sum + (price * h.amount);
         }, 0);
-        
-        const currentEquity = usdt + totalPositionsValue;
+
+        // For Binance Portfolio Margin, backend `equity` already includes wallet/position value.
+        // Fallback to cash + positions only when equity is unavailable.
+        const currentEquity = Number.isFinite(liveEquity) && liveEquity > 0
+          ? liveEquity
+          : (usdt + totalPositionsValue);
 
         // Auto-initialize baseline if placeholder or first sync in real mode
         const defaults = [0, 600, 800, 1000];
-        if (usdt > 0 && (defaults.includes(benchmarkCapital) || (!isRealMode && !holdings.length))) {
+        if (currentEquity > 0 && (defaults.includes(benchmarkCapital) || (!isRealMode && !holdings.length))) {
           setBenchmarkCapital(currentEquity);
           addLog(`BASIS LOCKED: Tracking performance from $${currentEquity.toFixed(2)} baseline.`, 'info');
+        }
+
+        // In live mode with no open positions, keep baseline aligned to current equity
+        // so performance starts near zero after mode switch or account sync.
+        if (isRealMode && freshHoldings.length === 0 && currentEquity > 0) {
+          const baselineGap = Math.abs(benchmarkCapital - currentEquity);
+          if (!benchmarkCapital || baselineGap > currentEquity * 0.02) {
+            setBenchmarkCapital(currentEquity);
+          }
         }
 
         // GHOST BASIS RESET: If baseline is huge but equity is 0/small on first real sync, auto-correct
