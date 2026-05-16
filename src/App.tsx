@@ -978,9 +978,7 @@ export default function App() {
   const pnl = equity - benchmarkCapital;
   const pnlPercent = benchmarkCapital > 0 ? (pnl / benchmarkCapital) * 100 : 0;
   const investedPct = equity > 0 ? (totalInvested / equity) * 100 : 0;
-  const displayedAvailableFunds = (isRealMode && holdings.length === 0 && balance > 0 && availableFunds < balance * 0.1)
-    ? balance
-    : (isRealMode ? availableFunds : balance);
+  const displayedAvailableFunds = isRealMode ? availableFunds : balance;
 
   // Auto-Recovery - Clean wipe if core state is corrupted
   useEffect(() => {
@@ -1008,7 +1006,7 @@ export default function App() {
              <div className="flex items-center bg-[#141414] p-0.5 rounded-sm overflow-hidden">
                 <button 
                   onClick={() => setIsRealMode(false)}
-                  className={`px-4 py-1.5 text-[10px] font-black uppercase tracking-tighter transition-all ${!isRealMode ? 'bg-[#F27D26] text-white shadow-lg' : 'text-white/40 hover:text-white'}`}
+                  className={`w-32 px-4 py-1.5 text-[10px] font-black uppercase tracking-tighter transition-all ${!isRealMode ? 'bg-[#F27D26] text-white shadow-lg' : 'text-white/40 hover:text-white'}`}
                 >
                   Paper Trading
                 </button>
@@ -1022,9 +1020,11 @@ export default function App() {
                     else addLog("API keys required in Settings for Real Mode", "warning");
                   }}
                   disabled={isSyncing}
-                  className={`px-4 py-1.5 text-[10px] font-black uppercase tracking-tighter transition-all flex items-center gap-2 ${isRealMode ? 'bg-rose-600 text-white shadow-lg' : 'text-white/40 hover:text-white'} ${isSyncing ? 'opacity-50 cursor-wait' : ''}`}
+                  className={`w-32 px-4 py-1.5 text-[10px] font-black uppercase tracking-tighter transition-all flex items-center justify-center gap-2 ${isRealMode ? 'bg-rose-600 text-white shadow-lg' : 'text-white/40 hover:text-white'} ${isSyncing ? 'cursor-wait' : ''}`}
                 >
-                  {isSyncing ? <Loader2 size={10} className="opacity-60" /> : null}
+                  <span className="inline-flex w-3 h-3 items-center justify-center">
+                    <Loader2 size={10} className={isSyncing ? 'opacity-60' : 'opacity-0'} />
+                  </span>
                   Live Futures
                 </button>
              </div>
@@ -1611,7 +1611,7 @@ export default function App() {
               trend={pnl >= 0 ? 'up' : 'down'}
               subValue={
                 <div className="flex items-center gap-2">
-                   <span className="opacity-60">CASH: ${displayedAvailableFunds.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                   <span className="opacity-60">AVAILABLE: ${displayedAvailableFunds.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                    <button 
                      onClick={(e) => { e.stopPropagation(); resetAccount(); }}
                      className="text-[8px] bg-white/5 hover:bg-white/10 px-2 py-0.5 rounded transition-colors uppercase font-bold"
@@ -1643,9 +1643,9 @@ export default function App() {
             />
             <MetricBox 
               icon={<DollarSign className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
-              label="Available Funds"
+              label="Available Margin"
               value={`$${displayedAvailableFunds.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-              subValue={isRealMode ? "Live Exchange USD" : "Simulated Capital"}
+              subValue={isRealMode ? "Live Exchange Free Balance" : "Simulated Capital"}
             />
             <MetricBox 
               icon={<Activity className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
