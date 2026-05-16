@@ -47,21 +47,42 @@ export default function App() {
     time: string;
   }
 
+  type ExecutionStatus = 'FILLED' | 'SKIPPED' | 'FAILED';
+  interface TradeEvent {
+    type: 'BUY' | 'SELL';
+    symbol: string;
+    price: number;
+    entryPrice?: number;
+    amount: number;
+    time: string;
+    reason?: string;
+    pnl?: number;
+    pnlPct?: number;
+    status?: ExecutionStatus;
+  }
+
   const [holdings, setHoldings] = useState<Holding[]>(() => {
     const saved = localStorage.getItem('te_holdings');
     if (!saved) return [];
     try {
       const parsed = JSON.parse(saved);
-      return Array.isArray(parsed) ? parsed : [parsed];
+      const arr = Array.isArray(parsed) ? parsed : [parsed];
+      return arr.map((h: any) => ({
+        ...h,
+        side: h?.side === 'SHORT' ? 'SHORT' : 'LONG',
+      }));
     } catch {
       return [];
     }
   });
   
-  const [tradeHistory, setTradeHistory] = useState<{ type: 'BUY' | 'SELL', symbol: string, price: number, entryPrice?: number, amount: number, time: string, reason?: string, pnl?: number, pnlPct?: number }[]>(() => {
+  const [tradeHistory, setTradeHistory] = useState<TradeEvent[]>(() => {
     const saved = localStorage.getItem('te_history');
     try {
-      return saved ? JSON.parse(saved) : [];
+      const parsed = saved ? JSON.parse(saved) : [];
+      return Array.isArray(parsed)
+        ? parsed.map((t: TradeEvent) => ({ ...t, status: t.status || 'FILLED' }))
+        : [];
     } catch {
       return [];
     }
@@ -121,6 +142,10 @@ export default function App() {
   // --- CORE SYSTEM FUNCTIONS (ORDER CRITICAL) ---
   const addLog = React.useCallback((message: string, type: 'info' | 'success' | 'warning' = 'info') => {
     setSystemLogs(prev => [{ time: new Date().toLocaleTimeString(), message, type }, ...prev].slice(0, 30));
+  }, []);
+
+  const pushTradeEvent = React.useCallback((event: TradeEvent) => {
+    setTradeHistory(prev => [{ ...event, status: event.status || 'FILLED' }, ...prev]);
   }, []);
 
   const syncRealBalance = React.useCallback(async () => {
@@ -265,6 +290,7 @@ export default function App() {
     
     if (tradeSymbol.includes('undefined') || price <= 0) {
        addLog(`TRADE ABORTED: Invalid symbol or price [${tradeSymbol} @ ${price}]`, 'warning');
+       pushTradeEvent({ type, symbol: tradeSymbol || 'UNKNOWN', price: price || 0, amount: 0, time: new Date().toISOString(), reason: 'SKIP: Invalid symbol/price', status: 'SKIPPED' });
        return;
     }
 
@@ -272,10 +298,16 @@ export default function App() {
       ? holdings.some(h => h.id === targetId)
       : holdings.some(h => h.symbol === tradeSymbol);
     const isRealShortEntry = isRealMode && type === 'SELL' && !targetId && !isHeld;
-    if (type === 'SELL' && !isHeld && !isRealShortEntry) return;
+    if (type === 'SELL' && !isHeld && !isRealShortEntry) {
+      pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: No open position to close', status: 'SKIPPED' });
+      return;
+    }
 
     const lockKey = `${type}_${tradeSymbol}_${targetId || 'all'}`;
-    if (tradeLockout.current.has(lockKey)) return;
+    if (tradeLockout.current.has(lockKey)) {
+      pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: Duplicate order lockout', status: 'SKIPPED' });
+      return;
+    }
     tradeLockout.current.add(lockKey);
     setTimeout(() => tradeLockout.current.delete(lockKey), 5000);
 
@@ -284,11 +316,19 @@ export default function App() {
     if (isRealMode) {
       addLog(`EXECUTING REAL ${type}: ${tradeSymbol} @ $${price} [${reason}]`, 'info');
       try {
-        const heldAmount = holdings.find(h => h.symbol === tradeSymbol)?.amount || 0;
-        const openingShort = type === 'SELL' && heldAmount <= 0;
+        const existingHolding = holdings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
+        const heldAmount = existingHolding?.amount || 0;
+        const heldSide = existingHolding?.side;
+        const openingShort = type === 'SELL' && (!existingHolding || heldAmount <= 0);
+        const closingExisting = Boolean(existingHolding) && (
+          (heldSide === 'LONG' && type === 'SELL') ||
+          (heldSide === 'SHORT' && type === 'BUY')
+        );
         let amount = 0;
 
-        if (type === 'BUY' || openingShort) {
+        if (closingExisting) {
+          amount = heldAmount;
+        } else if (type === 'BUY' || openingShort) {
           const slotsAvailable = Math.max(1, maxConcurrentTrades - holdings.length);
           const currentBalance = Math.max(0, balance);
           let allocation = Math.min(currentBalance, currentBalance / slotsAvailable);
@@ -300,6 +340,7 @@ export default function App() {
 
           if (allocation < 10) {
             addLog(`TRADE ABORTED: Available allocation ($${allocation.toFixed(2)}) below minimum threshold ($10).`, 'warning');
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: 'SKIP: Allocation below $10 minimum', status: 'SKIPPED' });
             return;
           }
 
@@ -315,6 +356,7 @@ export default function App() {
 
         if (amount <= 0) {
           addLog(`TRADE ABORTED: Unable to size order for ${tradeSymbol}.`, 'warning');
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: 'SKIP: Unable to size order', status: 'SKIPPED' });
           return;
         }
 
@@ -331,6 +373,38 @@ export default function App() {
 
         const result = await resp.json();
         if (result.status === 'success') {
+          const closingLong = heldSide === 'LONG' && type === 'SELL';
+          const closingShort = heldSide === 'SHORT' && type === 'BUY';
+          if (closingLong || closingShort) {
+            const realized = closingLong
+              ? (price - (existingHolding?.entryPrice || price)) * amount
+              : ((existingHolding?.entryPrice || price) - price) * amount;
+            const basis = (existingHolding?.entryPrice || price) * Math.max(amount, 1e-12);
+            const realizedPct = basis > 0 ? (realized / basis) * 100 : 0;
+            pushTradeEvent({
+              type,
+              symbol: tradeSymbol,
+              price,
+              entryPrice: existingHolding?.entryPrice,
+              amount,
+              time,
+              reason,
+              pnl: realized,
+              pnlPct: realizedPct,
+              status: 'FILLED',
+            });
+          } else {
+            pushTradeEvent({
+              type,
+              symbol: tradeSymbol,
+              price,
+              amount,
+              time,
+              reason,
+              status: 'FILLED',
+            });
+          }
+
           addLog(`REAL ${type} SUCCESS: ${tradeSymbol}`, 'success');
           setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 5) }));
           setTimeout(syncRealBalance, 1500); 
@@ -339,6 +413,7 @@ export default function App() {
         }
       } catch (e: any) {
         addLog(`REAL ${type} FAILED: ${e.message}`, 'warning');
+        pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `FAILED: ${e.message}`, status: 'FAILED' });
         setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 2) }));
         return;
       }
@@ -346,6 +421,7 @@ export default function App() {
       if (type === 'BUY') {
         if (holdings.length >= maxConcurrentTrades) {
           addLog(`BUY SKIPPED: Max concurrent trades (${maxConcurrentTrades}) reached.`, 'warning');
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: Max concurrent trades (${maxConcurrentTrades}) reached`, status: 'SKIPPED' });
           return;
         }
 
@@ -355,6 +431,7 @@ export default function App() {
         
         if (allocation < 10) {
           addLog(`PAPER TRADE SKIPPED: Insufficient balance for minimum $10 allocation.`, 'warning');
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: 'SKIP: Insufficient balance for $10 minimum', status: 'SKIPPED' });
           return;
         }
 
@@ -368,7 +445,7 @@ export default function App() {
 
         setBalance(prev => prev - allocation);
         setHoldings(prev => [...prev, { id: holdingId, symbol: tradeSymbol, amount, side: 'LONG', entryPrice: price, time }]);
-        setTradeHistory(prev => [{ type, symbol: tradeSymbol, price, amount, time, reason }, ...prev]);
+        pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason, status: 'FILLED' });
         addLog(`PAPER BUY: ${tradeSymbol} @ $${price} [${reason}]`, 'success');
       } else {
         // If targetId is provided, close ONLY that one. Otherwise close ALL for this symbol.
@@ -412,7 +489,7 @@ export default function App() {
              addLog(`TRADE EXIT [${tradeSymbol}]: Profit of $${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)`, 'success');
           }
 
-          setTradeHistory(prev => [{ 
+          pushTradeEvent({ 
             type, 
             symbol: tradeSymbol, 
             price, 
@@ -421,14 +498,15 @@ export default function App() {
             time, 
             reason, 
             pnl, 
-            pnlPct 
-          }, ...prev]);
+            pnlPct,
+            status: 'FILLED'
+          });
           
           addLog(`PAPER SELL: ${tradeSymbol} @ $${price} | P&L: ${pnlPct.toFixed(2)}% [${reason}]`, pnl >= 0 ? 'success' : 'warning');
         }
       }
     }
-  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, loading]);
+  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, loading, pushTradeEvent]);
 
 
 
@@ -444,7 +522,8 @@ export default function App() {
     for (const h of currentPositions) {
       const price = holdingPrices[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice);
       if (price) {
-        await executeTrade('SELL', h.symbol, price, 'EMERGENCY_LIQUIDATION', h.id);
+        const closeSide: 'BUY' | 'SELL' = h.side === 'SHORT' ? 'BUY' : 'SELL';
+        await executeTrade(closeSide, h.symbol, price, 'EMERGENCY_LIQUIDATION', h.id);
         await new Promise(r => setTimeout(r, 600));
       }
     }
@@ -761,13 +840,21 @@ export default function App() {
         const price = holdingPrices[holding.symbol] || (holding.symbol === symbol ? currentPrice : null);
         
         if (price) {
+          const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
+          const slTrigger = holding.side === 'SHORT'
+            ? price >= holding.entryPrice * (1 + stopLossPercent / 100)
+            : price <= holding.entryPrice * (1 - stopLossPercent / 100);
+          const tpTrigger = holding.side === 'SHORT'
+            ? price <= holding.entryPrice * (1 - takeProfitPercent / 100)
+            : price >= holding.entryPrice * (1 + takeProfitPercent / 100);
+
           // 1. Hard Stop Loss Check (5%)
-          if (price <= holding.entryPrice * (1 - stopLossPercent / 100)) {
-            executeTrade('SELL', holding.symbol, price, 'AUTO_EXIT: STOP LOSS (5%)');
+          if (slTrigger) {
+            executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: STOP LOSS (5%)', holding.id);
           } 
           // 2. Take Profit Check (15%)
-          else if (price >= holding.entryPrice * (1 + takeProfitPercent / 100)) {
-            executeTrade('SELL', holding.symbol, price, 'AUTO_EXIT: TAKE PROFIT (15%)');
+          else if (tpTrigger) {
+            executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: TAKE PROFIT (15%)', holding.id);
           }
           // Strategy-based Exit removed to respect user's strict 15%/5% TP/SL bounds
         }
@@ -1511,8 +1598,10 @@ export default function App() {
                   ) : (
                     holdings.map((h, i) => {
                       const price = holdingPrices[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice) || h.entryPrice;
-                      const pnlVal = (price - h.entryPrice) * h.amount;
-                      const pnlPctVal = ((price - h.entryPrice) / h.entryPrice) * 100;
+                      const move = h.side === 'SHORT' ? (h.entryPrice - price) : (price - h.entryPrice);
+                      const pnlVal = move * h.amount;
+                      const pnlPctVal = h.entryPrice > 0 ? (move / h.entryPrice) * 100 : 0;
+                      const closeSide: 'BUY' | 'SELL' = h.side === 'SHORT' ? 'BUY' : 'SELL';
                       return (
                         <tr key={i} className="hover:bg-gray-50/50 transition-colors group cursor-pointer" onClick={() => setSymbol(h.symbol)}>
                           <td className="px-6 py-5">
@@ -1522,7 +1611,7 @@ export default function App() {
                              </div>
                           </td>
                           <td className="px-6 py-5">
-                             <span className="text-[10px] font-black px-2 py-0.5 bg-emerald-100 text-emerald-800 rounded-sm">LONG</span>
+                              <span className={`text-[10px] font-black px-2 py-0.5 rounded-sm ${h.side === 'SHORT' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{h.side}</span>
                           </td>
                           <td className="px-6 py-5 font-mono text-xs opacity-60">
                              {h.amount < 0.01 ? h.amount.toFixed(6) : h.amount.toFixed(4)}
@@ -1541,7 +1630,7 @@ export default function App() {
                              <button 
                                onClick={(e) => {
                                  e.stopPropagation();
-                                 executeTrade('SELL', h.symbol, price, 'MANUAL_DOCK_CONTROL', h.id);
+                                 executeTrade(closeSide, h.symbol, price, 'MANUAL_DOCK_CONTROL', h.id);
                                }}
                                className="bg-[#141414] text-white hover:bg-[#F27D26] px-4 py-1.5 text-[10px] font-black uppercase tracking-tighter transition-all"
                              >
@@ -1592,9 +1681,21 @@ export default function App() {
                                   <div className="flex flex-col">
                                      <span className={`text-[10px] font-black ${trade.type === 'BUY' ? 'text-emerald-600' : 'text-rose-600'}`}>{trade.type}</span>
                                      <span className="text-[9px] font-mono opacity-60">${formatPrice(trade.price)}</span>
+                                     {trade.reason && <span className="text-[8px] opacity-40">{trade.reason}</span>}
                                   </div>
                                </td>
                                <td className="px-4 py-3 text-right">
+                                  <div className="flex items-center justify-end gap-2 mb-1">
+                                    <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-sm ${
+                                      (trade.status || 'FILLED') === 'FILLED'
+                                        ? 'bg-emerald-100 text-emerald-700'
+                                        : (trade.status || 'FILLED') === 'SKIPPED'
+                                          ? 'bg-amber-100 text-amber-700'
+                                          : 'bg-rose-100 text-rose-700'
+                                    }`}>
+                                      {trade.status || 'FILLED'}
+                                    </span>
+                                  </div>
                                   {trade.type === 'SELL' && trade.pnl !== undefined ? (
                                     <div className={`flex flex-col ${trade.pnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                                        <span className="text-[11px] font-black">${trade.pnl.toFixed(2)}</span>
