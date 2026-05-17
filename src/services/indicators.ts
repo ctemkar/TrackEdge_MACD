@@ -105,6 +105,7 @@ export interface StrategySignal {
   confluence: {
     rsi: 'OVERBOUGHT' | 'OVERSOLD' | 'NEUTRAL';
     macd: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+    macdHistogram: 'BULLISH_ACCELERATION' | 'BULLISH_FADE' | 'BEARISH_ACCELERATION' | 'BEARISH_FADE' | 'NEUTRAL';
     emaCrossover: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
     support: boolean;
   };
@@ -120,7 +121,7 @@ export function evaluateStrategy(
   if (candles.length < 2) return { 
     trend: 'NEUTRAL', 
     volume: false, 
-    confluence: { rsi: 'NEUTRAL', macd: 'NEUTRAL', emaCrossover: 'NEUTRAL', support: false }, 
+    confluence: { rsi: 'NEUTRAL', macd: 'NEUTRAL', macdHistogram: 'NEUTRAL', emaCrossover: 'NEUTRAL', support: false }, 
     overall: 'HOLD', 
     score: 0 
   };
@@ -179,10 +180,17 @@ export function evaluateStrategy(
 
   const histNow = lastMACD?.histogram ?? 0;
   const histPrev = prevMACD?.histogram ?? 0;
+  const histogramDelta = histNow - histPrev;
   const histogramRising = histNow > histPrev;
   const bullishMomentum = histNow > 0 && histogramRising;
   const bearishMomentum = histNow < 0 && !histogramRising;
   const weakeningMomentum = Math.abs(histNow) < Math.abs(histPrev);
+  const macdHistogramMode: 'BULLISH_ACCELERATION' | 'BULLISH_FADE' | 'BEARISH_ACCELERATION' | 'BEARISH_FADE' | 'NEUTRAL' =
+    histNow > 0
+      ? (histogramDelta >= 0 ? 'BULLISH_ACCELERATION' : 'BULLISH_FADE')
+      : histNow < 0
+        ? (histogramDelta <= 0 ? 'BEARISH_ACCELERATION' : 'BEARISH_FADE')
+        : 'NEUTRAL';
 
   // Sideways/choppy detector: frequent MACD crossovers in recent bars.
   let recentCrossovers = 0;
@@ -276,6 +284,7 @@ export function evaluateStrategy(
     confluence: {
       rsi: rsiMode,
       macd: macdMode,
+      macdHistogram: macdHistogramMode,
       emaCrossover,
       support: nearSupport
     },

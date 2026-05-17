@@ -90,6 +90,21 @@ const isNonTradableQuoteBaseSymbol = (raw: string) => {
   return /(?:USDT|USDC|USD){2,}$/.test(parts.compact) || NON_TRADABLE_QUOTE_BASES.has(parts.base);
 };
 
+const describeMacdHistogram = (state?: string) => {
+  switch (state) {
+    case 'BULLISH_ACCELERATION':
+      return 'EXPANDING_UP';
+    case 'BULLISH_FADE':
+      return 'BULL_FADE';
+    case 'BEARISH_ACCELERATION':
+      return 'EXPANDING_DOWN';
+    case 'BEARISH_FADE':
+      return 'BEAR_FADE';
+    default:
+      return 'NEUTRAL';
+  }
+};
+
 const CriteriaInfoLabel = ({ text, detail }: { text: string; detail: string }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [popoverPos, setPopoverPos] = useState<{ top: number; left: number } | null>(null);
@@ -3721,6 +3736,13 @@ export default function App() {
                            {strategy?.confluence.emaCrossover === 'BULLISH' ? 'OVER-CROSS' : 'UNDER-CROSS'}
                         </span>
                      </div>
+
+                    <div className="flex flex-col">
+                      <span className="text-[8px] uppercase font-bold opacity-40">MACD Histogram</span>
+                      <span className="text-[10px] font-black uppercase">
+                        {describeMacdHistogram(strategy?.confluence.macdHistogram)}
+                      </span>
+                    </div>
 
                      <div className="flex flex-col">
                         <span className="text-[8px] uppercase font-bold opacity-40">RSI Signal</span>
