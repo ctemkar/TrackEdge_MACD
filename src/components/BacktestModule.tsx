@@ -2,14 +2,15 @@ import React, { useState, useEffect } from 'react';
 import { Play, LineChart, TrendingUp, TrendingDown, History, Info, ChevronDown, ChevronUp, AlertCircle, Calendar } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { fetchHistoricalData, runBacktest, BacktestResult, BacktestTrade } from '../services/backtest';
-import { Candle } from '../services/indicators';
+import { Candle, StrategyConfig } from '../services/indicators';
 
 interface BacktestModuleProps {
   symbol: string;
   availableSymbols: { label: string, value: string }[];
+  strategyConfig: StrategyConfig;
 }
 
-export function BacktestModule({ symbol: initialSymbol, availableSymbols }: BacktestModuleProps) {
+export function BacktestModule({ symbol: initialSymbol, availableSymbols, strategyConfig }: BacktestModuleProps) {
   const [symbol, setSymbol] = useState(initialSymbol);
   const [interval, setInterval] = useState('15m');
   const [limit, setLimit] = useState(1000);
@@ -33,7 +34,7 @@ export function BacktestModule({ symbol: initialSymbol, availableSymbols }: Back
         throw new Error('Not enough historical data for a valid simulation (minimum 200 candles required).');
       }
 
-      const backtestResult = runBacktest(candles, 1000, stopLoss, takeProfit);
+      const backtestResult = runBacktest(candles, 1000, stopLoss, takeProfit, strategyConfig);
       setResult({ ...backtestResult, symbol });
     } catch (e: any) {
       setError(e.message || 'An error occurred during backtesting.');

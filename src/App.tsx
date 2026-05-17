@@ -2,14 +2,11 @@ import React, { useState, useEffect } from 'react';
 import { TrendingUp, Activity, ShieldAlert, ShieldCheck, Info, Wallet, DollarSign, ArrowUpRight, ArrowDownRight, Search, Zap, Loader2, History, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { fetchBinanceData, subscribeToTicker, fetchAllSymbols, fetchTopSymbolsByVolume } from './services/binance';
-import { calculateIndicators, evaluateStrategy, Candle, IndicatorResult, StrategySignal } from './services/indicators';
+import { calculateIndicators, evaluateStrategy, Candle, DEFAULT_STRATEGY_CONFIG, IndicatorResult, StrategyConfig, StrategySignal } from './services/indicators';
 import { scanMarket, MarketScanResult } from './services/scanner';
 import { BacktestModule } from './components/BacktestModule';
 
 export default function App() {
-  const AUTO_ENTRY_MIN_SCORE = 2;
-  const LIVE_MIN_ORDER_NOTIONAL = 10;
-  const LIVE_QUOTE_ALLOWLIST = ['USDT', 'USDC'];
   const [activeTab, setActiveTab] = useState<'LIVE' | 'BACKTEST'>('LIVE');
   const [data, setData] = useState<Candle[]>([]);
   const [indicators, setIndicators] = useState<IndicatorResult | null>(null);
@@ -24,9 +21,82 @@ export default function App() {
   const [symbol, setSymbol] = useState('BTCUSDT');
   const [availableSymbols, setAvailableSymbols] = useState<{ label: string, value: string }[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
-  const [stopLossPercent, setStopLossPercent] = useState(5);
-  const [takeProfitPercent, setTakeProfitPercent] = useState(15);
-  const [nextScanSec, setNextScanSec] = useState(30);
+  const [stopLossPercent, setStopLossPercent] = useState(() => {
+    const saved = localStorage.getItem('te_stop_loss_percent');
+    return saved ? (parseFloat(saved) || 5) : 5;
+  });
+  const [takeProfitPercent, setTakeProfitPercent] = useState(() => {
+    const saved = localStorage.getItem('te_take_profit_percent');
+    return saved ? (parseFloat(saved) || 15) : 15;
+  });
+  const [autoEntryMinScore, setAutoEntryMinScore] = useState(() => {
+    const saved = localStorage.getItem('te_auto_entry_min_score');
+    return saved ? (parseFloat(saved) || 2) : 2;
+  });
+  const [liveMinOrderNotional, setLiveMinOrderNotional] = useState(() => {
+    const saved = localStorage.getItem('te_live_min_order_notional');
+    return saved ? (parseFloat(saved) || 10) : 10;
+  });
+  const [liveQuoteAllowlistInput, setLiveQuoteAllowlistInput] = useState(() => {
+    return localStorage.getItem('te_live_quote_allowlist') || 'USDT,USDC';
+  });
+  const [scanIntervalSec, setScanIntervalSec] = useState(() => {
+    const saved = localStorage.getItem('te_scan_interval_sec');
+    return saved ? (parseInt(saved, 10) || 40) : 40;
+  });
+  const [holdingPollIntervalSec, setHoldingPollIntervalSec] = useState(() => {
+    const saved = localStorage.getItem('te_holding_poll_interval_sec');
+    return saved ? (parseInt(saved, 10) || 3) : 3;
+  });
+  const [duplicateOrderLockoutSec, setDuplicateOrderLockoutSec] = useState(() => {
+    const saved = localStorage.getItem('te_duplicate_order_lockout_sec');
+    return saved ? (parseInt(saved, 10) || 15) : 15;
+  });
+  const [liveEntryDelayMs, setLiveEntryDelayMs] = useState(() => {
+    const saved = localStorage.getItem('te_live_entry_delay_ms');
+    return saved ? (parseInt(saved, 10) || 400) : 400;
+  });
+  const [minPaperAllocation, setMinPaperAllocation] = useState(() => {
+    const saved = localStorage.getItem('te_min_paper_allocation');
+    return saved ? (parseFloat(saved) || 10) : 10;
+  });
+  const [softCooldownMinutes, setSoftCooldownMinutes] = useState(() => {
+    const saved = localStorage.getItem('te_soft_cooldown_minutes');
+    return saved ? (parseInt(saved, 10) || 2) : 2;
+  });
+  const [successCooldownMinutes, setSuccessCooldownMinutes] = useState(() => {
+    const saved = localStorage.getItem('te_success_cooldown_minutes');
+    return saved ? (parseInt(saved, 10) || 5) : 5;
+  });
+  const [paperLossCooldownMinutes, setPaperLossCooldownMinutes] = useState(() => {
+    const saved = localStorage.getItem('te_paper_loss_cooldown_minutes');
+    return saved ? (parseInt(saved, 10) || 30) : 30;
+  });
+  const [lowMarginLockMinutes, setLowMarginLockMinutes] = useState(() => {
+    const saved = localStorage.getItem('te_low_margin_lock_minutes');
+    return saved ? (parseInt(saved, 10) || 2) : 2;
+  });
+  const [closeFailureLockMinutes, setCloseFailureLockMinutes] = useState(() => {
+    const saved = localStorage.getItem('te_close_failure_lock_minutes');
+    return saved ? (parseInt(saved, 10) || 5) : 5;
+  });
+  const [hardFailureLockMinutes, setHardFailureLockMinutes] = useState(() => {
+    const saved = localStorage.getItem('te_hard_failure_lock_minutes');
+    return saved ? (parseInt(saved, 10) || 15) : 15;
+  });
+  const [strategyConfig, setStrategyConfig] = useState<StrategyConfig>(() => {
+    const saved = localStorage.getItem('te_strategy_config');
+    if (!saved) return DEFAULT_STRATEGY_CONFIG;
+    try {
+      return { ...DEFAULT_STRATEGY_CONFIG, ...JSON.parse(saved) };
+    } catch {
+      return DEFAULT_STRATEGY_CONFIG;
+    }
+  });
+  const [nextScanSec, setNextScanSec] = useState(() => {
+    const saved = localStorage.getItem('te_scan_interval_sec');
+    return saved ? (parseInt(saved, 10) || 40) : 40;
+  });
   
   const filteredSymbols = availableSymbols.filter(s => 
     s.label.toLowerCase().includes(searchQuery.toLowerCase()) || 
@@ -110,15 +180,27 @@ export default function App() {
   });
   
   const [autoTrade, setAutoTrade] = useState(false);
-  const [useBNBFees, setUseBNBFees] = useState(true);
+  const [useBNBFees, setUseBNBFees] = useState(() => {
+    const saved = localStorage.getItem('te_use_bnb_fees');
+    return saved !== null ? saved === 'true' : true;
+  });
   const [isRealMode, setIsRealMode] = useState(() => {
     const saved = localStorage.getItem('te_real_mode');
     return saved !== null ? saved === 'true' : false;
   });
   const [showSyncError, setShowSyncError] = useState(true);
-  const [maxConcurrentTrades, setMaxConcurrentTrades] = useState(15);
-  const [maxDrawdownPercent, setMaxDrawdownPercent] = useState(10);
-  const [isDefensiveMode, setIsDefensiveMode] = useState(false);
+  const [maxConcurrentTrades, setMaxConcurrentTrades] = useState(() => {
+    const saved = localStorage.getItem('te_max_concurrent_trades');
+    return saved ? (parseInt(saved, 10) || 15) : 15;
+  });
+  const [maxDrawdownPercent, setMaxDrawdownPercent] = useState(() => {
+    const saved = localStorage.getItem('te_max_drawdown_percent');
+    return saved ? (parseFloat(saved) || 10) : 10;
+  });
+  const [isDefensiveMode, setIsDefensiveMode] = useState(() => {
+    const saved = localStorage.getItem('te_is_defensive_mode');
+    return saved !== null ? saved === 'true' : false;
+  });
   const [systemLogs, setSystemLogs] = useState<SystemLogEntry[]>([]);
   const [holdingPrices, setHoldingPrices] = useState<Record<string, number>>({});
   const [liveUnrealizedPnl, setLiveUnrealizedPnl] = useState(0);

@@ -1,5 +1,5 @@
 import { fetchBinanceData } from './binance';
-import { calculateIndicators, evaluateStrategy, StrategySignal } from './indicators';
+import { calculateIndicators, evaluateStrategy, StrategyConfig, StrategySignal } from './indicators';
 
 export interface MarketScanResult {
   symbol: string;
@@ -13,7 +13,8 @@ export interface MarketScanResult {
 export async function scanMarket(
   symbols: string[],
   onProgress?: (current: number, total: number) => void,
-  shouldContinue?: () => boolean
+  shouldContinue?: () => boolean,
+  strategyConfig?: StrategyConfig,
 ): Promise<MarketScanResult[]> {
   const results: MarketScanResult[] = [];
   const batchSize = 5; // Reduced batch size to stay under rate limit (was 10)
@@ -27,8 +28,8 @@ export async function scanMarket(
       try {
         const candles = await fetchBinanceData(symbol);
         if (candles.length > 50) { 
-          const indicators = calculateIndicators(candles);
-          const signal = evaluateStrategy(candles, indicators);
+          const indicators = calculateIndicators(candles, strategyConfig);
+          const signal = evaluateStrategy(candles, indicators, strategyConfig);
           const lastCandle = candles[candles.length - 1];
           const prevCandle = candles[candles.length - 2];
           const change24h = ((lastCandle.close - prevCandle.close) / prevCandle.close) * 100;

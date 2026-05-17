@@ -1,4 +1,4 @@
-import { Candle, calculateIndicators, evaluateStrategy } from './indicators';
+import { Candle, calculateIndicators, DEFAULT_STRATEGY_CONFIG, evaluateStrategy, StrategyConfig } from './indicators';
 
 export interface BacktestResult {
   symbol: string;
@@ -48,15 +48,24 @@ export function runBacktest(
   candles: Candle[],
   initialBalance: number = 1000,
   stopLossPercent: number = 2,
-  takeProfitPercent: number = 5
+  takeProfitPercent: number = 5,
+  strategyConfig: StrategyConfig = DEFAULT_STRATEGY_CONFIG
 ): BacktestResult {
   let balance = initialBalance;
   let currentPosition: { entryPrice: number; entryTime: number; amount: number } | null = null;
   const trades: BacktestTrade[] = [];
   const equityCurve: { time: number; value: number }[] = [];
+  const requiredWarmup = Math.max(
+    200,
+    strategyConfig.trendSmaPeriod,
+    strategyConfig.macdSlowPeriod + strategyConfig.macdSignalPeriod,
+    strategyConfig.rsiPeriod,
+    strategyConfig.emaSlowPeriod,
+    strategyConfig.supportLookback,
+    strategyConfig.volumeLookback,
+  );
   
-  // We need enough candles for SMA200 (at least 200)
-  if (candles.length < 200) {
+  if (candles.length < requiredWarmup) {
     return {
       symbol: '',
       totalPnL: 0,
@@ -68,12 +77,10 @@ export function runBacktest(
     };
   }
 
-  // Iterate through candles after initial warmup
-  // We start at 200 because SMA200 needs 200 candles
-  for (let i = 200; i < candles.length; i++) {
+  for (let i = requiredWarmup; i < candles.length; i++) {
     const window = candles.slice(0, i + 1);
-    const indicators = calculateIndicators(window);
-    const signal = evaluateStrategy(window, indicators);
+    const indicators = calculateIndicators(window, strategyConfig);
+    const signal = evaluateStrategy(window, indicators, strategyConfig);
     const currentCandle = candles[i];
 
     // Manage current position
