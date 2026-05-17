@@ -3053,32 +3053,32 @@ export default function App() {
               <ShieldAlert size={120} strokeWidth={1} />
             </div>
             
-            <h2 className="font-mono text-[10px] uppercase tracking-[0.3em] mb-6 flex items-center gap-2 border-b border-white/10 pb-2">
+            <h2 className="font-mono text-[12px] uppercase tracking-[0.3em] mb-6 flex items-center gap-2 border-b border-white/10 pb-2">
               Risk Guard
             </h2>
 
               <div className="space-y-6 relative z-10">
                 <div>
-                  <label className="text-[10px] uppercase font-bold opacity-60 mb-1 block">Laboratory Seed Capital</label>
+                  <label className="text-[12px] uppercase font-bold opacity-60 mb-1 block">Laboratory Seed Capital</label>
                   <div className="flex gap-2">
                     <input 
                       type="number" 
                       value={seedCapital}
                       onChange={(e) => setSeedCapital(parseFloat(e.target.value) || 0)}
-                      className="bg-white/10 border border-white/20 rounded-sm py-1 px-3 text-xs font-mono w-full focus:outline-none focus:border-[#F27D26]"
+                      className="bg-white/10 border border-white/20 rounded-sm py-1 px-3 text-sm font-mono w-full focus:outline-none focus:border-[#F27D26]"
                     />
                     <button 
                       onClick={resetAccount}
-                      className="text-[10px] font-bold bg-[#F27D26] px-3 py-1 rounded-sm text-white hover:bg-orange-600 transition-colors"
+                      className="text-[12px] font-bold bg-[#F27D26] px-3 py-1 rounded-sm text-white hover:bg-orange-600 transition-colors"
                     >
                       SET
                     </button>
                   </div>
-                  <p className="text-[7px] font-mono opacity-30 mt-1">Changes balance only on SET/RESET.</p>
+                  <p className="text-[9px] font-mono opacity-30 mt-1">Changes balance only on SET/RESET.</p>
                 </div>
 
                 <div>
-                  <label className="text-[10px] uppercase font-bold opacity-60 mb-1 block">Capital Concentration</label>
+                  <label className="text-[12px] uppercase font-bold opacity-60 mb-1 block">Capital Concentration</label>
                   <input 
                     type="range" 
                     min="1" 
@@ -3088,7 +3088,7 @@ export default function App() {
                     onChange={(e) => setMaxConcurrentTrades(parseInt(e.target.value))}
                     className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-[#F27D26]"
                   />
-                  <div className="flex justify-between font-mono text-[8px] mt-1 opacity-40">
+                  <div className="flex justify-between font-mono text-[10px] mt-1 opacity-40">
                     <span>Targeted ($$$)</span>
                     <span className="text-[#F27D26] font-bold opacity-100">{maxConcurrentTrades} SLOTS</span>
                     <span>Broad ($)</span>
@@ -3096,7 +3096,7 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label className="text-[10px] uppercase font-bold opacity-60 mb-1 block text-emerald-400">Take Profit (Policy: 15%)</label>
+                  <label className="text-[12px] uppercase font-bold opacity-60 mb-1 block text-emerald-400">Take Profit (Policy: 15%)</label>
                   <input 
                     type="range" 
                     min="1" 
@@ -3106,7 +3106,7 @@ export default function App() {
                     onChange={(e) => setTakeProfitPercent(parseFloat(e.target.value))}
                     className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-emerald-500"
                   />
-                  <div className="flex justify-between font-mono text-[8px] mt-1 opacity-40">
+                  <div className="flex justify-between font-mono text-[10px] mt-1 opacity-40">
                     <span>Scalp (1%)</span>
                     <span className="text-emerald-400 font-bold opacity-100">{takeProfitPercent}% TARGET</span>
                     <span>Swing (20%)</span>
@@ -3115,16 +3115,16 @@ export default function App() {
 
                 <div>
                   <div className="flex justify-between items-center mb-1">
-                    <label className="text-[10px] uppercase font-bold opacity-60 text-rose-400">Standard Stop Loss</label>
+                    <label className="text-[12px] uppercase font-bold opacity-60 text-rose-400">Standard Stop Loss</label>
                     <div className="flex gap-1 items-center bg-white/5 border border-white/10 px-1 rounded-sm">
                        <input 
                          type="number" 
                          value={stopLossPercent}
                          onChange={(e) => setStopLossPercent(parseFloat(e.target.value) || 0)}
-                         className="w-8 bg-transparent text-[10px] font-mono text-center focus:outline-none"
+                         className="w-10 bg-transparent text-[12px] font-mono text-center focus:outline-none"
                          step="0.1"
                        />
-                       <span className="text-[8px] opacity-40">%</span>
+                       <span className="text-[10px] opacity-40">%</span>
                     </div>
                   </div>
                   <input 
@@ -3136,7 +3136,7 @@ export default function App() {
                     onChange={(e) => setStopLossPercent(parseFloat(e.target.value))}
                     className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-rose-500"
                   />
-                  <div className="flex justify-between font-mono text-[8px] mt-1 opacity-40">
+                  <div className="flex justify-between font-mono text-[10px] mt-1 opacity-40">
                     <span>Defensive (0.2%)</span>
                     <span className="text-rose-400 font-bold opacity-100">{stopLossPercent}% GUARD</span>
                     <span>Broad (10%)</span>
@@ -3146,18 +3146,18 @@ export default function App() {
                 <div className="p-3 bg-red-950/20 border border-red-500/20 rounded-sm">
                   <div className="flex justify-between items-center mb-2">
                     <div className="flex flex-col">
-                      <label className="text-[10px] uppercase font-bold text-rose-300">Portfolio Emergency Shield</label>
-                      <span className="text-[7px] opacity-40 uppercase">Liquidation on Drawdown</span>
+                      <label className="text-[12px] uppercase font-bold text-rose-300">Portfolio Emergency Shield</label>
+                      <span className="text-[9px] opacity-40 uppercase">Liquidation on Drawdown</span>
                     </div>
                     <div className="flex gap-1 items-center bg-black/40 border border-white/10 px-1 rounded-sm">
                        <input 
                          type="number" 
                          value={maxDrawdownPercent}
                          onChange={(e) => setMaxDrawdownPercent(parseFloat(e.target.value) || 0)}
-                         className="w-8 bg-transparent text-[10px] font-mono text-center text-rose-300 focus:outline-none"
+                         className="w-10 bg-transparent text-[12px] font-mono text-center text-rose-300 focus:outline-none"
                          step="1"
                        />
-                       <span className="text-[8px] opacity-40">%</span>
+                       <span className="text-[10px] opacity-40">%</span>
                     </div>
                   </div>
                   <input 
@@ -3169,7 +3169,7 @@ export default function App() {
                     onChange={(e) => setMaxDrawdownPercent(parseFloat(e.target.value))}
                     className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-rose-700"
                   />
-                  <div className="flex justify-between font-mono text-[8px] mt-1 opacity-40">
+                  <div className="flex justify-between font-mono text-[10px] mt-1 opacity-40">
                     <span>Ultra-Tight (1%)</span>
                     <span className="text-rose-300 font-bold">{maxDrawdownPercent}% MAX DRAWDOWN</span>
                     <span>Loose (30%)</span>
@@ -3179,14 +3179,14 @@ export default function App() {
                 <div className="flex items-center justify-between p-2 bg-emerald-500/10 border border-emerald-500/20 rounded-sm">
                    <div className="flex flex-col">
                       <div className="flex items-center gap-1">
-                        <ShieldCheck size={12} className="text-emerald-400" />
-                        <span className="text-[10px] uppercase font-black text-emerald-400">Adaptive Defense</span>
+                        <ShieldCheck size={14} className="text-emerald-400" />
+                        <span className="text-[12px] uppercase font-black text-emerald-400">Adaptive Defense</span>
                       </div>
-                      <span className="text-[7px] opacity-40 leading-tight">HALVES POSITIONS SIZE ON VOLATILITY</span>
+                      <span className="text-[9px] opacity-40 leading-tight">HALVES POSITIONS SIZE ON VOLATILITY</span>
                    </div>
                    <button 
                     onClick={() => setIsDefensiveMode(!isDefensiveMode)}
-                    className={`px-3 py-1 rounded-xs text-[10px] font-black transition-all ${isDefensiveMode ? 'bg-emerald-500 text-black' : 'bg-white/10 text-white hover:bg-white/20'}`}
+                    className={`px-3 py-1 rounded-xs text-[12px] font-black transition-all ${isDefensiveMode ? 'bg-emerald-500 text-black' : 'bg-white/10 text-white hover:bg-white/20'}`}
                    >
                      {isDefensiveMode ? 'ACTIVE' : 'OFF'}
                    </button>
@@ -3194,7 +3194,7 @@ export default function App() {
 
                 <div className="p-3 bg-white/5 border border-white/10 rounded-sm space-y-3">
                   <div className="flex items-center justify-between gap-3">
-                    <p className="text-[10px] uppercase font-bold opacity-70">Strategy Criteria</p>
+                    <p className="text-[12px] uppercase font-bold opacity-70">Strategy Criteria</p>
                     <button
                       type="button"
                       onClick={resetParametersToDefaults}

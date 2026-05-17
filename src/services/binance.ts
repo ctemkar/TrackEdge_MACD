@@ -16,7 +16,7 @@ export async function fetchBinanceData(
     const targetSymbol = raw === 'BTC'
       ? 'BTCUSDT'
       : (raw.endsWith('USD') && !raw.endsWith('USDT') ? `${raw}T` : raw);
-    const forceBinancePublic = options?.forceBinancePublic === true;
+    const forceBinancePublic = options?.forceBinancePublic !== false;
     const sourceQuery = forceBinancePublic ? '&source=binance_public' : '';
     const response = await fetch(`/api/binance/proxy/klines?symbol=${targetSymbol}&interval=${interval}&limit=${limit}${sourceQuery}`);
     const data = await response.json();
@@ -56,7 +56,7 @@ export async function fetchAllSymbols(options?: FetchAllSymbolsOptions): Promise
       : ['USDT', 'USDC'];
     const allowedQuotes = new Set(quoteSource.map(q => String(q || '').toUpperCase()).filter(Boolean));
 
-    const forceBinancePublic = options?.forceBinancePublic === true;
+    const forceBinancePublic = options?.forceBinancePublic !== false;
     const sourceQuery = forceBinancePublic ? '&source=binance_public' : '';
     const response = await fetch(`/api/binance/proxy/exchangeInfo?includeSpot=${includeSpot ? '1' : '0'}&includeFutures=${includeFutures ? '1' : '0'}${sourceQuery}`);
     const data = await response.json();
@@ -103,7 +103,7 @@ export async function fetchAllSymbols(options?: FetchAllSymbolsOptions): Promise
 }
 export async function fetchTopSymbolsByVolume(limit: number = 20, options?: { forceBinancePublic?: boolean }): Promise<string[]> {
   try {
-    const forceBinancePublic = options?.forceBinancePublic === true;
+    const forceBinancePublic = options?.forceBinancePublic !== false;
     const sourceQuery = forceBinancePublic ? '?source=binance_public' : '';
     const response = await fetch(`/api/binance/proxy/ticker24hr${sourceQuery}`);
     const data = await response.json();
@@ -120,7 +120,7 @@ export async function fetchTopSymbolsByVolume(limit: number = 20, options?: { fo
 
 export async function fetchTicker24hStats(options?: { forceBinancePublic?: boolean }): Promise<Map<string, { quoteVolume: number; priceChangePercent: number }>> {
   try {
-    const forceBinancePublic = options?.forceBinancePublic === true;
+    const forceBinancePublic = options?.forceBinancePublic !== false;
     const sourceQuery = forceBinancePublic ? '?source=binance_public' : '';
     const response = await fetch(`/api/binance/proxy/ticker24hr${sourceQuery}`);
     const data = await response.json();

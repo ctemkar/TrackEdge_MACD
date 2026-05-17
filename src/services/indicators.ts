@@ -177,23 +177,93 @@ export function evaluateStrategy(
   const nearSupport = lastCandle.close <= supportLevel * (1 + (config.nearSupportPercent / 100));
   const nearResistance = lastCandle.close >= resistanceLevel * (1 - (config.nearResistancePercent / 100));
 
-  let overall: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
-  // Strict entry rule: only buy when MACD crosses above signal on the daily candle.
-  const buySignal = macdCrossover === 'BULLISH';
-  // Mirrored short rule: only sell/short when MACD crosses below signal on the daily candle.
-  const sellSignal = macdCrossover === 'BEARISH';
+  const histNow = lastMACD?.histogram ?? 0;
+  const histPrev = prevMACD?.histogram ?? 0;
+  const histogramRising = histNow > histPrev;
+  const bullishMomentum = histNow > 0 && histogramRising;
+  const bearishMomentum = histNow < 0 && !histogramRising;
+  const weakeningMomentum = Math.abs(histNow) < Math.abs(histPrev);
 
+  // Sideways/choppy detector: frequent MACD crossovers in recent bars.
+  let recentCrossovers = 0;
+  const crossoverLookback = Math.min(14, indicators.macd.length - 1);
+  for (let i = indicators.macd.length - crossoverLookback; i < indicators.macd.length; i += 1) {
+    const curr = indicators.macd[i];
+    const prev = indicators.macd[i - 1];
+    if (!curr || !prev) continue;
+    const crossedUp = prev.MACD <= prev.signal && curr.MACD > curr.signal;
+    const crossedDown = prev.MACD >= prev.signal && curr.MACD < curr.signal;
+    if (crossedUp || crossedDown) recentCrossovers += 1;
+  }
+  const choppyMarket = recentCrossovers >= 3;
+
+  // Volatility guardrail (ATR-like percentage using high/low range).
+  const volatilityLookback = Math.min(14, candles.length);
+  const recentRanges = candles.slice(-volatilityLookback).map(c => (c.high - c.low) / Math.max(c.close, 1e-12));
+  const avgRangePct = recentRanges.length > 0
+    ? (recentRanges.reduce((sum, value) => sum + value, 0) / recentRanges.length) * 100
+    : 0;
+  const extremeVolatility = avgRangePct > 8;
+
+  // Late-entry guard: avoid chasing after an overextended candle.
+  const candleBodyPct = Math.abs(lastCandle.close - lastCandle.open) / Math.max(lastCandle.open, 1e-12) * 100;
+  const lateEntryRisk = candleBodyPct > Math.max(1.5, avgRangePct * 0.9);
+
+  const longStop = Math.min(lastCandle.close * 0.985, supportLevel * 0.997);
+  const longTarget = Math.max(resistanceLevel, lastCandle.close * 1.025);
+  const longRisk = Math.max(lastCandle.close - longStop, 1e-12);
+  const longReward = Math.max(longTarget - lastCandle.close, 0);
+  const longRiskReward = longReward / longRisk;
+
+  const shortStop = Math.max(lastCandle.close * 1.015, resistanceLevel * 1.003);
+  const shortTarget = Math.min(supportLevel, lastCandle.close * 0.975);
+  const shortRisk = Math.max(shortStop - lastCandle.close, 1e-12);
+  const shortReward = Math.max(lastCandle.close - shortTarget, 0);
+  const shortRiskReward = shortReward / shortRisk;
+
+  const trendBullish = trend === 'UP' && emaCrossover === 'BULLISH';
+  const trendBearish = trend === 'DOWN' && emaCrossover === 'BEARISH';
+
+  const longQuality = (
+    (macdCrossover === 'BULLISH' || bullishMomentum) &&
+    trendBullish &&
+    volumeConfirmed &&
+    (nearSupport || !nearResistance) &&
+    !lateEntryRisk &&
+    !choppyMarket &&
+    !extremeVolatility &&
+    longRiskReward >= 2
+  );
+
+  const shortQuality = (
+    (macdCrossover === 'BEARISH' || bearishMomentum) &&
+    trendBearish &&
+    volumeConfirmed &&
+    (nearResistance || !nearSupport) &&
+    !lateEntryRisk &&
+    !choppyMarket &&
+    !extremeVolatility &&
+    shortRiskReward >= 2
+  );
+
+  let overall: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
   let score = 0;
-  if (buySignal) {
+  if (longQuality) {
     overall = 'BUY';
-    // No extra criteria: a valid bullish crossover is a full-strength entry.
-    score = config.maxScore;
-  } else if (sellSignal) {
+    score = 6;
+    if (macdCrossover === 'BULLISH') score += 1;
+    if (bullishMomentum) score += 1;
+    if (longRiskReward >= 2.5) score += 1;
+    if (!weakeningMomentum) score += 1;
+  } else if (shortQuality) {
     overall = 'SELL';
-    // No extra criteria: a valid bearish crossover is a full-strength short entry.
-    score = config.maxScore;
+    score = 6;
+    if (macdCrossover === 'BEARISH') score += 1;
+    if (bearishMomentum) score += 1;
+    if (shortRiskReward >= 2.5) score += 1;
+    if (!weakeningMomentum) score += 1;
   } else {
-    // No bullish crossover: stay flat.
+    // Conservative default: if confirmation is incomplete, hold.
     score = 0;
   }
 

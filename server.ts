@@ -758,11 +758,12 @@ async function startServer() {
 
           const symbolRaw = String(input?.symbol || input?.info?.symbol || '').toUpperCase();
           if (!symbolRaw) return;
-          const compact = symbolRaw.replace('/', '').replace(':USDT', '').replace(':USD', '').replace(':', '');
-          const normalized = compact.endsWith('USDT') || compact.endsWith('USD') ? compact : `${compact}USDT`;
+          const compact = symbolRaw.split(':')[0].replace('/', '');
+          const normalized = /(USDT|USDC|USD)$/.test(compact) ? compact : `${compact}USDT`;
+          const hasCompositeQuoteSuffix = /(?:USDT|USDC|USD){2,}$/.test(normalized);
           
           // STRICT VALIDATION: Reject malformed symbols (repeated quote assets like USDTUSDTUSDT)
-          if (!/^[A-Z0-9]+(USDT|USDC|USD)$/.test(normalized) || /USDT.*USDT|USDC.*USDC/.test(normalized)) {
+          if (!/^[A-Z0-9]+(USDT|USDC|USD)$/.test(normalized) || hasCompositeQuoteSuffix) {
             console.warn(`[TradeEdge] Rejecting malformed symbol: "${normalized}" (doesn't match valid trading pair format)`);
             return;
           }
@@ -773,7 +774,7 @@ async function startServer() {
               ? `${normalized.slice(0, -4)}/USDT:USDT`
               : normalized.endsWith('USDC')
                 ? `${normalized.slice(0, -4)}/USDC:USDC`
-                : `${normalized}/USDT:USDT`);
+                : `${normalized.slice(0, -3)}/USD:USD`);
 
           allPositions[normalized] = {
             amount: contracts,
@@ -888,15 +889,28 @@ async function startServer() {
               const umBal = Number(asset.umWalletBalance || 0);
               const umPnl = Number(asset.umUnrealizedPNL || 0);
               if (symbol && (umBal !== 0 || umPnl !== 0)) {
+                const normalizedAssetSymbol = /(USDT|USDC|USD)$/.test(symbol) ? symbol : `${symbol}USDT`;
+                const symbolMatch = normalizedAssetSymbol.match(/^([A-Z0-9]+?)(USDT|USDC|USD)$/);
+                if (!symbolMatch || /(?:USDT|USDC|USD){2,}$/.test(normalizedAssetSymbol)) {
+                  logWithThrottle(
+                    'warn',
+                    `sync-um-skip-malformed-${normalizedAssetSymbol}`,
+                    `[TradeEdge Sync] Skipping malformed UM asset symbol: ${normalizedAssetSymbol}`,
+                    60 * 1000,
+                  );
+                  return;
+                }
+                const [, base, quote] = symbolMatch;
+                const displaySymbol = `${base}/${quote}:${quote}`;
                 console.log(`[TradeEdge Sync] UM Asset: ${symbol} balance=${umBal} pnl=${umPnl}`);
                 upsertPosition({
-                  symbol: `${symbol}/USDT:USDT`,
+                  symbol: displaySymbol,
                   positionAmt: umBal,
                   positionSide: umBal < 0 ? 'SHORT' : 'LONG',
                   contracts: Math.abs(umBal),
                   unrealizedPnl: umPnl,
                   info: {
-                    symbol: `${symbol}/USDT:USDT`,
+                    symbol: displaySymbol,
                     positionAmt: umBal,
                     positionSide: umBal < 0 ? 'SHORT' : 'LONG',
                     unRealizedProfit: umPnl,
@@ -1695,7 +1709,7 @@ async function startServer() {
     try {
       const { symbol, interval, limit } = req.query;
       const source = String(req.query.source || '').toLowerCase();
-      const forceBinancePublic = source === 'binance_public';
+      const forceBinancePublic = source !== 'bybit';
       const usePrivateGemini = preferGemini() && hasConfiguredKeys();
 
       if (usePrivateGemini) {
@@ -1788,7 +1802,7 @@ async function startServer() {
     }
     try {
       const source = String(req.query.source || '').toLowerCase();
-      const forceBinancePublic = source === 'binance_public';
+      const forceBinancePublic = source !== 'bybit';
       const usePrivateGemini = preferGemini() && hasConfiguredKeys();
       if (usePrivateGemini) {
         const client = getExchange();
@@ -1865,7 +1879,7 @@ async function startServer() {
   app.get('/api/binance/proxy/ticker24hr', async (req, res) => {
     try {
       const source = String(req.query.source || '').toLowerCase();
-      const forceBinancePublic = source === 'binance_public';
+      const forceBinancePublic = source !== 'bybit';
       const usePrivateGemini = preferGemini() && hasConfiguredKeys();
       if (usePrivateGemini) {
         const client = getExchange();
