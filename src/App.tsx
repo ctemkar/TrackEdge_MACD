@@ -6,6 +6,59 @@ import { calculateIndicators, evaluateStrategy, Candle, DEFAULT_STRATEGY_CONFIG,
 import { scanMarket, MarketScanResult } from './services/scanner';
 import { BacktestModule } from './components/BacktestModule';
 
+const CRITERIA_HELP: Record<string, string> = {
+  autoEntryMinScore: 'Minimum strategy confidence required before opening a new position. Higher values reduce trade frequency and prioritize stronger setups.',
+  liveMinOrderNotional: 'Minimum USDT notional value allowed per live order. Helps avoid exchange min-notional rejects and tiny low-quality entries.',
+  macdFastPeriod: 'Fast EMA period used by MACD. Lower values react faster to price changes but can create more noise.',
+  macdSlowPeriod: 'Slow EMA period used by MACD. Higher values smooth trend detection but react slower to reversals.',
+  macdSignalPeriod: 'Signal-line EMA period for MACD cross detection. Larger values filter noise but delay entry/exit confirmation.',
+  continuationScore: 'Score contribution for continuation-style trend behavior. Increase to favor momentum continuation over reversal setups.',
+  rsiOverbought: 'RSI threshold considered overbought. Lowering it triggers caution earlier; increasing it allows stronger momentum runs.',
+  rsiOversold: 'RSI threshold considered oversold. Raising it flags potential bounce setups sooner; lowering it requires deeper pullbacks.',
+  scanIntervalSec: 'Seconds between automated market scan cycles. Lower values react faster but increase API load and rate-limit risk.',
+  holdingPollIntervalSec: 'Seconds between live holding price refreshes. Lower values improve responsiveness but add frequent API calls.',
+  maxSymbolsPerScan: 'Maximum number of symbols evaluated in one scan cycle. Lowering this reduces API pressure and keeps scans focused.',
+  softCooldownMinutes: 'Cooldown after a skipped/rejected entry. Prevents immediate re-entry attempts on unstable symbols.',
+  successCooldownMinutes: 'Cooldown after a successful close. Helps avoid overtrading the same symbol immediately after profit-taking.',
+  paperLossCooldownMinutes: 'Cooldown after a paper-trading loss. Reduces repeated losses from rapid re-entry in bad conditions.',
+  duplicateOrderLockoutSec: 'Minimum seconds before allowing a repeated order on the same side/symbol. Prevents accidental duplicate submissions.',
+  liveEntryDelayMs: 'Delay between sequential live entry submissions. Reduces burst orders and margin/permission race failures.',
+  minPaperAllocation: 'Minimum paper capital allocated per trade. Prevents unrealistically tiny paper positions in simulation mode.',
+  lowMarginLockMinutes: 'Lock duration when free margin is too low. Temporarily pauses entries to avoid repeated margin rejects.',
+  closeFailureLockMinutes: 'Lock duration after close-order failures. Prevents repeated close retries from spiraling into API churn.',
+  hardFailureLockMinutes: 'Extended lock after severe repeated failures. Emergency brake to stabilize execution behavior.',
+  trendSmaPeriod: 'SMA lookback used for broad trend context. Higher values emphasize long-term trend, lower values react faster.',
+  rsiPeriod: 'Number of candles used to compute RSI. Lower values are more reactive; higher values are smoother and slower.',
+  emaFastPeriod: 'Fast EMA period used in trend/momentum context scoring. Lower values increase sensitivity to short-term swings.',
+  emaSlowPeriod: 'Slow EMA period used in trend/momentum context scoring. Higher values stabilize trend bias.',
+  volumeLookback: 'Candles used for average volume baseline. Larger lookback smooths anomalies; smaller lookback is more reactive.',
+  volumeMultiplier: 'Required volume intensity vs baseline for stronger signals. Higher values demand clearer participation.',
+  supportLookback: 'Candles inspected to estimate support/resistance zones. Larger values use broader market structure.',
+  nearSupportPercent: 'Distance threshold for detecting price near support. Higher values treat wider ranges as support proximity.',
+  nearResistancePercent: 'Distance threshold for detecting price near resistance. Higher values mark resistance proximity earlier.',
+  crossoverScore: 'Score weight assigned to MACD/EMA crossover events. Increase to prioritize crossover-driven entries.',
+  contextTrendScore: 'Weight of trend context inside the final signal score. Higher values favor trend alignment.',
+  contextVolumeScore: 'Weight of volume context inside the final signal score. Higher values require stronger volume confirmation.',
+  contextMacdScore: 'Weight of MACD context inside the final score. Increase when MACD behavior should dominate decisions.',
+  contextEmaScore: 'Weight of EMA context inside the final score. Increase when EMA structure should dominate decisions.',
+  contextRsiScore: 'Weight of RSI context inside the final score. Increase when RSI regime should dominate decisions.',
+  maxScore: 'Maximum theoretical score used for normalization/thresholding. Keep aligned with total weight design of your strategy.',
+  liveQuoteAllowlistInput: 'Comma-separated quote assets allowed for live trading (for example USDT, USDC). Restricts tradable universe for safety.',
+};
+
+const CriteriaInfoLabel = ({ text, detail }: { text: string; detail: string }) => (
+  <span className="inline-flex items-center gap-1">
+    <span>{text}</span>
+    <span
+      title={detail}
+      aria-label={`${text} details`}
+      className="inline-flex h-3.5 min-w-[14px] items-center justify-center rounded-full border border-cyan-400/50 bg-cyan-500/10 px-1 text-[7px] font-black leading-none text-cyan-300"
+    >
+      @i
+    </span>
+  </span>
+);
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<'LIVE' | 'BACKTEST'>('LIVE');
   const [data, setData] = useState<Candle[]>([]);
@@ -47,6 +100,10 @@ export default function App() {
   const [holdingPollIntervalSec, setHoldingPollIntervalSec] = useState(() => {
     const saved = localStorage.getItem('te_holding_poll_interval_sec');
     return saved ? (parseInt(saved, 10) || 3) : 3;
+  });
+  const [maxSymbolsPerScan, setMaxSymbolsPerScan] = useState(() => {
+    const saved = localStorage.getItem('te_max_symbols_per_scan');
+    return saved ? (parseInt(saved, 10) || 60) : 60;
   });
   const [duplicateOrderLockoutSec, setDuplicateOrderLockoutSec] = useState(() => {
     const saved = localStorage.getItem('te_duplicate_order_lockout_sec');
@@ -222,6 +279,8 @@ export default function App() {
   const [scanExecutionStats, setScanExecutionStats] = useState({ cycleId: 0, attempted: 0, filled: 0, failed: 0, skipped: 0 });
   const [executionFeedback, setExecutionFeedback] = useState<{ type: 'info' | 'success' | 'warning', message: string } | null>(null);
   const [entryLockUntil, setEntryLockUntil] = useState(0);
+  const lastRateLimitWarnAtRef = React.useRef(0);
+  const dismissedSyncErrorRef = React.useRef<{ message: string; until: number } | null>(null);
 
   // Auto-dismiss toast after 8s for warnings/errors, 4s for success/info
   React.useEffect(() => {
@@ -366,20 +425,47 @@ export default function App() {
     });
   }, [pushTradeEvent]);
 
+  const reportSyncError = React.useCallback((message: string | null) => {
+    if (!message) {
+      setSyncError(null);
+      return;
+    }
+    const dismissed = dismissedSyncErrorRef.current;
+    if (dismissed && dismissed.message === message && dismissed.until > Date.now()) {
+      return;
+    }
+    setSyncError(message);
+  }, []);
+
+  const dismissSyncError = React.useCallback(() => {
+    if (syncError) {
+      dismissedSyncErrorRef.current = {
+        message: syncError,
+        until: Date.now() + 2 * 60 * 1000,
+      };
+    }
+    setSyncError(null);
+  }, [syncError]);
+
   const syncRealBalance = React.useCallback(async () => {
     if (isSyncingRef.current) return false;
     if (rateLimitedUntilRef.current > Date.now()) {
       const retryTime = new Date(rateLimitedUntilRef.current).toLocaleTimeString();
       const message = `BINANCE RATE LIMITED: IP temporarily banned by Binance. Retry at ${retryTime}. (Too many API requests were made recently.)`;
-      setSyncError(message);
-      setExecutionFeedback({ type: 'warning', message });
-      addLog(message, 'warning');
+      const now = Date.now();
+      const shouldNotify = now - lastRateLimitWarnAtRef.current > 30000;
+      reportSyncError(message);
+      if (shouldNotify) {
+        lastRateLimitWarnAtRef.current = now;
+        setExecutionFeedback({ type: 'warning', message });
+        addLog(message, 'warning');
+      }
       return false;
     }
     if (entryLockUntilRef.current > Date.now()) {
       const retryTime = new Date(entryLockUntilRef.current).toLocaleTimeString();
       const message = `Live trading disabled until ${retryTime}`;
-      setSyncError(message);
+      reportSyncError(message);
       setExecutionFeedback({ type: 'warning', message });
       addLog(message, 'warning');
       return false;
@@ -430,7 +516,7 @@ export default function App() {
           message = 'TIMESTAMP REJECTED. Your local clock may be out of sync with exchange servers.';
         }
 
-        setSyncError(message);
+        reportSyncError(message);
         setExecutionFeedback({ type: 'warning', message });
         return false;
       }
@@ -554,14 +640,14 @@ export default function App() {
            setBenchmarkCapital(currentEquity);
         }
         
-        setSyncError(null);
+        reportSyncError(null);
         addLog(`SYNC SUCCESS: [${data.account || 'Margin'}] Total Equity $${currentEquity.toFixed(2)} (Cash: $${usdt.toFixed(2)})`, 'success');
         setServerStatus('OK');
         return true;
       } else {
         setAuthDegradedMessage(null);
         const message = data.message || 'Unknown balance sync error';
-        setSyncError(message);
+        reportSyncError(message);
         setExecutionFeedback({ type: 'warning', message });
         addLog(`SYNC FAILED: ${message}`, 'warning');
         return false;
@@ -570,14 +656,14 @@ export default function App() {
       console.error('Sync Error:', e);
       setAuthDegradedMessage(null);
       addLog(`SYNC ERROR: ${e.message}`, 'warning');
-      setSyncError(e.message);
+      reportSyncError(e.message);
       setServerStatus('ERROR');
       return false;
     } finally {
       isSyncingRef.current = false;
       setIsSyncing(false);
     }
-  }, [addLog, serverConfig?.outboundIp, benchmarkCapital, holdings.length, isRealMode, marketPicks, holdingPrices]);
+  }, [addLog, reportSyncError, serverConfig?.outboundIp, benchmarkCapital, holdings.length, isRealMode, marketPicks, holdingPrices]);
 
   React.useEffect(() => {
     syncRealBalanceRef.current = syncRealBalance;
@@ -1207,6 +1293,7 @@ export default function App() {
     localStorage.setItem('te_live_quote_allowlist', liveQuoteAllowlistInput);
     localStorage.setItem('te_scan_interval_sec', scanIntervalSec.toString());
     localStorage.setItem('te_holding_poll_interval_sec', holdingPollIntervalSec.toString());
+    localStorage.setItem('te_max_symbols_per_scan', maxSymbolsPerScan.toString());
     localStorage.setItem('te_duplicate_order_lockout_sec', duplicateOrderLockoutSec.toString());
     localStorage.setItem('te_live_entry_delay_ms', liveEntryDelayMs.toString());
     localStorage.setItem('te_min_paper_allocation', minPaperAllocation.toString());
@@ -1217,7 +1304,7 @@ export default function App() {
     localStorage.setItem('te_close_failure_lock_minutes', closeFailureLockMinutes.toString());
     localStorage.setItem('te_hard_failure_lock_minutes', hardFailureLockMinutes.toString());
     localStorage.setItem('te_strategy_config', JSON.stringify(strategyConfig));
-  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, duplicateOrderLockoutSec, liveEntryDelayMs, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
+  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
 
   // Baseline Safety: If paper trading and baseline is from a ghost real-sync session, fix it.
   useEffect(() => {
@@ -1266,6 +1353,168 @@ export default function App() {
   const updateStrategyConfig = React.useCallback((partial: Partial<StrategyConfig>) => {
     setStrategyConfig(prev => ({ ...prev, ...partial }));
   }, []);
+
+  const [aiCriteriaPrompt, setAiCriteriaPrompt] = useState('');
+  const [aiCriteriaFeedback, setAiCriteriaFeedback] = useState<string | null>(null);
+
+  const applyAiCriteriaPrompt = React.useCallback(() => {
+    const raw = aiCriteriaPrompt.trim();
+    if (!raw) {
+      setAiCriteriaFeedback('Enter a command first, for example: set scan interval 60, holding poll 8, rsi overbought 72.');
+      return;
+    }
+
+    const parts = raw
+      .split(/\n|;|,|\band\b/gi)
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    const extractNumber = (text: string) => {
+      const match = text.match(/-?\d+(?:\.\d+)?/);
+      return match ? parseFloat(match[0]) : null;
+    };
+
+    const touched: string[] = [];
+    const strategyPatch: Partial<StrategyConfig> = {};
+
+    for (const partRaw of parts) {
+      const part = partRaw.toLowerCase();
+      const val = extractNumber(part);
+
+      if (part.includes('auto entry') && val !== null) {
+        setAutoEntryMinScore(Math.max(0, Math.min(10, val)));
+        touched.push('Auto Entry Score');
+      } else if ((part.includes('live notional') || part.includes('min notional')) && val !== null) {
+        setLiveMinOrderNotional(Math.max(1, val));
+        touched.push('Min Live Notional');
+      } else if (part.includes('scan interval') && val !== null) {
+        setScanIntervalSec(Math.max(10, Math.round(val)));
+        touched.push('Scan Interval');
+      } else if ((part.includes('holding poll') || part.includes('poll interval')) && val !== null) {
+        setHoldingPollIntervalSec(Math.max(3, Math.round(val)));
+        touched.push('Holding Poll');
+      } else if ((part.includes('max symbols') || part.includes('symbols per scan')) && val !== null) {
+        setMaxSymbolsPerScan(Math.max(20, Math.min(200, Math.round(val))));
+        touched.push('Max Symbols / Scan');
+      } else if ((part.includes('soft cooldown')) && val !== null) {
+        setSoftCooldownMinutes(Math.max(1, Math.round(val)));
+        touched.push('Soft Cooldown');
+      } else if ((part.includes('success cooldown')) && val !== null) {
+        setSuccessCooldownMinutes(Math.max(1, Math.round(val)));
+        touched.push('Success Cooldown');
+      } else if ((part.includes('paper loss cooldown') || part.includes('loss cooldown')) && val !== null) {
+        setPaperLossCooldownMinutes(Math.max(1, Math.round(val)));
+        touched.push('Paper Loss Cooldown');
+      } else if ((part.includes('order lockout') || part.includes('duplicate order')) && val !== null) {
+        setDuplicateOrderLockoutSec(Math.max(1, Math.round(val)));
+        touched.push('Order Lockout');
+      } else if ((part.includes('entry delay') || part.includes('live entry delay')) && val !== null) {
+        setLiveEntryDelayMs(Math.max(0, Math.round(val)));
+        touched.push('Live Entry Delay');
+      } else if ((part.includes('min paper allocation') || part.includes('paper allocation')) && val !== null) {
+        setMinPaperAllocation(Math.max(1, val));
+        touched.push('Min Paper Allocation');
+      } else if (part.includes('low margin lock') && val !== null) {
+        setLowMarginLockMinutes(Math.max(1, Math.round(val)));
+        touched.push('Low Margin Lock');
+      } else if (part.includes('close failure lock') && val !== null) {
+        setCloseFailureLockMinutes(Math.max(1, Math.round(val)));
+        touched.push('Close Failure Lock');
+      } else if (part.includes('hard failure lock') && val !== null) {
+        setHardFailureLockMinutes(Math.max(1, Math.round(val)));
+        touched.push('Hard Failure Lock');
+      } else if (part.includes('rsi overbought') && val !== null) {
+        strategyPatch.rsiOverbought = Math.max(50, Math.min(95, val));
+        touched.push('RSI Overbought');
+      } else if (part.includes('rsi oversold') && val !== null) {
+        strategyPatch.rsiOversold = Math.max(5, Math.min(50, val));
+        touched.push('RSI Oversold');
+      } else if (part.includes('rsi period') && val !== null) {
+        strategyPatch.rsiPeriod = Math.max(2, Math.round(val));
+        touched.push('RSI Period');
+      } else if (part.includes('macd fast') && val !== null) {
+        strategyPatch.macdFastPeriod = Math.max(1, Math.round(val));
+        touched.push('MACD Fast');
+      } else if (part.includes('macd slow') && val !== null) {
+        strategyPatch.macdSlowPeriod = Math.max(2, Math.round(val));
+        touched.push('MACD Slow');
+      } else if (part.includes('macd signal') && val !== null) {
+        strategyPatch.macdSignalPeriod = Math.max(1, Math.round(val));
+        touched.push('MACD Signal');
+      } else if (part.includes('continuation score') && val !== null) {
+        strategyPatch.continuationScore = Math.max(0, Math.min(10, val));
+        touched.push('Continuation Score');
+      } else if (part.includes('trend sma') && val !== null) {
+        strategyPatch.trendSmaPeriod = Math.max(2, Math.round(val));
+        touched.push('Trend SMA Period');
+      } else if (part.includes('ema fast') && val !== null) {
+        strategyPatch.emaFastPeriod = Math.max(1, Math.round(val));
+        touched.push('EMA Fast Period');
+      } else if (part.includes('ema slow') && val !== null) {
+        strategyPatch.emaSlowPeriod = Math.max(2, Math.round(val));
+        touched.push('EMA Slow Period');
+      } else if (part.includes('volume lookback') && val !== null) {
+        strategyPatch.volumeLookback = Math.max(2, Math.round(val));
+        touched.push('Volume Lookback');
+      } else if (part.includes('volume multiplier') && val !== null) {
+        strategyPatch.volumeMultiplier = Math.max(0.1, val);
+        touched.push('Volume Multiplier');
+      } else if (part.includes('support lookback') && val !== null) {
+        strategyPatch.supportLookback = Math.max(2, Math.round(val));
+        touched.push('Support Lookback');
+      } else if (part.includes('near support') && val !== null) {
+        strategyPatch.nearSupportPercent = Math.max(0.1, val);
+        touched.push('Near Support (%)');
+      } else if (part.includes('near resistance') && val !== null) {
+        strategyPatch.nearResistancePercent = Math.max(0.1, val);
+        touched.push('Near Resistance (%)');
+      } else if (part.includes('crossover score') && val !== null) {
+        strategyPatch.crossoverScore = Math.max(0, Math.min(10, val));
+        touched.push('Crossover Score');
+      } else if (part.includes('trend context') && val !== null) {
+        strategyPatch.contextTrendScore = Math.max(0, Math.min(10, val));
+        touched.push('Trend Context Score');
+      } else if (part.includes('volume context') && val !== null) {
+        strategyPatch.contextVolumeScore = Math.max(0, Math.min(10, val));
+        touched.push('Volume Context Score');
+      } else if (part.includes('macd context') && val !== null) {
+        strategyPatch.contextMacdScore = Math.max(0, Math.min(10, val));
+        touched.push('MACD Context Score');
+      } else if (part.includes('ema context') && val !== null) {
+        strategyPatch.contextEmaScore = Math.max(0, Math.min(10, val));
+        touched.push('EMA Context Score');
+      } else if (part.includes('rsi context') && val !== null) {
+        strategyPatch.contextRsiScore = Math.max(0, Math.min(10, val));
+        touched.push('RSI Context Score');
+      } else if (part.includes('max score') && val !== null) {
+        strategyPatch.maxScore = Math.max(1, Math.min(10, val));
+        touched.push('Max Score');
+      } else if (part.includes('quotes')) {
+        const quotes = partRaw
+          .replace(/.*quotes?/i, '')
+          .replace(/[:=]/g, ' ')
+          .split(/[\s,]+/)
+          .map(s => s.trim().toUpperCase())
+          .filter(Boolean)
+          .filter(s => /^[A-Z]{3,6}$/.test(s));
+        if (quotes.length > 0) {
+          setLiveQuoteAllowlistInput(Array.from(new Set(quotes)).join(','));
+          touched.push('Allowed Live Quotes');
+        }
+      }
+    }
+
+    if (Object.keys(strategyPatch).length > 0) {
+      updateStrategyConfig(strategyPatch);
+    }
+
+    if (touched.length === 0) {
+      setAiCriteriaFeedback('No recognized criteria were found. Try: scan interval 60, holding poll 8, rsi overbought 72.');
+      return;
+    }
+
+    setAiCriteriaFeedback(`Updated ${Array.from(new Set(touched)).join(', ')}`);
+  }, [aiCriteriaPrompt, updateStrategyConfig]);
 
   // Emergency Drawdown Watcher
   useEffect(() => {
@@ -1364,6 +1613,15 @@ export default function App() {
         if (symbolsToScan.length < beforeFilter) {
           console.log(`[Scanner] Filtered ${beforeFilter - symbolsToScan.length} non-futures symbols from scan universe`);
         }
+      }
+
+      if (isLiveBinance) {
+        const cap = Math.max(20, maxSymbolsPerScan);
+        const reduced = symbolsToScan.slice(0, cap);
+        if (baseSymbol && !reduced.includes(baseSymbol) && reduced.length > 0) {
+          reduced[reduced.length - 1] = baseSymbol;
+        }
+        symbolsToScan = Array.from(new Set(reduced));
       }
 
       if (symbolsToScan.length === 0) {
@@ -1832,7 +2090,7 @@ export default function App() {
                 </button>
                 <button 
                   onClick={async () => {
-                    setSyncError(null);
+                    reportSyncError(null);
                     if (entryLockActive) {
                       const lockMessage = `Live trading disabled until ${entryLockRetryTime}`;
                       setExecutionFeedback({ type: 'warning', message: lockMessage });
@@ -1847,7 +2105,7 @@ export default function App() {
                       const message = serverStatus !== 'OK'
                         ? 'SERVER STATUS UNKNOWN: wait for connection health before enabling Live Futures.'
                         : 'API KEYS REQUIRED: configure exchange credentials before enabling Live Futures.';
-                      setSyncError(message);
+                      reportSyncError(message);
                       setExecutionFeedback({ type: 'warning', message });
                       addLog(message, 'warning');
                     }
@@ -2240,114 +2498,136 @@ export default function App() {
 
                 <div className="p-3 bg-white/5 border border-white/10 rounded-sm space-y-3">
                   <p className="text-[10px] uppercase font-bold opacity-70">Strategy Criteria</p>
+                  <div className="space-y-2 rounded-sm border border-cyan-500/20 bg-cyan-500/5 p-2">
+                    <p className="text-[8px] uppercase font-bold tracking-wide text-cyan-300">AI Criteria Editor</p>
+                    <textarea
+                      value={aiCriteriaPrompt}
+                      onChange={(e) => setAiCriteriaPrompt(e.target.value)}
+                      placeholder="Example: set scan interval 60, holding poll 8, max symbols 50, rsi overbought 72"
+                      className="h-16 w-full resize-none rounded-sm border border-white/10 bg-black/40 px-2 py-1 text-[10px] font-mono"
+                    />
+                    <div className="flex items-center justify-between gap-2">
+                      <button
+                        type="button"
+                        onClick={applyAiCriteriaPrompt}
+                        className="rounded-xs border border-cyan-400/40 bg-cyan-500/20 px-2 py-1 text-[9px] font-black uppercase tracking-wide text-cyan-200 hover:bg-cyan-500/30"
+                      >
+                        Apply AI Command
+                      </button>
+                      {aiCriteriaFeedback && <span className="text-[8px] text-cyan-200/80">{aiCriteriaFeedback}</span>}
+                    </div>
+                  </div>
                   <div className="grid grid-cols-2 gap-2">
-                    <label className="text-[8px] uppercase opacity-60">Auto Entry Score
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Auto Entry Score" detail={CRITERIA_HELP.autoEntryMinScore} />
                       <input type="number" min="0" max="10" step="0.5" value={autoEntryMinScore} onChange={(e) => setAutoEntryMinScore(parseFloat(e.target.value) || 0)} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Min Live Notional
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Min Live Notional" detail={CRITERIA_HELP.liveMinOrderNotional} />
                       <input type="number" min="1" step="1" value={liveMinOrderNotional} onChange={(e) => setLiveMinOrderNotional(parseFloat(e.target.value) || 1)} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">MACD Fast
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="MACD Fast" detail={CRITERIA_HELP.macdFastPeriod} />
                       <input type="number" min="1" step="1" value={strategyConfig.macdFastPeriod} onChange={(e) => updateStrategyConfig({ macdFastPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">MACD Slow
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="MACD Slow" detail={CRITERIA_HELP.macdSlowPeriod} />
                       <input type="number" min="2" step="1" value={strategyConfig.macdSlowPeriod} onChange={(e) => updateStrategyConfig({ macdSlowPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">MACD Signal
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="MACD Signal" detail={CRITERIA_HELP.macdSignalPeriod} />
                       <input type="number" min="1" step="1" value={strategyConfig.macdSignalPeriod} onChange={(e) => updateStrategyConfig({ macdSignalPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Continuation Score
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Continuation Score" detail={CRITERIA_HELP.continuationScore} />
                       <input type="number" min="0" max="10" step="0.5" value={strategyConfig.continuationScore} onChange={(e) => updateStrategyConfig({ continuationScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">RSI Overbought
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="RSI Overbought" detail={CRITERIA_HELP.rsiOverbought} />
                       <input type="number" min="50" max="95" step="1" value={strategyConfig.rsiOverbought} onChange={(e) => updateStrategyConfig({ rsiOverbought: parseFloat(e.target.value) || 70 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">RSI Oversold
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="RSI Oversold" detail={CRITERIA_HELP.rsiOversold} />
                       <input type="number" min="5" max="50" step="1" value={strategyConfig.rsiOversold} onChange={(e) => updateStrategyConfig({ rsiOversold: parseFloat(e.target.value) || 45 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Scan Interval (s)
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Scan Interval (s)" detail={CRITERIA_HELP.scanIntervalSec} />
                       <input type="number" min="10" step="1" value={scanIntervalSec} onChange={(e) => setScanIntervalSec(Math.max(10, parseInt(e.target.value, 10) || 10))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Holding Poll (s)
-                      <input type="number" min="1" step="1" value={holdingPollIntervalSec} onChange={(e) => setHoldingPollIntervalSec(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Holding Poll (s)" detail={CRITERIA_HELP.holdingPollIntervalSec} />
+                      <input type="number" min="3" step="1" value={holdingPollIntervalSec} onChange={(e) => setHoldingPollIntervalSec(Math.max(3, parseInt(e.target.value, 10) || 3))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Soft Cooldown (m)
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Max Symbols / Scan" detail={CRITERIA_HELP.maxSymbolsPerScan} />
+                      <input type="number" min="20" max="200" step="5" value={maxSymbolsPerScan} onChange={(e) => setMaxSymbolsPerScan(Math.max(20, Math.min(200, parseInt(e.target.value, 10) || 20)))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Soft Cooldown (m)" detail={CRITERIA_HELP.softCooldownMinutes} />
                       <input type="number" min="1" step="1" value={softCooldownMinutes} onChange={(e) => setSoftCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Success Cooldown (m)
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Success Cooldown (m)" detail={CRITERIA_HELP.successCooldownMinutes} />
                       <input type="number" min="1" step="1" value={successCooldownMinutes} onChange={(e) => setSuccessCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Paper Loss Cooldown (m)
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Paper Loss Cooldown (m)" detail={CRITERIA_HELP.paperLossCooldownMinutes} />
                       <input type="number" min="1" step="1" value={paperLossCooldownMinutes} onChange={(e) => setPaperLossCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Order Lockout (s)
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Order Lockout (s)" detail={CRITERIA_HELP.duplicateOrderLockoutSec} />
                       <input type="number" min="1" step="1" value={duplicateOrderLockoutSec} onChange={(e) => setDuplicateOrderLockoutSec(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Live Entry Delay (ms)
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Live Entry Delay (ms)" detail={CRITERIA_HELP.liveEntryDelayMs} />
                       <input type="number" min="0" step="50" value={liveEntryDelayMs} onChange={(e) => setLiveEntryDelayMs(Math.max(0, parseInt(e.target.value, 10) || 0))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Min Paper Allocation
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Min Paper Allocation" detail={CRITERIA_HELP.minPaperAllocation} />
                       <input type="number" min="1" step="1" value={minPaperAllocation} onChange={(e) => setMinPaperAllocation(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Low Margin Lock (m)
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Low Margin Lock (m)" detail={CRITERIA_HELP.lowMarginLockMinutes} />
                       <input type="number" min="1" step="1" value={lowMarginLockMinutes} onChange={(e) => setLowMarginLockMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Close Failure Lock (m)
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Close Failure Lock (m)" detail={CRITERIA_HELP.closeFailureLockMinutes} />
                       <input type="number" min="1" step="1" value={closeFailureLockMinutes} onChange={(e) => setCloseFailureLockMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Hard Failure Lock (m)
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Hard Failure Lock (m)" detail={CRITERIA_HELP.hardFailureLockMinutes} />
                       <input type="number" min="1" step="1" value={hardFailureLockMinutes} onChange={(e) => setHardFailureLockMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Trend SMA Period
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Trend SMA Period" detail={CRITERIA_HELP.trendSmaPeriod} />
                       <input type="number" min="2" step="1" value={strategyConfig.trendSmaPeriod} onChange={(e) => updateStrategyConfig({ trendSmaPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">RSI Period
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="RSI Period" detail={CRITERIA_HELP.rsiPeriod} />
                       <input type="number" min="2" step="1" value={strategyConfig.rsiPeriod} onChange={(e) => updateStrategyConfig({ rsiPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">EMA Fast Period
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="EMA Fast Period" detail={CRITERIA_HELP.emaFastPeriod} />
                       <input type="number" min="1" step="1" value={strategyConfig.emaFastPeriod} onChange={(e) => updateStrategyConfig({ emaFastPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">EMA Slow Period
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="EMA Slow Period" detail={CRITERIA_HELP.emaSlowPeriod} />
                       <input type="number" min="2" step="1" value={strategyConfig.emaSlowPeriod} onChange={(e) => updateStrategyConfig({ emaSlowPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Volume Lookback
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Volume Lookback" detail={CRITERIA_HELP.volumeLookback} />
                       <input type="number" min="2" step="1" value={strategyConfig.volumeLookback} onChange={(e) => updateStrategyConfig({ volumeLookback: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Volume Multiplier
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Volume Multiplier" detail={CRITERIA_HELP.volumeMultiplier} />
                       <input type="number" min="0.1" step="0.1" value={strategyConfig.volumeMultiplier} onChange={(e) => updateStrategyConfig({ volumeMultiplier: Math.max(0.1, parseFloat(e.target.value) || 0.1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Support Lookback
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Support Lookback" detail={CRITERIA_HELP.supportLookback} />
                       <input type="number" min="2" step="1" value={strategyConfig.supportLookback} onChange={(e) => updateStrategyConfig({ supportLookback: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Near Support (%)
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Near Support (%)" detail={CRITERIA_HELP.nearSupportPercent} />
                       <input type="number" min="0.1" step="0.1" value={strategyConfig.nearSupportPercent} onChange={(e) => updateStrategyConfig({ nearSupportPercent: Math.max(0.1, parseFloat(e.target.value) || 0.1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Near Resistance (%)
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Near Resistance (%)" detail={CRITERIA_HELP.nearResistancePercent} />
                       <input type="number" min="0.1" step="0.1" value={strategyConfig.nearResistancePercent} onChange={(e) => updateStrategyConfig({ nearResistancePercent: Math.max(0.1, parseFloat(e.target.value) || 0.1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Crossover Score
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Crossover Score" detail={CRITERIA_HELP.crossoverScore} />
                       <input type="number" min="0" max="10" step="0.5" value={strategyConfig.crossoverScore} onChange={(e) => updateStrategyConfig({ crossoverScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Trend Context Score
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Trend Context Score" detail={CRITERIA_HELP.contextTrendScore} />
                       <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextTrendScore} onChange={(e) => updateStrategyConfig({ contextTrendScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Volume Context Score
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Volume Context Score" detail={CRITERIA_HELP.contextVolumeScore} />
                       <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextVolumeScore} onChange={(e) => updateStrategyConfig({ contextVolumeScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">MACD Context Score
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="MACD Context Score" detail={CRITERIA_HELP.contextMacdScore} />
                       <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextMacdScore} onChange={(e) => updateStrategyConfig({ contextMacdScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">EMA Context Score
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="EMA Context Score" detail={CRITERIA_HELP.contextEmaScore} />
                       <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextEmaScore} onChange={(e) => updateStrategyConfig({ contextEmaScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">RSI Context Score
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="RSI Context Score" detail={CRITERIA_HELP.contextRsiScore} />
                       <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextRsiScore} onChange={(e) => updateStrategyConfig({ contextRsiScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60">Max Score
+                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Max Score" detail={CRITERIA_HELP.maxScore} />
                       <input type="number" min="1" max="10" step="0.5" value={strategyConfig.maxScore} onChange={(e) => updateStrategyConfig({ maxScore: Math.max(1, parseFloat(e.target.value) || 1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                     </label>
                   </div>
-                  <label className="text-[8px] uppercase opacity-60 block">Allowed Live Quotes (comma separated)
+                  <label className="text-[8px] uppercase opacity-60 block"><CriteriaInfoLabel text="Allowed Live Quotes (comma separated)" detail={CRITERIA_HELP.liveQuoteAllowlistInput} />
                     <input type="text" value={liveQuoteAllowlistInput} onChange={(e) => setLiveQuoteAllowlistInput(e.target.value.toUpperCase())} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
                   </label>
                 </div>
@@ -2424,7 +2704,7 @@ export default function App() {
                     {syncError && (
                       <div className="mb-4 p-3 bg-rose-600/20 border-2 border-rose-600 rounded-sm relative">
                         <button 
-                          onClick={() => setSyncError(null)}
+                          onClick={dismissSyncError}
                           className="absolute top-1 right-1 text-white/40 hover:text-white"
                         >
                           ×

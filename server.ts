@@ -21,6 +21,7 @@ async function startServer() {
     .map(s => s.trim().toUpperCase())
     .filter(Boolean);
   const unsupportedSymbolSkips = new Map<string, { until: number; count: number; reason: string }>();
+  let cachedBinancePositionMode: { dualSidePosition: boolean; fetchedAt: number } | null = null;
 
   // Rate-limit state: tracks when Binance bans expire + consecutive failure count for backoff
   const rateLimitState = {
@@ -244,6 +245,59 @@ async function startServer() {
     }
   };
 
+  // Fetch Binance position mode so order params can match one-way vs hedge configuration.
+  const fetchBinancePositionModeViaHttp = async (
+    apiKey: string,
+    apiSecret: string,
+  ): Promise<{ dualSidePosition: boolean | null }> => {
+    try {
+      if (cachedBinancePositionMode && Date.now() - cachedBinancePositionMode.fetchedAt < 60_000) {
+        return { dualSidePosition: cachedBinancePositionMode.dualSidePosition };
+      }
+
+      const timestamp = Date.now();
+      const recvWindow = '5000';
+      const params = new URLSearchParams({ timestamp: String(timestamp), recvWindow });
+      const queryString = params.toString();
+      const signature = crypto
+        .createHmac('sha256', apiSecret)
+        .update(queryString)
+        .digest('hex');
+
+      const endpoints = [
+        'https://fapi.binance.com/fapi/v1/positionSide/dual',
+        'https://papi.binance.com/papi/v1/um/positionSide/dual',
+      ];
+
+      for (const endpoint of endpoints) {
+        const url = `${endpoint}?${queryString}&signature=${signature}`;
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: {
+            'X-MBX-APIKEY': apiKey,
+            'Content-Type': 'application/json',
+          },
+        });
+
+        if (!response.ok) continue;
+
+        const json: any = await response.json();
+        const raw = json?.dualSidePosition;
+        const dualSidePosition = typeof raw === 'boolean' ? raw : String(raw || '').toLowerCase() === 'true';
+
+        cachedBinancePositionMode = {
+          dualSidePosition,
+          fetchedAt: Date.now(),
+        };
+        return { dualSidePosition };
+      }
+
+      return { dualSidePosition: null };
+    } catch {
+      return { dualSidePosition: null };
+    }
+  };
+
   // Exchange Client (Lazy Init)
   let exchangeInstance: ccxt.Exchange | null = null;
   const hasConfiguredKeys = () => !!(
@@ -254,11 +308,20 @@ async function startServer() {
     (process.env.GEMINI_API_KEY && process.env.GEMINI_API_SECRET) ||
     (process.env.GEMINI_KEY && process.env.GEMINI_SECRET)
   );
+  const getPreferredBinanceCredentials = () => {
+    const candidates = [
+      { key: (process.env.BINANCE_KEY || '').trim(), secret: (process.env.BINANCE_SECRET || '').trim(), source: 'BINANCE_KEY' },
+      { key: (process.env.BINANCE_API_KEY || '').trim(), secret: (process.env.BINANCE_API_SECRET || '').trim(), source: 'BINANCE_API_KEY' },
+      { key: (process.env.BINANCE_LIVE_API_KEY || '').trim(), secret: (process.env.BINANCE_LIVE_API_SECRET || '').trim(), source: 'BINANCE_LIVE_API_KEY' },
+    ];
+    return candidates.find(c => c.key.length > 5 && c.secret.length > 5) || { key: '', secret: '', source: 'none' };
+  };
   const preferGemini = () => (process.env.EXCHANGE || '').toLowerCase() === 'gemini';
   const getExchange = () => {
     if (!exchangeInstance) {
-      const bKey = (process.env.BINANCE_LIVE_API_KEY || process.env.BINANCE_API_KEY || process.env.BINANCE_KEY || '').trim();
-      const bSecret = (process.env.BINANCE_LIVE_API_SECRET || process.env.BINANCE_API_SECRET || process.env.BINANCE_SECRET || '').trim();
+      const preferredBinance = getPreferredBinanceCredentials();
+      const bKey = preferredBinance.key;
+      const bSecret = preferredBinance.secret;
       const gKey = (process.env.GEMINI_LIVE_API_KEY || process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '').trim();
       const gSecret = (process.env.GEMINI_LIVE_API_SECRET || process.env.GEMINI_API_SECRET || process.env.GEMINI_SECRET || '').trim();
 
@@ -297,7 +360,7 @@ async function startServer() {
            enableRateLimit: true,
          });
       } else {
-         console.warn(`[TradeEdge] Initializing BINANCE client (Key: ${apiKey.substring(0, 8)}...)`);
+        console.warn(`[TradeEdge] Initializing BINANCE client from ${preferredBinance.source} (Key: ${apiKey.substring(0, 8)}...)`);
          exchangeInstance = new ccxt.binance({
            apiKey,
            secret,
@@ -305,7 +368,8 @@ async function startServer() {
            options: { 
              defaultType: 'future',
               adjustForTimeDifference: true,
-              portfolioMargin: true
+              portfolioMargin: true,
+              defaultPositionSide: 'BOTH'
            }
          });
 
@@ -426,8 +490,9 @@ async function startServer() {
         });
       }
 
-      const apiKey = (process.env.BINANCE_LIVE_API_KEY || process.env.BINANCE_API_KEY || process.env.BINANCE_KEY || '').trim();
-      const apiSecret = (process.env.BINANCE_LIVE_API_SECRET || process.env.BINANCE_API_SECRET || process.env.BINANCE_SECRET || '').trim();
+      const preferredBinance = getPreferredBinanceCredentials();
+      const apiKey = preferredBinance.key;
+      const apiSecret = preferredBinance.secret;
       if (!apiKey || !apiSecret) {
         throw new Error('Binance API keys are missing. Check your .env credentials.');
       }
@@ -706,8 +771,9 @@ async function startServer() {
         let positionsFetched = false;
         
         // PRIMARY: Try direct Binance HTTP API (most reliable)
-        const binanceKey = (process.env.BINANCE_LIVE_API_KEY || process.env.BINANCE_API_KEY || process.env.BINANCE_KEY || '').trim();
-        const binanceSecret = (process.env.BINANCE_LIVE_API_SECRET || process.env.BINANCE_API_SECRET || process.env.BINANCE_SECRET || '').trim();
+        const preferredBinance = getPreferredBinanceCredentials();
+        const binanceKey = preferredBinance.key;
+        const binanceSecret = preferredBinance.secret;
         
         if (binanceKey && binanceSecret) {
           const httpPositionResult = await fetchBinancePositionsViaHttp(binanceKey, binanceSecret);
@@ -1180,7 +1246,24 @@ async function startServer() {
           const validPositionSide = requestedPositionSide === 'LONG' || requestedPositionSide === 'SHORT'
             ? requestedPositionSide
             : undefined;
+          let effectivePositionSide: 'LONG' | 'SHORT' | 'BOTH' | undefined = validPositionSide;
           const wantsReduceOnly = reduceOnly === true;
+
+          if (client.id === 'binance') {
+            const preferredBinance = getPreferredBinanceCredentials();
+            const binanceKey = preferredBinance.key;
+            const binanceSecret = preferredBinance.secret;
+            if (binanceKey && binanceSecret) {
+              const mode = await fetchBinancePositionModeViaHttp(binanceKey, binanceSecret);
+              if (mode.dualSidePosition === false) {
+                // One-way mode only accepts BOTH position side.
+                effectivePositionSide = 'BOTH';
+              } else if (mode.dualSidePosition === true && !effectivePositionSide) {
+                // In hedge mode, default to side-aligned leg if caller did not provide one.
+                effectivePositionSide = side.toUpperCase() === 'BUY' ? 'LONG' : 'SHORT';
+              }
+            }
+          }
 
           // Precision and exchange limits precheck before submit.
           try {
@@ -1263,7 +1346,7 @@ async function startServer() {
           }
 
           const orderParams: Record<string, any> = {};
-          if (validPositionSide) orderParams.positionSide = validPositionSide;
+          if (effectivePositionSide) orderParams.positionSide = effectivePositionSide;
           if (wantsReduceOnly) orderParams.reduceOnly = true;
 
           const submitMarketOrder = async (params: Record<string, any>) => {
@@ -1275,6 +1358,68 @@ async function startServer() {
               undefined,
               params
             );
+          };
+
+          const submitMarketOrderDirectHttp = async (params: Record<string, any>) => {
+            const preferredBinance = getPreferredBinanceCredentials();
+            const binanceKey = preferredBinance.key;
+            const binanceSecret = preferredBinance.secret;
+            if (!binanceKey || !binanceSecret) {
+              throw new Error('Binance API keys unavailable for direct order fallback.');
+            }
+
+            const timestamp = Date.now();
+            const body = new URLSearchParams({
+              symbol: raw,
+              side: String(side || '').toUpperCase(),
+              type: 'MARKET',
+              quantity: String(finalAmount),
+              recvWindow: '5000',
+              timestamp: String(timestamp),
+            });
+
+            if (params?.positionSide) body.set('positionSide', String(params.positionSide));
+            if (params?.reduceOnly === true) body.set('reduceOnly', 'true');
+
+            const query = body.toString();
+            const signature = crypto.createHmac('sha256', binanceSecret).update(query).digest('hex');
+            const orderEndpoints = [
+              'https://fapi.binance.com/fapi/v1/order',
+              'https://papi.binance.com/papi/v1/um/order',
+            ];
+
+            let lastErr = 'unknown order error';
+            for (const endpoint of orderEndpoints) {
+              const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                  'X-MBX-APIKEY': binanceKey,
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: `${query}&signature=${signature}`,
+              });
+
+              const text = await response.text();
+              if (!response.ok) {
+                lastErr = text;
+                continue;
+              }
+
+              let json: any = {};
+              try {
+                json = text ? JSON.parse(text) : {};
+              } catch {
+                json = {};
+              }
+
+              return {
+                id: json?.orderId,
+                clientOrderId: json?.clientOrderId,
+                info: json,
+              };
+            }
+
+            throw new Error(`binance ${lastErr}`);
           };
 
           try {
@@ -1329,6 +1474,18 @@ async function startServer() {
                 break;
               } catch (retryErr: any) {
                 lastRetryErr = retryErr;
+              }
+            }
+
+            if (!order) {
+              for (const retryParams of retryVariants) {
+                try {
+                  order = await submitMarketOrderDirectHttp(retryParams);
+                  lastRetryErr = null;
+                  break;
+                } catch (retryErr: any) {
+                  lastRetryErr = retryErr;
+                }
               }
             }
 
