@@ -2070,10 +2070,19 @@ export default function App() {
               .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now())
           : [];
 
-        const entries = [
-          ...potentialLongs.map(pick => ({ side: 'BUY' as const, pick })),
-          ...potentialShorts.map(pick => ({ side: 'SELL' as const, pick })),
-        ].sort((a, b) => b.pick.signal.score - a.pick.signal.score);
+        const sortedLongs = potentialLongs
+          .map(pick => ({ side: 'BUY' as const, pick }))
+          .sort((a, b) => b.pick.signal.score - a.pick.signal.score);
+        const sortedShorts = potentialShorts
+          .map(pick => ({ side: 'SELL' as const, pick }))
+          .sort((a, b) => b.pick.signal.score - a.pick.signal.score);
+
+        const entries: Array<{ side: 'BUY' | 'SELL'; pick: typeof results[number] }> = [];
+        const maxEntryCandidates = Math.max(sortedLongs.length, sortedShorts.length);
+        for (let index = 0; index < maxEntryCandidates; index += 1) {
+          if (sortedLongs[index]) entries.push(sortedLongs[index]);
+          if (sortedShorts[index]) entries.push(sortedShorts[index]);
+        }
 
         if (currentHoldings.length < currentMaxTrades) {
           const availableSlots = currentMaxTrades - currentHoldings.length;
@@ -2721,7 +2730,7 @@ export default function App() {
                   Live Futures
                 </button>
                 {entryLockActive && (
-                  <span className="text-[8px] font-mono uppercase text-rose-600 ml-1">
+                  <span className="text-[10px] font-mono uppercase text-rose-600 ml-1">
                     Disabled until {entryLockRemainingSec}s
                   </span>
                 )}
@@ -2732,7 +2741,7 @@ export default function App() {
              <div className="flex items-center gap-2 bg-[#141414]/5 px-3 py-1 rounded-sm border border-[#141414]/10 shadow-sm">
                 <div className="flex items-center gap-1.5">
                   <Zap size={10} className={autoTrade ? 'text-emerald-500 fill-emerald-500' : 'text-gray-400'} />
-                  <span className="text-[9px] font-black uppercase tracking-tighter opacity-60">Autonomous</span>
+                  <span className="text-[11px] font-black uppercase tracking-tighter opacity-60">Autonomous</span>
                 </div>
                 <button 
                   onClick={() => {
@@ -2754,7 +2763,7 @@ export default function App() {
                   </div>
                 </button>
                   {!autoTrade && entryLockActive && (
-                    <span className="text-[8px] font-mono uppercase text-rose-600">
+                    <span className="text-[10px] font-mono uppercase text-rose-600">
                       Disabled by Safety Lock ({entryLockRemainingSec}s)
                     </span>
                   )}
@@ -2763,14 +2772,14 @@ export default function App() {
              <div className="flex items-center bg-white border border-[#141414] rounded-sm overflow-hidden">
                 <button 
                   onClick={() => setActiveTab('LIVE')}
-                  className={`px-3 py-1 text-[9px] font-black uppercase tracking-tighter transition-colors ${activeTab === 'LIVE' ? 'bg-[#141414] text-white' : 'hover:bg-gray-100 flex items-center gap-1'}`}
+                  className={`px-3 py-1 text-[11px] font-black uppercase tracking-tighter transition-colors ${activeTab === 'LIVE' ? 'bg-[#141414] text-white' : 'hover:bg-gray-100 flex items-center gap-1'}`}
                 >
                   <Activity size={10} className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} />
                   Terminal
                 </button>
                 <button 
                   onClick={() => setActiveTab('BACKTEST')}
-                  className={`px-3 py-1 text-[9px] font-black uppercase tracking-tighter transition-colors ${activeTab === 'BACKTEST' ? 'bg-[#141414] text-white' : 'hover:bg-gray-100 flex items-center gap-1'}`}
+                  className={`px-3 py-1 text-[11px] font-black uppercase tracking-tighter transition-colors ${activeTab === 'BACKTEST' ? 'bg-[#141414] text-white' : 'hover:bg-gray-100 flex items-center gap-1'}`}
                 >
                   <History size={10} className="text-blue-500" />
                   Strategy Lab
@@ -2778,7 +2787,7 @@ export default function App() {
              </div>
 
              {isRealMode && !serverConfig?.realTradingEnabled && (
-                <span className="text-[9px] font-black text-rose-600 bg-rose-50 px-2 py-0.5 border border-rose-200">READ-ONLY MODE</span>
+               <span className="text-[11px] font-black text-rose-600 bg-rose-50 px-2 py-0.5 border border-rose-200">READ-ONLY MODE</span>
              )}
           </div>
         </div>
@@ -2830,11 +2839,11 @@ export default function App() {
           <section className="bg-white border-2 border-[#141414] p-6 shadow-[8px_8px_0px_0px_#141414]">
             <div className="flex items-center justify-between mb-6">
               <div className="flex flex-col">
-                <h2 className="font-mono text-[10px] uppercase tracking-[0.3em] flex items-center gap-2">
-                  <Search size={14} className="text-[#F27D26]" />
+                <h2 className="font-mono text-[13px] uppercase tracking-[0.24em] flex items-center gap-2">
+                  <Search size={16} className="text-[#F27D26]" />
                   Market Protocol
                 </h2>
-                <span className="text-[8px] font-mono mt-1 uppercase opacity-40">
+                <span className="text-[11px] font-mono mt-1 uppercase opacity-50">
                   {scanning
                     ? (isScanPreparing
                       ? `Scanner Active: Preparing ${scanDisplayTotal} Assets`
@@ -2843,7 +2852,7 @@ export default function App() {
                 </span>
               </div>
               <div className="flex items-center gap-2">
-                <span className="text-[9px] font-mono opacity-40">{scanning ? 'Scanning now' : 'Auto scan ready'}</span>
+                <span className="text-[11px] font-mono opacity-50">{scanning ? 'Scanning now' : 'Auto scan ready'}</span>
                 <button 
                   onClick={() => performScan(true)} 
                   className="cursor-pointer"
@@ -2855,7 +2864,7 @@ export default function App() {
             </div>
 
             <div className="mt-3 mb-4">
-              <div className="flex justify-between text-[8px] font-mono uppercase opacity-50 mb-1">
+              <div className="flex justify-between text-[11px] font-mono uppercase opacity-60 mb-1">
                 <span>{scanning ? 'Scan Progress' : 'Idle'}</span>
                 <span>{scanning ? (isScanPreparing ? `Preparing scan...` : `${scanProgress.current}/${scanProgress.total} scanned (${Math.round(scanProgressPct)}%)`) : `${availableSymbols.length} assets`}</span>
               </div>
@@ -2867,41 +2876,41 @@ export default function App() {
               </div>
             </div>
 
-            <div className="grid grid-cols-4 gap-2 text-[8px] font-mono uppercase">
+            <div className="grid grid-cols-4 gap-2 text-[10px] font-mono uppercase">
               <div className="border border-gray-200 px-2 py-1">
                 <span className="opacity-50">Attempted</span>
-                <p className="font-black text-[10px]">{scanExecutionStats.attempted}</p>
+                <p className="font-black text-[14px]">{scanExecutionStats.attempted}</p>
               </div>
               <div className="border border-emerald-200 bg-emerald-50/50 px-2 py-1">
                 <span className="opacity-50">Filled</span>
-                <p className="font-black text-[10px] text-emerald-700">{scanExecutionStats.filled}</p>
+                <p className="font-black text-[14px] text-emerald-700">{scanExecutionStats.filled}</p>
               </div>
               <div className="border border-rose-200 bg-rose-50/50 px-2 py-1">
                 <span className="opacity-50">Failed</span>
-                <p className="font-black text-[10px] text-rose-700">{scanExecutionStats.failed}</p>
+                <p className="font-black text-[14px] text-rose-700">{scanExecutionStats.failed}</p>
               </div>
               <div className="border border-amber-200 bg-amber-50/50 px-2 py-1">
                 <span className="opacity-50">Skipped</span>
-                <p className="font-black text-[10px] text-amber-700">{scanExecutionStats.skipped}</p>
+                <p className="font-black text-[14px] text-amber-700">{scanExecutionStats.skipped}</p>
               </div>
             </div>
 
-            <div className="mt-2 grid grid-cols-4 gap-2 text-[8px] font-mono uppercase">
+            <div className="mt-2 grid grid-cols-4 gap-2 text-[10px] font-mono uppercase">
               <div className="border border-sky-200 bg-sky-50/60 px-2 py-1">
                 <span className="opacity-50">Signals Found</span>
-                <p className="font-black text-[10px] text-sky-700">{marketPickLifecycleSummary.signalFound}</p>
+                <p className="font-black text-[14px] text-sky-700">{marketPickLifecycleSummary.signalFound}</p>
               </div>
               <div className="border border-amber-200 bg-amber-50/60 px-2 py-1">
                 <span className="opacity-50">Submitted</span>
-                <p className="font-black text-[10px] text-amber-700">{marketPickLifecycleSummary.orderSubmitted}</p>
+                <p className="font-black text-[14px] text-amber-700">{marketPickLifecycleSummary.orderSubmitted}</p>
               </div>
               <div className="border border-emerald-200 bg-emerald-50/60 px-2 py-1">
                 <span className="opacity-50">Confirmed</span>
-                <p className="font-black text-[10px] text-emerald-700">{marketPickLifecycleSummary.exchangeConfirmed}</p>
+                <p className="font-black text-[14px] text-emerald-700">{marketPickLifecycleSummary.exchangeConfirmed}</p>
               </div>
               <div className="border border-[#F27D26]/30 bg-[#F27D26]/10 px-2 py-1">
                 <span className="opacity-50">Open Positions</span>
-                <p className="font-black text-[10px] text-[#C85E13]">{marketPickLifecycleSummary.openPositions}</p>
+                <p className="font-black text-[14px] text-[#C85E13]">{marketPickLifecycleSummary.openPositions}</p>
               </div>
             </div>
           </section>
@@ -2909,10 +2918,10 @@ export default function App() {
           <section className="bg-white border-2 border-[#141414] p-4 shadow-[8px_8px_0px_0px_#141414]">
             <div className="space-y-4">
               <div className="flex items-center justify-between">
-                <h3 className="font-mono text-[10px] uppercase tracking-[0.24em] opacity-70">Signal Table</h3>
-                <span className="text-[8px] font-mono uppercase opacity-40">{Math.min(150, marketPicks.length)} shown</span>
+                <h3 className="font-mono text-[12px] uppercase tracking-[0.2em] opacity-75">Signal Table</h3>
+                <span className="text-[10px] font-mono uppercase opacity-50">{Math.min(150, marketPicks.length)} shown</span>
               </div>
-              <div className="grid grid-cols-5 items-center border-b pb-2 text-[8px] font-mono opacity-40 uppercase tracking-widest px-2">
+              <div className="grid grid-cols-5 items-center border-b pb-2 text-[10px] font-mono opacity-50 uppercase tracking-wide px-2">
                 <span>Asset</span>
                 <span className="text-center">Trend/RSI</span>
                 <span className="text-center">Score</span>
@@ -2926,25 +2935,25 @@ export default function App() {
                   <div key={pick.symbol} className="grid grid-cols-5 items-center group py-1.5 hover:bg-gray-50/50 px-2 border-b border-gray-50 transition-colors">
                     <button 
                       onClick={() => setSymbol(pick.symbol)}
-                      className="flex flex-col items-start text-left text-[10px] font-black hover:text-[#F27D26] transition-colors"
+                      className="flex flex-col items-start text-left text-[13px] font-black hover:text-[#F27D26] transition-colors"
                     >
                       <span>{pick.symbol.replace('USDT', '')}</span>
-                      <span className={`mt-1 rounded-sm px-1.5 py-0.5 text-[7px] font-black uppercase tracking-wide ${lifecycle.className}`}>
+                      <span className={`mt-1 rounded-sm px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide ${lifecycle.className}`}>
                         {lifecycle.label}
                       </span>
                     </button>
                     
                     <div className="text-center flex flex-col">
                       <div className="flex items-center justify-center gap-1">
-                         <span className={`text-[9px] font-mono font-bold ${pick.trend === 'UP' ? 'text-emerald-600' : 'text-rose-600'}`}>
+                         <span className={`text-[11px] font-mono font-bold ${pick.trend === 'UP' ? 'text-emerald-600' : 'text-rose-600'}`}>
                            {pick.trend}
                          </span>
-                         <span className="text-[7px] font-mono opacity-30">@{pick.rsi?.toFixed(0)}</span>
+                         <span className="text-[9px] font-mono opacity-40">@{pick.rsi?.toFixed(0)}</span>
                       </div>
                     </div>
 
                     <div className="text-center">
-                      <span className={`text-[9px] font-mono font-bold ${
+                      <span className={`text-[11px] font-mono font-bold ${
                         pick.signal.score >= 8 ? 'text-emerald-500' :
                         pick.signal.score >= 5 ? 'text-[#F27D26]' :
                         'opacity-30'
@@ -2954,7 +2963,7 @@ export default function App() {
                     </div>
 
                     <div className="flex justify-center">
-                      <div className={`text-[8px] font-black px-1 rounded-sm ${
+                      <div className={`text-[10px] font-black px-1 rounded-sm ${
                         pick.signal.overall === 'BUY' ? 'bg-emerald-100 text-emerald-800' : 
                         pick.signal.overall === 'SELL' ? 'bg-rose-100 text-rose-800' : 'bg-gray-100 text-gray-400'
                       }`}>
@@ -2966,7 +2975,7 @@ export default function App() {
                       <button 
                         onClick={() => executeTrade(pick.signal.overall === 'SELL' ? 'SELL' : 'BUY', pick.symbol, pick.lastPrice, `AI_${pick.signal.overall}_DISCOVERY_${pick.signal.score}`)}
                         disabled={pick.signal.overall === 'HOLD' || entryLockActive || holdings.length >= maxConcurrentTrades || holdings.some(h => h.symbol === pick.symbol)}
-                        className="text-[#141414] hover:bg-[#F27D26] hover:text-white border border-[#141414]/10 text-[7px] px-2 py-0.5 font-bold uppercase transition-all disabled:opacity-0"
+                        className="text-[#141414] hover:bg-[#F27D26] hover:text-white border border-[#141414]/10 text-[10px] px-2 py-0.5 font-bold uppercase transition-all disabled:opacity-0"
                       >
                         {pick.signal.overall === 'SELL' ? 'Short' : pick.signal.overall === 'BUY' ? 'Long' : 'Hold'}
                       </button>

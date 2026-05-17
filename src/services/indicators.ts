@@ -153,7 +153,8 @@ export function evaluateStrategy(
   if (lastMACD && prevMACD) {
     if (prevMACD.MACD <= prevMACD.signal && lastMACD.MACD > lastMACD.signal) {
       macdCrossover = 'BULLISH';
-    } else if (prevMACD.MACD >= prevMACD.signal && lastMACD.MACD < lastMACD.signal) {
+    }
+    if (prevMACD.MACD >= prevMACD.signal && lastMACD.MACD < lastMACD.signal) {
       macdCrossover = 'BEARISH';
     }
   }
