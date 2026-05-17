@@ -936,6 +936,8 @@ export default function App() {
     if (loading || !price) return;
     const time = new Date().toISOString();
     const eventCycleId = typeof cycleId === 'number' ? cycleId : undefined;
+    const normalizedTradeSymbol = String(tradeSymbol || '').toUpperCase();
+    const hasAllowedLiveQuote = liveQuoteAllowlist.some((quote: string) => normalizedTradeSymbol.endsWith(quote));
     
     if (tradeSymbol.includes('undefined') || price <= 0) {
        addLog(`TRADE ABORTED: Invalid symbol or price [${tradeSymbol} @ ${price}]`, 'warning');
@@ -959,6 +961,13 @@ export default function App() {
       addLog(`TRADE ABORTED: ${tradeSymbol} is not a tradable futures position. USDT remains cash available for trading.`, 'warning');
       setExecutionFeedback({ type: 'warning', message: `${type} blocked: invalid symbol "${tradeSymbol}".` });
       pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: Malformed symbol', status: 'SKIPPED', cycleId: eventCycleId });
+      return;
+    }
+
+    if (isRealMode && !hasAllowedLiveQuote) {
+      addLog(`TRADE SKIPPED: ${tradeSymbol} does not match allowed live quotes [${liveQuoteAllowlist.join(', ')}].`, 'warning');
+      setExecutionFeedback({ type: 'warning', message: `${type} blocked: ${tradeSymbol} is outside allowed live quotes.` });
+      pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: 'SKIP: Outside allowed live quotes', status: 'SKIPPED', cycleId: eventCycleId });
       return;
     }
 
@@ -2084,7 +2093,7 @@ export default function App() {
       const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
       const isLiveTradableFuturesSymbol = (value: string) => liveTradableSymbols.size === 0 || liveTradableSymbols.has(value.toUpperCase());
       let symbolsToScan = isLiveBinance
-        ? Array.from(new Set(candidateValues)).filter(value => isLikelyBinanceSymbol(value) && hasTradableBase(value))
+        ? Array.from(new Set(candidateValues)).filter(value => isLikelyBinanceSymbol(value) && hasAllowedQuote(value) && hasTradableBase(value))
         : Array.from(new Set([baseSymbol, ...candidateValues]));
 
       if (symbolsToScan.length === 0) {
