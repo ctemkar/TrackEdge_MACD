@@ -20,7 +20,7 @@ const CRITERIA_HELP: Record<string, string> = {
   rsiOversold: 'RSI threshold considered oversold. Raising it flags potential bounce setups sooner; lowering it requires deeper pullbacks.',
   scanIntervalSec: 'Seconds between automated market scan cycles. Lower values react faster but increase API load and rate-limit risk.',
   holdingPollIntervalSec: 'Seconds between live holding price refreshes. Lower values improve responsiveness but add frequent API calls.',
-  maxSymbolsPerScan: 'Maximum number of symbols evaluated in one scan cycle. Lowering this reduces API pressure and keeps scans focused.',
+  maxSymbolsPerScan: 'Maximum number of symbols evaluated in one scan cycle while focused mode is active. Full Universe Mode ignores this cap and scans the full fetched list.',
   softCooldownMinutes: 'Cooldown after a skipped/rejected entry. Prevents immediate re-entry attempts on unstable symbols.',
   successCooldownMinutes: 'Cooldown after a successful close. Helps avoid overtrading the same symbol immediately after profit-taking.',
   paperLossCooldownMinutes: 'Cooldown after a paper-trading loss. Reduces repeated losses from rapid re-entry in bad conditions.',
@@ -48,6 +48,30 @@ const CRITERIA_HELP: Record<string, string> = {
   maxScore: 'Maximum theoretical score used for normalization/thresholding. Keep aligned with total weight design of your strategy.',
   liveQuoteAllowlistInput: 'Comma-separated quote assets allowed for live trading (for example USDT, USDC). Restricts tradable universe for safety.',
 };
+
+const PARAMETER_DEFAULTS = {
+  maxConcurrentTrades: 15,
+  takeProfitPercent: 15,
+  stopLossPercent: 5,
+  maxDrawdownPercent: 10,
+  isDefensiveMode: false,
+  autoEntryMinScore: 4,
+  liveMinOrderNotional: 10,
+  liveQuoteAllowlistInput: 'USDT,USDC',
+  scanIntervalSec: 40,
+  holdingPollIntervalSec: 5,
+  maxSymbolsPerScan: 1500,
+  duplicateOrderLockoutSec: 45,
+  liveEntryDelayMs: 900,
+  minPaperAllocation: 25,
+  softCooldownMinutes: 30,
+  successCooldownMinutes: 45,
+  paperLossCooldownMinutes: 60,
+  lowMarginLockMinutes: 15,
+  closeFailureLockMinutes: 30,
+  hardFailureLockMinutes: 120,
+  fullUniverseMode: false,
+} as const;
 
 const CriteriaInfoLabel = ({ text, detail }: { text: string; detail: string }) => {
   const [isOpen, setIsOpen] = useState(false);
@@ -1545,6 +1569,40 @@ export default function App() {
     setAiCriteriaFeedback('Restored previous behavior settings.');
   }, [aiCriteriaSnapshot]);
 
+  const resetParametersToDefaults = React.useCallback(() => {
+    const confirmed = window.confirm(
+      'Reset all trading parameters to default values? This will keep balances, positions, and history intact.'
+    );
+
+    if (!confirmed) return;
+
+    setMaxConcurrentTrades(PARAMETER_DEFAULTS.maxConcurrentTrades);
+    setTakeProfitPercent(PARAMETER_DEFAULTS.takeProfitPercent);
+    setStopLossPercent(PARAMETER_DEFAULTS.stopLossPercent);
+    setMaxDrawdownPercent(PARAMETER_DEFAULTS.maxDrawdownPercent);
+    setIsDefensiveMode(PARAMETER_DEFAULTS.isDefensiveMode);
+    setAutoEntryMinScore(PARAMETER_DEFAULTS.autoEntryMinScore);
+    setLiveMinOrderNotional(PARAMETER_DEFAULTS.liveMinOrderNotional);
+    setLiveQuoteAllowlistInput(PARAMETER_DEFAULTS.liveQuoteAllowlistInput);
+    setScanIntervalSec(PARAMETER_DEFAULTS.scanIntervalSec);
+    setHoldingPollIntervalSec(PARAMETER_DEFAULTS.holdingPollIntervalSec);
+    setMaxSymbolsPerScan(PARAMETER_DEFAULTS.maxSymbolsPerScan);
+    setDuplicateOrderLockoutSec(PARAMETER_DEFAULTS.duplicateOrderLockoutSec);
+    setLiveEntryDelayMs(PARAMETER_DEFAULTS.liveEntryDelayMs);
+    setMinPaperAllocation(PARAMETER_DEFAULTS.minPaperAllocation);
+    setSoftCooldownMinutes(PARAMETER_DEFAULTS.softCooldownMinutes);
+    setSuccessCooldownMinutes(PARAMETER_DEFAULTS.successCooldownMinutes);
+    setPaperLossCooldownMinutes(PARAMETER_DEFAULTS.paperLossCooldownMinutes);
+    setLowMarginLockMinutes(PARAMETER_DEFAULTS.lowMarginLockMinutes);
+    setCloseFailureLockMinutes(PARAMETER_DEFAULTS.closeFailureLockMinutes);
+    setHardFailureLockMinutes(PARAMETER_DEFAULTS.hardFailureLockMinutes);
+    setFullUniverseMode(PARAMETER_DEFAULTS.fullUniverseMode);
+    setStrategyConfig({ ...DEFAULT_STRATEGY_CONFIG });
+    setAiCriteriaPrompt('');
+    setAiCriteriaSnapshot(null);
+    setAiCriteriaFeedback('Reset all parameters to defaults.');
+  }, []);
+
   useEffect(() => {
     if (aiCriteriaSnapshot) {
       localStorage.setItem('te_ai_criteria_snapshot', JSON.stringify(aiCriteriaSnapshot));
@@ -1860,7 +1918,7 @@ export default function App() {
         symbolsToScan = symbolsToScan.filter(isLikelyBinanceSymbol);
       }
 
-      if (isLiveBinance) {
+      if (isLiveBinance && !fullUniverseMode) {
         const cap = Math.max(20, Math.min(2000, maxSymbolsPerScan));
         const reduced = symbolsToScan.slice(0, Math.min(cap, symbolsToScan.length));
         if (baseSymbol && !reduced.includes(baseSymbol) && reduced.length > 0) {
@@ -2897,7 +2955,16 @@ export default function App() {
                 </div>
 
                 <div className="p-3 bg-white/5 border border-white/10 rounded-sm space-y-3">
-                  <p className="text-[10px] uppercase font-bold opacity-70">Strategy Criteria</p>
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-[10px] uppercase font-bold opacity-70">Strategy Criteria</p>
+                    <button
+                      type="button"
+                      onClick={resetParametersToDefaults}
+                      className="rounded-sm border border-rose-300/40 bg-rose-500/10 px-3 py-1.5 text-[11px] font-black uppercase tracking-wide text-rose-200 hover:bg-rose-500/20"
+                    >
+                      Reset to Defaults
+                    </button>
+                  </div>
                   <div className="flex items-center justify-between rounded-sm border border-white/10 bg-black/25 px-3 py-2">
                     <span className="text-[12px] uppercase tracking-wide text-white/70">Important Items</span>
                     <button
@@ -2911,7 +2978,7 @@ export default function App() {
                   <div className="flex items-center justify-between rounded-sm border border-amber-300/40 bg-amber-500/10 px-3 py-2">
                     <div className="flex flex-col">
                       <span className="text-[12px] uppercase tracking-wide text-amber-200">Full Universe Mode</span>
-                      <span className="text-[10px] text-amber-100/70">Scans spot + futures and all quote assets. Slower, higher rate-limit risk.</span>
+                      <span className="text-[10px] text-amber-100/70">Scans spot + futures across all quote assets and ignores Max Symbols / Scan. Slower, much higher rate-limit risk.</span>
                     </div>
                     <button
                       type="button"
