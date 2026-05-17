@@ -273,7 +273,12 @@ export default function App() {
     hasKeys: boolean, 
     outboundIp?: string,
     exchange?: string,
-    type?: string
+    type?: string,
+    binanceRouteHealth?: {
+      positions?: string,
+      orders?: string,
+      updatedAt?: number,
+    }
   } | null>(null);
   const [isBotActive, setIsBotActive] = useState(false);
   const [scanExecutionStats, setScanExecutionStats] = useState({ cycleId: 0, attempted: 0, filled: 0, failed: 0, skipped: 0 });
@@ -534,6 +539,10 @@ export default function App() {
         setBalance(syncedBalance);
         setAvailableFunds(syncedAvailable);
         setLiveUnrealizedPnl(Number.isFinite(syncedUnrealized) ? syncedUnrealized : 0);
+        setServerConfig(prev => prev ? {
+          ...prev,
+          binanceRouteHealth: data?.binanceRouteHealth || prev.binanceRouteHealth,
+        } : prev);
         setAuthDegradedMessage(isAuthDegraded
           ? (degradedMsg || 'Binance futures auth is degraded (-2015): API key, IP whitelist, or permissions are incomplete.')
           : null);
@@ -682,7 +691,8 @@ export default function App() {
           ...data.config,
           outboundIp: data.outboundIp,
           exchange: data.exchange,
-          type: data.type
+          type: data.type,
+          binanceRouteHealth: data.binanceRouteHealth,
         });
       }
       else setServerStatus('ERROR');
@@ -2639,6 +2649,11 @@ export default function App() {
                       <span className="text-[7px] font-mono opacity-30 uppercase">
                         {isRealMode ? `${(serverConfig?.exchange || 'EXCHANGE').toUpperCase()} ${serverConfig?.type || ''} LINKED` : 'SIMULATION MODE'}
                       </span>
+                      {isRealMode && serverConfig?.exchange === 'binance' && serverConfig?.binanceRouteHealth && (
+                        <span className="mt-1 text-[7px] font-mono uppercase text-cyan-300/80">
+                          Route Health: positions {serverConfig.binanceRouteHealth.positions || 'UNKNOWN'} / orders {serverConfig.binanceRouteHealth.orders || 'UNKNOWN'}
+                        </span>
+                      )}
                     </div>
                     <button 
                       onClick={async () => {

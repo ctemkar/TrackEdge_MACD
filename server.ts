@@ -22,6 +22,11 @@ async function startServer() {
     .filter(Boolean);
   const unsupportedSymbolSkips = new Map<string, { until: number; count: number; reason: string }>();
   let cachedBinancePositionMode: { dualSidePosition: boolean; fetchedAt: number } | null = null;
+  const binanceRouteHealth = {
+    positions: 'UNKNOWN',
+    orders: 'UNKNOWN',
+    updatedAt: 0,
+  };
 
   // Rate-limit state: tracks when Binance bans expire + consecutive failure count for backoff
   const rateLimitState = {
@@ -129,6 +134,8 @@ async function startServer() {
 
         const data = await response.json();
         if (Array.isArray(data)) {
+          binanceRouteHealth.positions = endpoint.label === 'papi-um-position-risk' ? 'PAPI UM' : 'FAPI';
+          binanceRouteHealth.updatedAt = Date.now();
           console.log(`[TradeEdge] Direct Binance HTTP: Got ${data.length} positions from ${endpoint.label}`);
           return { positions: data, authError: false };
         }
@@ -452,6 +459,7 @@ async function startServer() {
       exchange: currentExchange,
       type: currentExchange === 'binance' ? 'FUTURES' : 'SPOT',
       outboundIp,
+      binanceRouteHealth,
       blockedUntil: blockedUntil > now ? blockedUntil : 0,
       config: {
         realTradingEnabled: process.env.ENABLE_REAL_TRADING === 'true',
@@ -1088,6 +1096,7 @@ async function startServer() {
         availableBalance: uiAvailableBalance,
         authDegraded,
         authDegradedMessage,
+        binanceRouteHealth,
         unrealizedPnl: Number.isFinite(totalUnrealizedPnl) ? totalUnrealizedPnl : 0,
         positions: allPositions,
         raw: { info: balanceData.info },
@@ -1441,6 +1450,9 @@ async function startServer() {
               } catch {
                 json = {};
               }
+
+              binanceRouteHealth.orders = endpoint.includes('/papi/') ? 'PAPI UM' : 'FAPI';
+              binanceRouteHealth.updatedAt = Date.now();
 
               return {
                 id: json?.orderId,
