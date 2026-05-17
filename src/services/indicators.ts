@@ -177,30 +177,23 @@ export function evaluateStrategy(
   const nearResistance = lastCandle.close >= resistanceLevel * (1 - (config.nearResistancePercent / 100));
 
   let overall: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
-  const bullishMacdRegime = macdMode === 'BULLISH' && emaCrossover === 'BULLISH' && trend !== 'DOWN';
-  const bearishMacdRegime = macdMode === 'BEARISH' && emaCrossover === 'BEARISH' && trend !== 'UP';
-  const buySignal = macdCrossover === 'BULLISH' || bullishMacdRegime;
-  const sellSignal = macdCrossover === 'BEARISH' || bearishMacdRegime;
+  // Strict entry rule: only buy when MACD crosses above signal on the daily candle.
+  const buySignal = macdCrossover === 'BULLISH';
+  // Mirrored short rule: only sell/short when MACD crosses below signal on the daily candle.
+  const sellSignal = macdCrossover === 'BEARISH';
 
   let score = 0;
   if (buySignal) {
     overall = 'BUY';
-    score = config.crossoverScore;
-    if (bullishMacdRegime) score += config.contextMacdScore + config.contextEmaScore;
-    if (trend === 'UP') score += config.contextTrendScore;
-    if (volumeConfirmed) score += config.contextVolumeScore;
+    // No extra criteria: a valid bullish crossover is a full-strength entry.
+    score = config.maxScore;
   } else if (sellSignal) {
     overall = 'SELL';
-    score = config.crossoverScore;
-    if (bearishMacdRegime) score += config.contextMacdScore + config.contextEmaScore;
-    if (trend === 'DOWN') score += config.contextTrendScore;
+    // No extra criteria: a valid bearish crossover is a full-strength short entry.
+    score = config.maxScore;
   } else {
-    // No crossover: stay flat and only compute context confidence.
-    if (trend !== 'NEUTRAL') score += config.contextTrendScore;
-    if (volumeConfirmed) score += config.contextVolumeScore;
-    if (macdMode === 'BULLISH') score += config.contextMacdScore;
-    if (emaCrossover === 'BULLISH') score += config.contextEmaScore;
-    if (rsiMode === 'OVERSOLD') score += config.contextRsiScore;
+    // No bullish crossover: stay flat.
+    score = 0;
   }
 
   return {
