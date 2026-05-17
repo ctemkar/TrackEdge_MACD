@@ -32,6 +32,35 @@ async function startServer() {
   };
   const MAX_BACKOFF_MS = 5 * 60 * 1000; // cap backoff at 5 minutes
   const MAX_AUTH_BLOCK_MS = 10 * 60 * 1000; // cap auth block at 10 minutes
+  const throttledLogState = new Map<string, number>();
+  const logOnceState = new Set<string>();
+
+  const logWithThrottle = (
+    level: 'log' | 'warn' | 'error',
+    key: string,
+    message: string,
+    intervalMs: number,
+  ) => {
+    const now = Date.now();
+    const last = throttledLogState.get(key) || 0;
+    if (now - last < intervalMs) return;
+    throttledLogState.set(key, now);
+    if (level === 'warn') console.warn(message);
+    else if (level === 'error') console.error(message);
+    else console.log(message);
+  };
+
+  const logOnce = (
+    level: 'log' | 'warn' | 'error',
+    key: string,
+    message: string,
+  ) => {
+    if (logOnceState.has(key)) return;
+    logOnceState.add(key);
+    if (level === 'warn') console.warn(message);
+    else if (level === 'error') console.error(message);
+    else console.log(message);
+  };
 
   const isBinanceAuthErrorMessage = (message: string) => {
     const normalized = String(message || '').toLowerCase();
@@ -82,7 +111,11 @@ async function startServer() {
       
       if (!response.ok) {
         const text = await response.text();
-        console.warn(`[TradeEdge] Binance /fapi/v2/positionRisk returned ${response.status}: ${text.substring(0, 100)}`);
+        logOnce(
+          'warn',
+          `binance-position-risk-${response.status}`,
+          `[TradeEdge] Binance /fapi/v2/positionRisk returned ${response.status}: ${text.substring(0, 100)}`,
+        );
         return {
           positions: [],
           authError: response.status === 401 || isBinanceAuthErrorMessage(text),
@@ -570,12 +603,20 @@ async function startServer() {
         if (binanceKey && binanceSecret) {
           const httpPositionResult = await fetchBinancePositionsViaHttp(binanceKey, binanceSecret);
           const httpPositions = httpPositionResult.positions;
+          console.log(`[TradeEdge Sync DEBUG] Direct HTTP attempt: got ${httpPositions.length} positions, result status: ${httpPositionResult.status}`);
           if (httpPositions.length > 0) {
             console.log(`[TradeEdge Sync] Successfully fetched ${httpPositions.length} positions via direct HTTP API`);
-            httpPositions.forEach(upsertPosition);
+            httpPositions.forEach(pos => {
+              console.log(`[TradeEdge Sync DEBUG] Processing position: ${JSON.stringify(pos).substring(0, 100)}`);
+              upsertPosition(pos);
+            });
             positionsFetched = true;
           } else {
-            console.warn(`[TradeEdge Sync] Direct HTTP API returned 0 positions (may lack permissions)`);
+            logOnce(
+              'warn',
+              'sync-direct-http-zero-positions',
+              `[TradeEdge Sync] Direct HTTP API returned 0 positions (may lack permissions)`,
+            );
           }
         }
         
@@ -588,14 +629,22 @@ async function startServer() {
           });
           
           if (umAssets.length > 0) {
-            console.log(`[TradeEdge Sync] Found ${umAssets.length} assets with UM positions in fetchBalance info`);
+            logOnce(
+              'log',
+              `sync-um-assets-${umAssets.length}`,
+              `[TradeEdge Sync] Found ${umAssets.length} assets with UM positions in fetchBalance info`,
+            );
             umAssets.forEach((asset: any) => {
               const symbol = String(asset.asset || '').toUpperCase();
               
               // SKIP quote assets (USDT, USDC, BUSD, etc.) - they're not tradable base assets
               const QUOTE_ASSETS = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'USDN', 'EUR', 'GBP', 'JPY']);
               if (QUOTE_ASSETS.has(symbol)) {
-                console.log(`[TradeEdge Sync] Skipping quote asset: ${symbol} (not a tradable base asset)`);
+                logOnce(
+                  'log',
+                  `sync-skip-quote-${symbol}`,
+                  `[TradeEdge Sync] Skipping quote asset: ${symbol} (not a tradable base asset)`,
+                );
                 return;
               }
               
@@ -694,7 +743,15 @@ async function startServer() {
             console.warn(`[TradeEdge Sync] Fallback fetchAccount failed: ${fallbackErr?.message}`);
           }
         } else if (positionsFetched || Object.keys(allPositions).length > 0) {
-          console.log(`[TradeEdge Sync] Total positions loaded: ${Object.keys(allPositions).length}`);
+          const loadedCount = Object.keys(allPositions).length;
+          if (loadedCount > 0) {
+            logWithThrottle(
+              'log',
+              `sync-total-positions-${loadedCount}`,
+              `[TradeEdge Sync] Total positions loaded: ${loadedCount}`,
+              2 * 60 * 1000,
+            );
+          }
         }
 
         totalUnrealizedPnl = Object.values(allPositions).reduce((sum, p) => {
@@ -709,7 +766,6 @@ async function startServer() {
             return sum + (Number.isFinite(umPnl) ? umPnl : 0);
           }, 0);
           if (umPnlSum !== 0) {
-            console.log(`[TradeEdge Sync] UM Account unrealized PnL: ${umPnlSum}`);
             totalUnrealizedPnl = umPnlSum;
           }
         }
@@ -778,7 +834,15 @@ async function startServer() {
       }
       
       const positionKeys = Object.keys(allPositions);
-      console.log(`[TradeEdge Sync] ${client.id.toUpperCase()} Summary: Cash=$${cashTotal.toFixed(2)}, Positions=${positionKeys.length}, Valid=${positionKeys.join(',')}`);
+      const shouldLogSummary = process.env.TRADEEDGE_VERBOSE_SYNC === 'true' || positionKeys.length > 0;
+      if (shouldLogSummary) {
+        logWithThrottle(
+          'log',
+          `sync-summary-${client.id}-${positionKeys.length}`,
+          `[TradeEdge Sync] ${client.id.toUpperCase()} Summary: Cash=$${cashTotal.toFixed(2)}, Positions=${positionKeys.length}, Valid=${positionKeys.join(',')}`,
+          2 * 60 * 1000,
+        );
+      }
       
       res.json({ 
         status: 'success', 

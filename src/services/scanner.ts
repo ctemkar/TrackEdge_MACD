@@ -16,7 +16,7 @@ export async function scanMarket(
   shouldContinue?: () => boolean
 ): Promise<MarketScanResult[]> {
   const results: MarketScanResult[] = [];
-  const batchSize = 10; // Increased batch size for faster scanning
+  const batchSize = 5; // Reduced batch size to stay under rate limit (was 10)
   
   for (let i = 0; i < symbols.length; i += batchSize) {
     if (shouldContinue && !shouldContinue()) break;
@@ -52,8 +52,10 @@ export async function scanMarket(
     results.push(...batchResults.filter((r): r is MarketScanResult => r !== null));
     if (shouldContinue && !shouldContinue()) break;
     
-    // Tiny delay to avoid aggressive burst rate limits
-    await new Promise(resolve => setTimeout(resolve, 50));
+    // Adaptive delay: increase inter-batch spacing to reduce API request burst
+    // Binance limit: 2400 req/min = 40 req/sec. With 5 symbols per batch at ~3 req/symbol,
+    // 200ms per batch gives ~25 reqs/sec target
+    await new Promise(resolve => setTimeout(resolve, 200));
   }
   
   return results.sort((a, b) => b.signal.score - a.signal.score);

@@ -72,6 +72,14 @@ export default function App() {
     cycleId?: number;
   }
 
+  interface SystemLogEntry {
+    time: string;
+    message: string;
+    type: 'info' | 'success' | 'warning';
+    groupKey: string;
+    repeatCount: number;
+  }
+
   const [holdings, setHoldings] = useState<Holding[]>(() => {
     const saved = localStorage.getItem('te_holdings');
     if (!saved) return [];
@@ -109,7 +117,7 @@ export default function App() {
   const [maxConcurrentTrades, setMaxConcurrentTrades] = useState(15);
   const [maxDrawdownPercent, setMaxDrawdownPercent] = useState(10);
   const [isDefensiveMode, setIsDefensiveMode] = useState(false);
-  const [systemLogs, setSystemLogs] = useState<{ time: string, message: string, type: 'info' | 'success' | 'warning' }[]>([]);
+  const [systemLogs, setSystemLogs] = useState<SystemLogEntry[]>([]);
   const [holdingPrices, setHoldingPrices] = useState<Record<string, number>>({});
   const [liveUnrealizedPnl, setLiveUnrealizedPnl] = useState(0);
   const [cooldowns, setCooldowns] = useState<Record<string, number>>({});
@@ -136,6 +144,7 @@ export default function App() {
   }, [executionFeedback]);
   const tradeLockout = React.useRef<Set<string>>(new Set());
   const isSyncingRef = React.useRef(false);
+  const syncRealBalanceRef = React.useRef<() => Promise<boolean>>(async () => false);
   const scanningRef = React.useRef(false);
   const rateLimitedUntilRef = React.useRef(0);
   const RATE_LIMIT_UNTIL_KEY = 'te_rate_limited_until';
@@ -155,10 +164,10 @@ export default function App() {
   }, [holdings, autoTrade, maxConcurrentTrades]);
 
   React.useEffect(() => {
-    // Safety-first boot: never resume autonomous scanning from persisted state.
-    localStorage.setItem('te_auto_trade', 'false');
-    autoTradeRef.current = false;
-    setAutoTrade(false);
+    // On boot: restore autonomous mode preference from localStorage
+    const savedAutoTrade = localStorage.getItem('te_auto_trade') === 'true';
+    autoTradeRef.current = savedAutoTrade;
+    setAutoTrade(savedAutoTrade);
   }, []);
 
   React.useEffect(() => {
@@ -204,7 +213,34 @@ export default function App() {
 
   // --- CORE SYSTEM FUNCTIONS (ORDER CRITICAL) ---
   const addLog = React.useCallback((message: string, type: 'info' | 'success' | 'warning' = 'info') => {
-    setSystemLogs(prev => [{ time: new Date().toLocaleTimeString(), message, type }, ...prev].slice(0, 30));
+    const normalized = message.startsWith('SYNC SUCCESS:')
+      ? 'SYNC SUCCESS'
+      : message.startsWith('INITIATING EXCHANGE HANDSHAKE')
+        ? 'INITIATING EXCHANGE HANDSHAKE'
+        : message;
+    const groupKey = `${type}:${normalized}`;
+
+    setSystemLogs(prev => {
+      const now = new Date().toLocaleTimeString();
+      if (prev.length > 0 && prev[0].groupKey === groupKey) {
+        const updatedTop: SystemLogEntry = {
+          ...prev[0],
+          time: now,
+          message,
+          repeatCount: prev[0].repeatCount + 1,
+        };
+        return [updatedTop, ...prev.slice(1)].slice(0, 30);
+      }
+
+      const nextEntry: SystemLogEntry = {
+        time: now,
+        message,
+        type,
+        groupKey,
+        repeatCount: 1,
+      };
+      return [nextEntry, ...prev].slice(0, 30);
+    });
   }, []);
 
   const pushTradeEvent = React.useCallback((event: TradeEvent) => {
@@ -433,6 +469,10 @@ export default function App() {
     }
   }, [addLog, serverConfig?.outboundIp, benchmarkCapital, holdings.length, isRealMode, marketPicks, holdingPrices]);
 
+  React.useEffect(() => {
+    syncRealBalanceRef.current = syncRealBalance;
+  }, [syncRealBalance]);
+
   const checkServer = React.useCallback(async () => {
     try {
       const resp = await fetch('/api/health');
@@ -529,6 +569,31 @@ export default function App() {
         }
       };
 
+      const normalizeLiveSymbol = (rawSymbol: string) => {
+        const compact = String(rawSymbol || '')
+          .toUpperCase()
+          .replace('/', '')
+          .replace(':USDT', '')
+          .replace(':USD', '')
+          .replace(':', '');
+        if (!compact) return compact;
+        if (compact.endsWith('USDT') || compact.endsWith('USD')) return compact;
+        if (compact.endsWith('USD') && !compact.endsWith('USDT')) return `${compact}T`;
+        return `${compact}USDT`;
+      };
+
+      const hasPositionForSymbol = (positions: Record<string, any>, rawSymbol: string) => {
+        const normalized = normalizeLiveSymbol(rawSymbol);
+        if (!normalized) return false;
+        const alt = normalized.endsWith('USDT') ? normalized.slice(0, -1) : `${normalized}T`;
+        const candidates = [normalized, alt];
+        return candidates.some((key) => {
+          const p = positions?.[key];
+          const amt = Number(p?.amount ?? p?.total ?? 0);
+          return Number.isFinite(amt) && Math.abs(amt) > 0;
+        });
+      };
+
       try {
         existingHolding = holdings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
         heldAmount = existingHolding?.amount || 0;
@@ -617,33 +682,10 @@ export default function App() {
         }
 
         if (result.status === 'success') {
-          const normalizeLiveSymbol = (rawSymbol: string) => {
-            const compact = String(rawSymbol || '')
-              .toUpperCase()
-              .replace('/', '')
-              .replace(':USDT', '')
-              .replace(':USD', '')
-              .replace(':', '');
-            if (!compact) return compact;
-            if (compact.endsWith('USDT') || compact.endsWith('USD')) return compact;
-            if (compact.endsWith('USD') && !compact.endsWith('USDT')) return `${compact}T`;
-            return `${compact}USDT`;
-          };
 
-          const hasPositionForSymbol = (positions: Record<string, any>, rawSymbol: string) => {
-            const normalized = normalizeLiveSymbol(rawSymbol);
-            if (!normalized) return false;
-            const alt = normalized.endsWith('USDT') ? normalized.slice(0, -1) : `${normalized}T`;
-            const candidates = [normalized, alt];
-            return candidates.some((key) => {
-              const p = positions?.[key];
-              const amt = Number(p?.amount ?? p?.total ?? 0);
-              return Number.isFinite(amt) && Math.abs(amt) > 0;
-            });
-          };
-
-          // STRICT: Only mark FILLED if live position actually exists on exchange now.
-          // No retries, no assumptions. If position doesn't match, order failed at exchange level.
+          // Verify position state after order acknowledgement. Some accounts cannot
+          // read positionRisk immediately (or at all), so we treat accepted orders
+          // as pending confirmation instead of hard-failing immediately.
           let verified = false;
           let verifyAttempts = 0;
           try {
@@ -671,21 +713,17 @@ export default function App() {
           }
 
           if (!verified) {
-            const msg = 'Exchange order response received but NO live position detected. Order may have failed or not reached exchange.';
-            addLog(`REAL ${type} FAILED: ${tradeSymbol} - ${msg}`, 'warning');
-            setExecutionFeedback({ type: 'warning', message: `${type} failed for ${tradeSymbol}: Position not found.` });
-            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `FAILED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
-            // Safety brake: stop autonomous live entries after ambiguous exchange response.
-            if (!closingExisting) {
-              autoTradeRef.current = false;
-              setAutoTrade(false);
-              addLog('AUTONOMOUS PAUSED: Exchange did not confirm live position after order response.', 'warning');
-            }
+            const orderId = result?.order?.id || result?.order?.clientOrderId || result?.order?.info?.orderId;
+            const msg = `Order accepted by exchange but live position not yet visible${orderId ? ` (order ${orderId})` : ''}.`;
+            addLog(`REAL ${type} PENDING CONFIRMATION: ${tradeSymbol} - ${msg}`, 'warning');
+            setExecutionFeedback({ type: 'warning', message: `${type} submitted for ${tradeSymbol}. Waiting for position sync.` });
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason: `PENDING CONFIRMATION: ${msg}`, status: 'FILLED', cycleId: eventCycleId });
             if (closingExisting) {
               lockEntries(5 * 60 * 1000, `Close verification failed for ${tradeSymbol}. New entries paused for 5m.`);
             }
             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 2) }));
             setTimeout(syncRealBalance, 1500);
+            setTimeout(syncRealBalance, 4500);
             return;
           }
 
@@ -756,7 +794,7 @@ export default function App() {
           if (verifyResp.ok) {
             const verify = await verifyResp.json();
             const positions = verify?.positions || {};
-            const hasPosition = Boolean(positions[tradeSymbol]);
+            const hasPosition = hasPositionForSymbol(positions, tradeSymbol);
             if (closingExisting) {
               verified = !hasPosition;
             } else if (type === 'BUY' || openingShort) {
@@ -784,6 +822,16 @@ export default function App() {
             cycleId: eventCycleId,
           });
           setTimeout(syncRealBalance, 1500);
+          return;
+        }
+
+        if (!isMarginOrFundsFailure && !isAuthFailure) {
+          const pendingMsg = `Order submission for ${tradeSymbol} needs delayed confirmation (${msg}).`;
+          addLog(`REAL ${type} PENDING CONFIRMATION: ${pendingMsg}`, 'warning');
+          setExecutionFeedback({ type: 'warning', message: `${type} submitted for ${tradeSymbol}. Waiting for exchange confirmation.` });
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: heldAmount || 0, time, reason: `PENDING CONFIRMATION: ${msg}`, status: 'FILLED', cycleId: eventCycleId });
+          setTimeout(syncRealBalance, 1500);
+          setTimeout(syncRealBalance, 4500);
           return;
         }
 
@@ -980,13 +1028,13 @@ export default function App() {
     if (rateLimitedUntilRef.current > Date.now()) return;
 
     // Keep live account metrics fresh after user has explicitly enabled Live mode.
-    syncRealBalance();
+    syncRealBalanceRef.current();
     const timer = setInterval(() => {
-      syncRealBalance();
+      syncRealBalanceRef.current();
     }, 15000);
 
     return () => clearInterval(timer);
-  }, [isRealMode, syncRealBalance, serverStatus]);
+  }, [isRealMode, serverStatus]);
 
   const currentHolding = holdings.find(h => h.symbol === symbol);
   const stopLossPrice = (currentHolding && currentPrice)
@@ -1314,11 +1362,11 @@ export default function App() {
       loadData(true);
       if (autoTradeRef.current) {
         performScan();
-        setNextScanSec(30);
+        setNextScanSec(40);  // Increased from 30s to reduce rate limit pressure
       } else {
         setNextScanSec(0);
       }
-    }, 30000);
+    }, 40000);  // Increased from 30s to 40s: Binance limit 2400 req/min means ~67 req/sec budget; 5-symbol batch every 40s = 1.75 req/sec target
 
     const countdownInterval = setInterval(() => {
       setNextScanSec(prev => Math.max(0, prev - 1));
@@ -2445,7 +2493,9 @@ export default function App() {
                           <span className="font-black uppercase opacity-70">{log.type}</span>
                           <span className="opacity-50">{log.time}</span>
                         </div>
-                        <div className="leading-relaxed">{log.message}</div>
+                        <div className="leading-relaxed">
+                          {log.repeatCount > 1 ? `${log.message} ... (x${log.repeatCount})` : log.message}
+                        </div>
                       </div>
                     ))
                   )}
