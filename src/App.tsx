@@ -65,7 +65,7 @@ const CriteriaInfoLabel = ({ text, detail }: { text: string; detail: string }) =
         @i
       </button>
       {isOpen && (
-        <span className="absolute left-0 top-full z-20 mt-1 w-56 rounded-sm border border-cyan-400/30 bg-[#081317] px-2 py-2 text-[9px] normal-case leading-relaxed text-cyan-100 shadow-[0_8px_24px_rgba(0,0,0,0.35)]">
+        <span className="absolute left-0 top-full z-[9999] mt-1 w-56 rounded-sm border border-cyan-400/40 bg-[#0a1a20] px-2 py-2 text-[9px] normal-case leading-relaxed text-cyan-100 shadow-[0_8px_32px_rgba(0,0,0,0.8)]">
           <span className="mb-1 block text-[8px] font-black uppercase tracking-wide text-cyan-300">{text}</span>
           <span>{detail}</span>
         </span>
