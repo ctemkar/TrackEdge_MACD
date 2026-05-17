@@ -99,37 +99,52 @@ async function startServer() {
         .createHmac('sha256', apiSecret)
         .update(queryString)
         .digest('hex');
-      
-      const url = `https://fapi.binance.com/fapi/v2/positionRisk?${queryString}&signature=${signature}`;
-      
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-          'X-MBX-APIKEY': apiKey,
-          'Content-Type': 'application/json',
-        },
-      });
-      
-      if (!response.ok) {
-        const text = await response.text();
+
+      const endpoints = [
+        { label: 'fapi-position-risk', url: `https://fapi.binance.com/fapi/v2/positionRisk?${queryString}&signature=${signature}` },
+        { label: 'papi-um-position-risk', url: `https://papi.binance.com/papi/v1/um/positionRisk?${queryString}&signature=${signature}` },
+      ];
+
+      let sawAuthError = false;
+      let lastMessage = '';
+      const endpointErrors: string[] = [];
+
+      for (const endpoint of endpoints) {
+        const response = await fetch(endpoint.url, {
+          method: 'GET',
+          headers: {
+            'X-MBX-APIKEY': apiKey,
+            'Content-Type': 'application/json',
+          },
+        });
+
+        if (!response.ok) {
+          const text = await response.text();
+          lastMessage = text;
+          const authError = response.status === 401 || isBinanceAuthErrorMessage(text);
+          sawAuthError = sawAuthError || authError;
+          endpointErrors.push(`${endpoint.label}:${response.status}:${text.substring(0, 100)}`);
+          continue;
+        }
+
+        const data = await response.json();
+        if (Array.isArray(data)) {
+          console.log(`[TradeEdge] Direct Binance HTTP: Got ${data.length} positions from ${endpoint.label}`);
+          return { positions: data, authError: false };
+        }
+      }
+
+      if (endpointErrors.length > 0) {
+        const msg = endpointErrors.slice(0, 2).join(' | ');
+        const level = sawAuthError ? 'warn' : 'log';
         logOnce(
-          'warn',
-          `binance-position-risk-${response.status}`,
-          `[TradeEdge] Binance /fapi/v2/positionRisk returned ${response.status}: ${text.substring(0, 100)}`,
+          level,
+          `binance-position-risk-all-failed-${sawAuthError ? 'auth' : 'other'}`,
+          `[TradeEdge] Binance positionRisk fallback exhausted: ${msg}`,
         );
-        return {
-          positions: [],
-          authError: response.status === 401 || isBinanceAuthErrorMessage(text),
-          message: text,
-        };
       }
-      
-      const data = await response.json();
-      if (Array.isArray(data)) {
-        console.log(`[TradeEdge] Direct Binance HTTP: Got ${data.length} positions from /fapi/v2/positionRisk`);
-        return { positions: data, authError: false };
-      }
-      return { positions: [], authError: false };
+
+      return { positions: [], authError: sawAuthError, message: lastMessage || 'positionRisk unavailable' };
     } catch (e: any) {
       console.warn(`[TradeEdge] Direct Binance HTTP request failed: ${e?.message}`);
       const errMsg = String(e?.message || '');
@@ -810,6 +825,8 @@ async function startServer() {
               console.log(`[TradeEdge Sync] Recovered ${accountPositions.length} positions via Binance account endpoints`);
               accountPositions.forEach(upsertPosition);
               positionsFetched = true;
+              authDegraded = false;
+              authDegradedMessage = '';
             }
             
             // CAPTURE account balance data from the response (totalWalletBalance, totalUnrealizedProfit, etc.)
@@ -1036,6 +1053,19 @@ async function startServer() {
 
       if (uiAvailableBalance === null) {
         uiAvailableBalance = cashTotal;
+      }
+
+      const hasUsablePositions = Object.keys(allPositions).length > 0;
+      const hasUsableBalance = Number.isFinite(cashTotal) && cashTotal > 0;
+
+      // Avoid false auth alarms when a probe endpoint fails but trading data is otherwise available.
+      if (authDegraded && (hasUsablePositions || hasUsableBalance)) {
+        authDegraded = false;
+        authDegradedMessage = '';
+      }
+
+      if (authDegraded && authDegradedMessage) {
+        authDegradedMessage = 'Some Binance private endpoints are restricted for this account mode. Trading may still work via compatible endpoints.';
       }
       
       const positionKeys = Object.keys(allPositions);
