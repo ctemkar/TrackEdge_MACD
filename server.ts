@@ -535,6 +535,8 @@ async function startServer() {
       }
 
       let totalUnrealizedPnl = 0;
+      let authDegraded = false;
+      let authDegradedMessage = '';
 
       if (client.id === 'binance') {
         const upsertPosition = (input: any) => {
@@ -603,7 +605,11 @@ async function startServer() {
         if (binanceKey && binanceSecret) {
           const httpPositionResult = await fetchBinancePositionsViaHttp(binanceKey, binanceSecret);
           const httpPositions = httpPositionResult.positions;
-          console.log(`[TradeEdge Sync DEBUG] Direct HTTP attempt: got ${httpPositions.length} positions, result status: ${httpPositionResult.status}`);
+          if (httpPositionResult.authError) {
+            authDegraded = true;
+            authDegradedMessage = httpPositionResult.message || 'Binance private futures endpoint returned auth error (-2015).';
+          }
+          console.log(`[TradeEdge Sync DEBUG] Direct HTTP attempt: got ${httpPositions.length} positions, authError=${httpPositionResult.authError}${httpPositionResult.message ? `, message=${httpPositionResult.message}` : ''}`);
           if (httpPositions.length > 0) {
             console.log(`[TradeEdge Sync] Successfully fetched ${httpPositions.length} positions via direct HTTP API`);
             httpPositions.forEach(pos => {
@@ -817,13 +823,9 @@ async function startServer() {
         const fallbackCash = portfolioMarginEquity && portfolioMarginEquity > 0 ? portfolioMarginEquity : cashTotal;
 
         if (Number.isFinite(primaryAvailable)) {
-          // PM APIs can report a very low available value while account equity is high.
-          // If we are flat (or nearly flat) and the value is implausibly small, show fallback cash/equity.
-          if (!hasOpenPositions && fallbackCash > 0 && primaryAvailable < fallbackCash * 0.1) {
-            uiAvailableBalance = fallbackCash;
-          } else {
-            uiAvailableBalance = primaryAvailable;
-          }
+          // Use exchange-reported available margin directly.
+          // Inflating this with equity can trigger repeated -2019 rejects.
+          uiAvailableBalance = primaryAvailable;
         } else {
           uiAvailableBalance = fallbackCash;
         }
@@ -851,6 +853,8 @@ async function startServer() {
         balance: { USDT: cashTotal }, 
         equity: portfolioMarginEquity,
         availableBalance: uiAvailableBalance,
+        authDegraded,
+        authDegradedMessage,
         unrealizedPnl: Number.isFinite(totalUnrealizedPnl) ? totalUnrealizedPnl : 0,
         positions: allPositions,
         raw: { info: balanceData.info },
@@ -1081,6 +1085,44 @@ async function startServer() {
             if (finalNotional < minUserNotional * 0.995) {
               throw new Error(`MIN NOTIONAL ENFORCED: ${ccxtSymbol} order value $${finalNotional.toFixed(2)} is below $${minUserNotional.toFixed(2)}`);
             }
+
+            // Conservative margin guard: cap notional to currently available balance.
+            // This prevents stale UI state from submitting oversized orders that Binance rejects with -2019.
+            try {
+              const bal = await client.fetchBalance({ type: 'future' } as any);
+              const infoRows = Array.isArray((bal as any)?.info) ? (bal as any).info : [(bal as any)?.info || {}];
+              const usdtRow = infoRows.find((row: any) => (row?.asset || '').toUpperCase() === 'USDT') || infoRows[0] || {};
+              const availableCandidates = [
+                Number(usdtRow?.availableBalance),
+                Number(usdtRow?.totalAvailableBalance),
+                Number(usdtRow?.maxWithdrawAmount),
+              ].filter(v => Number.isFinite(v) && v >= 0) as number[];
+
+              const availableMargin = availableCandidates.length > 0 ? availableCandidates[0] : NaN;
+              if (Number.isFinite(availableMargin)) {
+                const maxNotionalAt1x = Math.max(0, availableMargin * 0.98);
+                if (maxNotionalAt1x < minUserNotional) {
+                  throw new Error(`allocation below available margin: available $${availableMargin.toFixed(2)} < minimum order $${minUserNotional.toFixed(2)}`);
+                }
+                if (finalNotional > maxNotionalAt1x) {
+                  finalAmount = maxNotionalAt1x / last;
+                  try {
+                    finalAmount = parseFloat(client.amountToPrecision(ccxtSymbol, finalAmount));
+                  } catch {
+                    // Keep numeric fallback.
+                  }
+                  if (!Number.isFinite(finalAmount) || finalAmount <= 0) {
+                    throw new Error(`allocation below available margin: ${ccxtSymbol} size underflow after margin cap`);
+                  }
+                }
+              }
+            } catch (marginGuardErr: any) {
+              const guardMsg = String(marginGuardErr?.message || 'margin guard failed');
+              if (/allocation below available margin/i.test(guardMsg)) {
+                throw marginGuardErr;
+              }
+              // If the margin probe itself fails, continue with normal exchange validation.
+            }
           }
 
           const orderParams: Record<string, any> = {};
@@ -1119,6 +1161,16 @@ async function startServer() {
     } catch (error: any) {
       const msg = String(error?.message || 'Unknown order failure');
       const unsupported = msg.includes('does not have market symbol') || msg.includes('UNSUPPORTED MARKET') || msg.includes('SYMBOL SKIPPED');
+      const lowMarginSkip = /allocation below available margin|MIN NOTIONAL ENFORCED|below minimum order/i.test(msg);
+
+      if (lowMarginSkip) {
+        const normalized = msg.toLowerCase().includes('allocation below')
+          ? msg
+          : `allocation below minimum order threshold: ${msg}`;
+        console.warn(`[TradeEdge SKIP] ${normalized}`);
+        return res.json({ status: 'skipped', message: normalized });
+      }
+
       if (unsupported) {
         const raw = String(req.body?.symbol || '').toUpperCase().replace('/', '').replace(':', '');
         if (raw) {

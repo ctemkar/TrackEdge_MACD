@@ -8,6 +8,7 @@ import { BacktestModule } from './components/BacktestModule';
 
 export default function App() {
   const AUTO_ENTRY_MIN_SCORE = 2;
+  const LIVE_MIN_ORDER_NOTIONAL = 10;
   const LIVE_QUOTE_ALLOWLIST = ['USDT', 'USDC'];
   const [activeTab, setActiveTab] = useState<'LIVE' | 'BACKTEST'>('LIVE');
   const [data, setData] = useState<Candle[]>([]);
@@ -15,6 +16,7 @@ export default function App() {
   const [strategy, setStrategy] = useState<StrategySignal | null>(null);
   const [currentPrice, setCurrentPrice] = useState<number | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [authDegradedMessage, setAuthDegradedMessage] = useState<string | null>(null);
   const [syncDetails, setSyncDetails] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
@@ -352,12 +354,28 @@ export default function App() {
         const liveEquity = Number(data.equity);
         const usdt = Number(data?.balance?.USDT || 0);
         const liveAvailable = Number(data?.availableBalance);
+        const isAuthDegraded = data?.authDegraded === true;
+        const degradedMsg = String(data?.authDegradedMessage || '').trim();
         const syncedBalance = Number.isFinite(liveEquity) && liveEquity > 0 ? liveEquity : usdt;
         const syncedAvailable = Number.isFinite(liveAvailable) && liveAvailable >= 0 ? liveAvailable : usdt;
         const syncedUnrealized = Number(data?.unrealizedPnl);
         setBalance(syncedBalance);
         setAvailableFunds(syncedAvailable);
         setLiveUnrealizedPnl(Number.isFinite(syncedUnrealized) ? syncedUnrealized : 0);
+        setAuthDegradedMessage(isAuthDegraded
+          ? (degradedMsg || 'Binance futures auth is degraded (-2015): API key, IP whitelist, or permissions are incomplete.')
+          : null);
+
+        // Hard live safety: pause autonomous mode before scanner/order logic when margin is below minimum order notional.
+        if (isRealMode && autoTradeRef.current && syncedAvailable < LIVE_MIN_ORDER_NOTIONAL) {
+          const lockMs = 2 * 60 * 1000;
+          autoTradeRef.current = false;
+          setAutoTrade(false);
+          setEntryLockUntil(prev => Math.max(prev, Date.now() + lockMs));
+          const lowMarginMsg = `AUTONOMOUS PAUSED: Free margin $${syncedAvailable.toFixed(2)} below minimum order $${LIVE_MIN_ORDER_NOTIONAL.toFixed(2)}.`;
+          addLog(lowMarginMsg, 'warning');
+          setExecutionFeedback({ type: 'warning', message: lowMarginMsg });
+        }
         
         let freshHoldings: Holding[] = [];
         if (data.positions) {
@@ -451,6 +469,7 @@ export default function App() {
         setServerStatus('OK');
         return true;
       } else {
+        setAuthDegradedMessage(null);
         const message = data.message || 'Unknown balance sync error';
         setSyncError(message);
         setExecutionFeedback({ type: 'warning', message });
@@ -459,6 +478,7 @@ export default function App() {
       }
     } catch (e: any) {
       console.error('Sync Error:', e);
+      setAuthDegradedMessage(null);
       addLog(`SYNC ERROR: ${e.message}`, 'warning');
       setSyncError(e.message);
       setServerStatus('ERROR');
@@ -610,14 +630,11 @@ export default function App() {
         } else if (type === 'BUY' || openingShort) {
           const slotsAvailable = Math.max(1, maxConcurrentTrades - holdings.length);
           const realFreeCapital = Math.max(0, availableFunds * 0.95);
-          const realFallbackCapital = isRealMode && holdings.length === 0 && realFreeCapital < 10 && balance >= 10
-            ? Math.max(0, Math.min(balance * 0.1, 50))
-            : 0;
           const tradableCapital = isRealMode
-            ? Math.max(realFreeCapital, realFallbackCapital)
+            ? realFreeCapital
             : Math.max(0, balance);
           let allocation = Math.min(tradableCapital, tradableCapital / slotsAvailable);
-          const minLiveNotional = 10;
+          const minLiveNotional = LIVE_MIN_ORDER_NOTIONAL;
 
           // Avoid over-fragmenting capital across many slots; if we can fund at least one
           // minimal order, keep per-trade allocation at $10+ instead of skipping every entry.
@@ -627,9 +644,9 @@ export default function App() {
 
           allocation = Math.min(allocation, tradableCapital);
 
-          if (allocation < 10) {
-            addLog(`TRADE ABORTED: Available allocation ($${allocation.toFixed(2)}) below minimum threshold ($10).`, 'warning');
-            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: 'SKIP: Allocation below $10 minimum', status: 'SKIPPED', cycleId: eventCycleId });
+          if (allocation < minLiveNotional) {
+            addLog(`TRADE ABORTED: Available allocation ($${allocation.toFixed(2)}) below minimum threshold ($${minLiveNotional.toFixed(2)}).`, 'warning');
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: Allocation below $${minLiveNotional.toFixed(2)} minimum`, status: 'SKIPPED', cycleId: eventCycleId });
             return;
           }
 
@@ -1242,14 +1259,11 @@ export default function App() {
         if (currentHoldings.length < currentMaxTrades) {
           const availableSlots = currentMaxTrades - currentHoldings.length;
           const realFreeCapital = Math.max(0, availableFunds * 0.95);
-          const realFallbackCapital = isRealMode && currentHoldings.length === 0 && realFreeCapital < 10 && balance >= 10
-            ? Math.max(0, Math.min(balance * 0.1, 50))
-            : 0;
-          const realTradableCapital = Math.max(realFreeCapital, realFallbackCapital);
-          if (isRealMode && realTradableCapital < 10) {
+          const realTradableCapital = realFreeCapital;
+          if (isRealMode && realTradableCapital < LIVE_MIN_ORDER_NOTIONAL) {
             const marginLockUntil = Date.now() + (2 * 60 * 1000);
             setEntryLockUntil(prev => Math.max(prev, marginLockUntil));
-            pushScanSkipEvent(`SKIP: Free margin too low for minimum order ($${realFreeCapital.toFixed(2)} effective $${realTradableCapital.toFixed(2)} < $10.00)`, cycleId);
+            pushScanSkipEvent(`SKIP: Free margin too low for minimum order ($${realFreeCapital.toFixed(2)} effective $${realTradableCapital.toFixed(2)} < $${LIVE_MIN_ORDER_NOTIONAL.toFixed(2)})`, cycleId);
             return;
           }
           const toTrade = entries.slice(0, availableSlots);
@@ -1520,6 +1534,7 @@ export default function App() {
     syncErrorLower.includes('enable futures') ||
     syncErrorLower.includes('-2015')
   );
+  const isAuthDegradedBannerVisible = isRealMode && !isAuthDisabledBannerVisible && Boolean(authDegradedMessage);
   const authLockMinutes = Math.floor(entryLockRemainingSec / 60);
   const authLockSeconds = String(entryLockRemainingSec % 60).padStart(2, '0');
   const visibleTradeHistory = tradeHistory.filter(t => {
@@ -1567,6 +1582,21 @@ export default function App() {
               </div>
             </div>
             <span className="text-[10px] font-mono font-black text-rose-800 border border-rose-300 bg-white px-2 py-1 rounded-sm shrink-0">{entryLockRetryTime}</span>
+          </div>
+        </div>
+      )}
+
+      {isAuthDegradedBannerVisible && (
+        <div className="max-w-7xl mx-auto mb-4 border-2 border-amber-700 bg-amber-50 px-4 py-3 shadow-[6px_6px_0px_0px_#92400e]">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start gap-2">
+              <ShieldAlert size={16} className="text-amber-700 mt-0.5 shrink-0" />
+              <div>
+                <p className="text-[10px] font-black uppercase tracking-[0.18em] text-amber-900">Live futures auth degraded</p>
+                <p className="text-[10px] font-mono text-amber-900 mt-1">{authDegradedMessage}</p>
+              </div>
+            </div>
+            <span className="text-[10px] font-mono font-black text-amber-800 border border-amber-300 bg-white px-2 py-1 rounded-sm shrink-0">-2015</span>
           </div>
         </div>
       )}
