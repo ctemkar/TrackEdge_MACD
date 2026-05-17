@@ -26,6 +26,7 @@ const CRITERIA_HELP: Record<string, string> = {
   paperLossCooldownMinutes: 'Cooldown after a paper-trading loss. Reduces repeated losses from rapid re-entry in bad conditions.',
   duplicateOrderLockoutSec: 'Minimum seconds before allowing a repeated order on the same side/symbol. Prevents accidental duplicate submissions.',
   liveEntryDelayMs: 'Delay between sequential live entry submissions. Reduces burst orders and margin/permission race failures.',
+  liveEntriesPerCycle: 'Maximum number of new live entries allowed per scan cycle. Higher values trade faster but can increase margin/race-condition risk.',
   minPaperAllocation: 'Minimum paper capital allocated per trade. Prevents unrealistically tiny paper positions in simulation mode.',
   lowMarginLockMinutes: 'Lock duration when free margin is too low. Temporarily pauses entries to avoid repeated margin rejects.',
   closeFailureLockMinutes: 'Lock duration after close-order failures. Prevents repeated close retries from spiraling into API churn.',
@@ -63,6 +64,7 @@ const PARAMETER_DEFAULTS = {
   maxSymbolsPerScan: 1500,
   duplicateOrderLockoutSec: 45,
   liveEntryDelayMs: 900,
+  liveEntriesPerCycle: 3,
   minPaperAllocation: 25,
   softCooldownMinutes: 30,
   successCooldownMinutes: 45,
@@ -225,6 +227,10 @@ export default function App() {
   const [liveEntryDelayMs, setLiveEntryDelayMs] = useState(() => {
     const saved = localStorage.getItem('te_live_entry_delay_ms');
     return saved ? (parseInt(saved, 10) || 400) : 400;
+  });
+  const [liveEntriesPerCycle, setLiveEntriesPerCycle] = useState(() => {
+    const saved = localStorage.getItem('te_live_entries_per_cycle');
+    return saved ? Math.max(1, parseInt(saved, 10) || 3) : 3;
   });
   const [minPaperAllocation, setMinPaperAllocation] = useState(() => {
     const saved = localStorage.getItem('te_min_paper_allocation');
@@ -1489,6 +1495,7 @@ export default function App() {
     localStorage.setItem('te_max_symbols_per_scan', maxSymbolsPerScan.toString());
     localStorage.setItem('te_duplicate_order_lockout_sec', duplicateOrderLockoutSec.toString());
     localStorage.setItem('te_live_entry_delay_ms', liveEntryDelayMs.toString());
+    localStorage.setItem('te_live_entries_per_cycle', liveEntriesPerCycle.toString());
     localStorage.setItem('te_min_paper_allocation', minPaperAllocation.toString());
     localStorage.setItem('te_soft_cooldown_minutes', softCooldownMinutes.toString());
     localStorage.setItem('te_success_cooldown_minutes', successCooldownMinutes.toString());
@@ -1497,7 +1504,7 @@ export default function App() {
     localStorage.setItem('te_close_failure_lock_minutes', closeFailureLockMinutes.toString());
     localStorage.setItem('te_hard_failure_lock_minutes', hardFailureLockMinutes.toString());
     localStorage.setItem('te_strategy_config', JSON.stringify(strategyConfig));
-  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
+  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
 
   useEffect(() => {
     localStorage.setItem('te_show_extra_criteria', showExtraCriteria ? '1' : '0');
@@ -1566,6 +1573,7 @@ export default function App() {
     paperLossCooldownMinutes: number;
     duplicateOrderLockoutSec: number;
     liveEntryDelayMs: number;
+    liveEntriesPerCycle: number;
     minPaperAllocation: number;
     lowMarginLockMinutes: number;
     closeFailureLockMinutes: number;
@@ -1602,6 +1610,7 @@ export default function App() {
     setPaperLossCooldownMinutes(aiCriteriaSnapshot.paperLossCooldownMinutes);
     setDuplicateOrderLockoutSec(aiCriteriaSnapshot.duplicateOrderLockoutSec);
     setLiveEntryDelayMs(aiCriteriaSnapshot.liveEntryDelayMs);
+    setLiveEntriesPerCycle(aiCriteriaSnapshot.liveEntriesPerCycle);
     setMinPaperAllocation(aiCriteriaSnapshot.minPaperAllocation);
     setLowMarginLockMinutes(aiCriteriaSnapshot.lowMarginLockMinutes);
     setCloseFailureLockMinutes(aiCriteriaSnapshot.closeFailureLockMinutes);
@@ -1632,6 +1641,7 @@ export default function App() {
     setMaxSymbolsPerScan(PARAMETER_DEFAULTS.maxSymbolsPerScan);
     setDuplicateOrderLockoutSec(PARAMETER_DEFAULTS.duplicateOrderLockoutSec);
     setLiveEntryDelayMs(PARAMETER_DEFAULTS.liveEntryDelayMs);
+    setLiveEntriesPerCycle(PARAMETER_DEFAULTS.liveEntriesPerCycle);
     setMinPaperAllocation(PARAMETER_DEFAULTS.minPaperAllocation);
     setSoftCooldownMinutes(PARAMETER_DEFAULTS.softCooldownMinutes);
     setSuccessCooldownMinutes(PARAMETER_DEFAULTS.successCooldownMinutes);
@@ -1682,6 +1692,7 @@ export default function App() {
       paperLossCooldownMinutes,
       duplicateOrderLockoutSec,
       liveEntryDelayMs,
+      liveEntriesPerCycle,
       minPaperAllocation,
       lowMarginLockMinutes,
       closeFailureLockMinutes,
@@ -1727,6 +1738,9 @@ export default function App() {
       } else if ((part.includes('entry delay') || part.includes('live entry delay')) && val !== null) {
         setLiveEntryDelayMs(Math.max(0, Math.round(val)));
         touched.push('Live Entry Delay');
+      } else if ((part.includes('entries per cycle') || part.includes('entry cap') || part.includes('live entry cap')) && val !== null) {
+        setLiveEntriesPerCycle(Math.max(1, Math.round(val)));
+        touched.push('Live Entry Cap');
       } else if ((part.includes('min paper allocation') || part.includes('paper allocation')) && val !== null) {
         setMinPaperAllocation(Math.max(1, val));
         touched.push('Min Paper Allocation');
@@ -2073,8 +2087,18 @@ export default function App() {
           
           if (toTrade.length > 0) {
             // Live mode safety: execute entries sequentially to avoid burst margin failures.
-            const maxEntriesThisCycle = isRealMode ? 1 : availableSlots;
+            const maxEntriesThisCycle = isRealMode ? Math.max(1, liveEntriesPerCycle) : availableSlots;
             const selectedTrades = toTrade.slice(0, maxEntriesThisCycle);
+            if (isRealMode && toTrade.length > selectedTrades.length) {
+              const deferred = toTrade
+                .slice(selectedTrades.length, selectedTrades.length + 6)
+                .map(t => `${t.pick.symbol}(${t.pick.signal.score}/10)`)
+                .join(', ');
+              pushScanSkipEvent(
+                `SKIP: ${toTrade.length - selectedTrades.length} additional entries deferred this cycle (live throttle ${selectedTrades.length}/${toTrade.length}). Deferred: ${deferred}`,
+                cycleId,
+              );
+            }
             for (const { side, pick } of selectedTrades) {
               const entryType = side === 'BUY' ? 'LONG' : 'SHORT';
               await executeTrade(side, pick.symbol, pick.lastPrice, `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`, undefined, cycleId);
@@ -2099,7 +2123,7 @@ export default function App() {
       setScanning(false);
       setTimeout(() => setIsBotActive(false), 2000);
     }
-  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode]);
+  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, liveEntriesPerCycle, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode]);
  // Removed 'scanning' from dependencies
 
   const resetAccount = React.useCallback(() => {
@@ -2546,10 +2570,12 @@ export default function App() {
       };
     }
 
-    if (pick.signal.overall === 'BUY') {
+    if (pick.signal.overall === 'BUY' || pick.signal.overall === 'SELL') {
       return {
         label: 'Signal Found',
-        className: 'bg-sky-100 text-sky-800',
+        className: pick.signal.overall === 'SELL'
+          ? 'bg-rose-100 text-rose-800'
+          : 'bg-sky-100 text-sky-800',
       };
     }
 
@@ -2566,7 +2592,7 @@ export default function App() {
 
     for (const pick of marketPicks) {
       const lifecycle = getMarketPickLifecycle(pick);
-      if (pick.signal.overall === 'BUY') signalFound += 1;
+      if (pick.signal.overall === 'BUY' || pick.signal.overall === 'SELL') signalFound += 1;
       if (lifecycle.label === 'Order Submitted') orderSubmitted += 1;
       if (lifecycle.label === 'Exchange Confirmed') exchangeConfirmed += 1;
     }
@@ -3211,6 +3237,9 @@ export default function App() {
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Live Entry Delay (ms)" detail={CRITERIA_HELP.liveEntryDelayMs} />
                       <input type="number" min="0" step="50" value={liveEntryDelayMs} onChange={(e) => setLiveEntryDelayMs(Math.max(0, parseInt(e.target.value, 10) || 0))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
+                    </label>
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Live Entries / Cycle" detail={CRITERIA_HELP.liveEntriesPerCycle} />
+                      <input type="number" min="1" step="1" value={liveEntriesPerCycle} onChange={(e) => setLiveEntriesPerCycle(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Min Paper Allocation" detail={CRITERIA_HELP.minPaperAllocation} />
                       <input type="number" min="1" step="1" value={minPaperAllocation} onChange={(e) => setMinPaperAllocation(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
