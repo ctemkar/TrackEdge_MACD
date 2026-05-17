@@ -7,6 +7,8 @@ import { calculateIndicators, evaluateStrategy, Candle, DEFAULT_STRATEGY_CONFIG,
 import { scanMarket, MarketScanResult } from './services/scanner';
 import { BacktestModule } from './components/BacktestModule';
 
+const STRATEGY_SIGNAL_INTERVAL = '1d';
+
 const CRITERIA_HELP: Record<string, string> = {
   autoEntryMinScore: 'Minimum strategy confidence required before opening a new position. Higher values reduce trade frequency and prioritize stronger setups.',
   liveMinOrderNotional: 'Minimum USDT notional value allowed per live order. Helps avoid exchange min-notional rejects and tiny low-quality entries.',
@@ -175,7 +177,22 @@ export default function App() {
   });
   const [maxSymbolsPerScan, setMaxSymbolsPerScan] = useState(() => {
     const saved = localStorage.getItem('te_max_symbols_per_scan');
-    return saved ? (parseInt(saved, 10) || 60) : 60;
+    const migrated = localStorage.getItem('te_max_symbols_scan_migrated_v2') === '1';
+    if (!saved) {
+      localStorage.setItem('te_max_symbols_scan_migrated_v2', '1');
+      return 1500;
+    }
+
+    const parsed = parseInt(saved, 10) || 1500;
+    // One-time migration: old default 60 was too restrictive for full-universe scans.
+    if (!migrated && parsed === 60) {
+      localStorage.setItem('te_max_symbols_scan_migrated_v2', '1');
+      localStorage.setItem('te_max_symbols_per_scan', '1500');
+      return 1500;
+    }
+
+    localStorage.setItem('te_max_symbols_scan_migrated_v2', '1');
+    return Math.max(20, Math.min(2000, parsed));
   });
   const [duplicateOrderLockoutSec, setDuplicateOrderLockoutSec] = useState(() => {
     const saved = localStorage.getItem('te_duplicate_order_lockout_sec');
@@ -212,6 +229,12 @@ export default function App() {
   const [hardFailureLockMinutes, setHardFailureLockMinutes] = useState(() => {
     const saved = localStorage.getItem('te_hard_failure_lock_minutes');
     return saved ? (parseInt(saved, 10) || 15) : 15;
+  });
+  const [showExtraCriteria, setShowExtraCriteria] = useState(() => {
+    return localStorage.getItem('te_show_extra_criteria') === '1';
+  });
+  const [fullUniverseMode, setFullUniverseMode] = useState(() => {
+    return localStorage.getItem('te_scan_full_universe_mode') === '1';
   });
   const [strategyConfig, setStrategyConfig] = useState<StrategyConfig>(() => {
     const saved = localStorage.getItem('te_strategy_config');
@@ -939,12 +962,12 @@ export default function App() {
         if (closingExisting) {
           amount = heldAmount;
         } else if (type === 'BUY' || openingShort) {
-          const slotsAvailable = Math.max(1, maxConcurrentTrades - holdings.length);
-          const realFreeCapital = Math.max(0, availableFunds * 0.95);
+          const effectiveSplitSlots = 1;
+          const realFreeCapital = Math.max(0, availableFunds * 0.99);
           const tradableCapital = isRealMode
             ? realFreeCapital
             : Math.max(0, balance);
-          let allocation = Math.min(tradableCapital, tradableCapital / slotsAvailable);
+          let allocation = Math.min(tradableCapital, tradableCapital / effectiveSplitSlots);
           const minLiveNotional = liveMinOrderNotional;
 
           // Avoid over-fragmenting capital across many slots; if we can fund at least one
@@ -1388,6 +1411,14 @@ export default function App() {
     localStorage.setItem('te_strategy_config', JSON.stringify(strategyConfig));
   }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
 
+  useEffect(() => {
+    localStorage.setItem('te_show_extra_criteria', showExtraCriteria ? '1' : '0');
+  }, [showExtraCriteria]);
+
+  useEffect(() => {
+    localStorage.setItem('te_scan_full_universe_mode', fullUniverseMode ? '1' : '0');
+  }, [fullUniverseMode]);
+
   // Baseline Safety: If paper trading and baseline is from a ghost real-sync session, fix it.
   useEffect(() => {
     if (!isRealMode && holdings.length === 0 && benchmarkCapital > (balance * 2) && balance === 800) {
@@ -1436,8 +1467,70 @@ export default function App() {
     setStrategyConfig(prev => ({ ...prev, ...partial }));
   }, []);
 
+  type AiCriteriaSnapshot = {
+    autoEntryMinScore: number;
+    liveMinOrderNotional: number;
+    scanIntervalSec: number;
+    holdingPollIntervalSec: number;
+    maxSymbolsPerScan: number;
+    softCooldownMinutes: number;
+    successCooldownMinutes: number;
+    paperLossCooldownMinutes: number;
+    duplicateOrderLockoutSec: number;
+    liveEntryDelayMs: number;
+    minPaperAllocation: number;
+    lowMarginLockMinutes: number;
+    closeFailureLockMinutes: number;
+    hardFailureLockMinutes: number;
+    liveQuoteAllowlistInput: string;
+    strategyConfig: StrategyConfig;
+  };
+
   const [aiCriteriaPrompt, setAiCriteriaPrompt] = useState('');
   const [aiCriteriaFeedback, setAiCriteriaFeedback] = useState<string | null>(null);
+  const [aiCriteriaSnapshot, setAiCriteriaSnapshot] = useState<AiCriteriaSnapshot | null>(() => {
+    const saved = localStorage.getItem('te_ai_criteria_snapshot');
+    if (!saved) return null;
+    try {
+      return JSON.parse(saved) as AiCriteriaSnapshot;
+    } catch {
+      return null;
+    }
+  });
+
+  const restoreAiCriteriaSnapshot = React.useCallback(() => {
+    if (!aiCriteriaSnapshot) {
+      setAiCriteriaFeedback('No previous AI behavior snapshot available.');
+      return;
+    }
+
+    setAutoEntryMinScore(aiCriteriaSnapshot.autoEntryMinScore);
+    setLiveMinOrderNotional(aiCriteriaSnapshot.liveMinOrderNotional);
+    setScanIntervalSec(aiCriteriaSnapshot.scanIntervalSec);
+    setHoldingPollIntervalSec(aiCriteriaSnapshot.holdingPollIntervalSec);
+    setMaxSymbolsPerScan(aiCriteriaSnapshot.maxSymbolsPerScan);
+    setSoftCooldownMinutes(aiCriteriaSnapshot.softCooldownMinutes);
+    setSuccessCooldownMinutes(aiCriteriaSnapshot.successCooldownMinutes);
+    setPaperLossCooldownMinutes(aiCriteriaSnapshot.paperLossCooldownMinutes);
+    setDuplicateOrderLockoutSec(aiCriteriaSnapshot.duplicateOrderLockoutSec);
+    setLiveEntryDelayMs(aiCriteriaSnapshot.liveEntryDelayMs);
+    setMinPaperAllocation(aiCriteriaSnapshot.minPaperAllocation);
+    setLowMarginLockMinutes(aiCriteriaSnapshot.lowMarginLockMinutes);
+    setCloseFailureLockMinutes(aiCriteriaSnapshot.closeFailureLockMinutes);
+    setHardFailureLockMinutes(aiCriteriaSnapshot.hardFailureLockMinutes);
+    setLiveQuoteAllowlistInput(aiCriteriaSnapshot.liveQuoteAllowlistInput);
+    setStrategyConfig(aiCriteriaSnapshot.strategyConfig);
+    setAiCriteriaSnapshot(null);
+    setAiCriteriaFeedback('Restored previous behavior settings.');
+  }, [aiCriteriaSnapshot]);
+
+  useEffect(() => {
+    if (aiCriteriaSnapshot) {
+      localStorage.setItem('te_ai_criteria_snapshot', JSON.stringify(aiCriteriaSnapshot));
+    } else {
+      localStorage.removeItem('te_ai_criteria_snapshot');
+    }
+  }, [aiCriteriaSnapshot]);
 
   const applyAiCriteriaPrompt = React.useCallback(() => {
     const raw = aiCriteriaPrompt.trim();
@@ -1454,6 +1547,25 @@ export default function App() {
     const extractNumber = (text: string) => {
       const match = text.match(/-?\d+(?:\.\d+)?/);
       return match ? parseFloat(match[0]) : null;
+    };
+
+    const previousSnapshot: AiCriteriaSnapshot = {
+      autoEntryMinScore,
+      liveMinOrderNotional,
+      scanIntervalSec,
+      holdingPollIntervalSec,
+      maxSymbolsPerScan,
+      softCooldownMinutes,
+      successCooldownMinutes,
+      paperLossCooldownMinutes,
+      duplicateOrderLockoutSec,
+      liveEntryDelayMs,
+      minPaperAllocation,
+      lowMarginLockMinutes,
+      closeFailureLockMinutes,
+      hardFailureLockMinutes,
+      liveQuoteAllowlistInput,
+      strategyConfig: { ...strategyConfig }
     };
 
     const touched: string[] = [];
@@ -1476,7 +1588,7 @@ export default function App() {
         setHoldingPollIntervalSec(Math.max(3, Math.round(val)));
         touched.push('Holding Poll');
       } else if ((part.includes('max symbols') || part.includes('symbols per scan')) && val !== null) {
-        setMaxSymbolsPerScan(Math.max(20, Math.min(200, Math.round(val))));
+        setMaxSymbolsPerScan(Math.max(20, Math.min(2000, Math.round(val))));
         touched.push('Max Symbols / Scan');
       } else if ((part.includes('soft cooldown')) && val !== null) {
         setSoftCooldownMinutes(Math.max(1, Math.round(val)));
@@ -1595,8 +1707,28 @@ export default function App() {
       return;
     }
 
+    setAiCriteriaSnapshot(previousSnapshot);
     setAiCriteriaFeedback(`Updated ${Array.from(new Set(touched)).join(', ')}`);
-  }, [aiCriteriaPrompt, updateStrategyConfig]);
+  }, [
+    aiCriteriaPrompt,
+    autoEntryMinScore,
+    liveMinOrderNotional,
+    scanIntervalSec,
+    holdingPollIntervalSec,
+    maxSymbolsPerScan,
+    softCooldownMinutes,
+    successCooldownMinutes,
+    paperLossCooldownMinutes,
+    duplicateOrderLockoutSec,
+    liveEntryDelayMs,
+    minPaperAllocation,
+    lowMarginLockMinutes,
+    closeFailureLockMinutes,
+    hardFailureLockMinutes,
+    liveQuoteAllowlistInput,
+    strategyConfig,
+    updateStrategyConfig
+  ]);
 
   // Emergency Drawdown Watcher
   useEffect(() => {
@@ -1659,7 +1791,12 @@ export default function App() {
       setScanProgress({ current: 0, total: 0 });
       let allSymbols: { label: string; value: string }[];
       try {
-        allSymbols = await fetchAllSymbols();
+        allSymbols = await fetchAllSymbols({
+          includeSpot: fullUniverseMode,
+          includeFutures: true,
+          fullUniverse: fullUniverseMode,
+          allowedQuotes: liveQuoteAllowlist,
+        });
       } catch (err: any) {
         const retryAt: number = err?.retryAt || 0;
         if (retryAt > Date.now()) {
@@ -1684,12 +1821,13 @@ export default function App() {
         const validSuffixes = /^[A-Z0-9]+?(USDT|USDC|FDUSD|BTC|ETH|BNB)$/;
         return validSuffixes.test(up) && up.length < 20 && !/[^A-Z0-9]/.test(up);
       };
+      const isLikelyBinanceSymbol = (v: string) => /^[A-Z0-9]{5,24}$/.test(v.toUpperCase());
       const isLiveBinance = isRealMode && serverConfig?.exchange === 'binance';
       const baseSymbol = isRealMode ? liveNormalized(symbol) : symbol;
       const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
       let symbolsToScan = Array.from(new Set([baseSymbol, ...candidateValues]));
 
-      if (isLiveBinance) {
+      if (isLiveBinance && !fullUniverseMode) {
         const beforeFilter = symbolsToScan.length;
         symbolsToScan = symbolsToScan.filter(v => hasAllowedQuote(v) && isLikelyBinanceFuturesSymbol(v));
         if (symbolsToScan.length < beforeFilter) {
@@ -1697,9 +1835,13 @@ export default function App() {
         }
       }
 
+      if (isLiveBinance && fullUniverseMode) {
+        symbolsToScan = symbolsToScan.filter(isLikelyBinanceSymbol);
+      }
+
       if (isLiveBinance) {
-        const cap = Math.max(20, maxSymbolsPerScan);
-        const reduced = symbolsToScan.slice(0, cap);
+        const cap = Math.max(20, Math.min(2000, maxSymbolsPerScan));
+        const reduced = symbolsToScan.slice(0, Math.min(cap, symbolsToScan.length));
         if (baseSymbol && !reduced.includes(baseSymbol) && reduced.length > 0) {
           reduced[reduced.length - 1] = baseSymbol;
         }
@@ -1835,7 +1977,7 @@ export default function App() {
       setScanning(false);
       setTimeout(() => setIsBotActive(false), 2000);
     }
-  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, strategyConfig, liveQuoteAllowlistInput]);
+  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode]);
  // Removed 'scanning' from dependencies
 
   const resetAccount = React.useCallback(() => {
@@ -1860,7 +2002,12 @@ export default function App() {
         return;
       }
       try {
-        const all = await fetchAllSymbols();
+        const all = await fetchAllSymbols({
+          includeSpot: fullUniverseMode,
+          includeFutures: true,
+          fullUniverse: fullUniverseMode,
+          allowedQuotes: liveQuoteAllowlist,
+        });
         setAvailableSymbols(all);
         addLog(`Market Metadata: ${all.length} exchange vectors mapped.`, 'info');
       } catch (err: any) {
@@ -1875,7 +2022,7 @@ export default function App() {
       addLog(`PROTOCOL STATUS: Autonomous Execution is ${autoTrade ? 'ACTIVE' : 'IDLE'}`, autoTrade ? 'success' : 'info');
     };
     initSymbols();
-  }, [addLog, autoTrade, setRateLimitUntil, serverStatus]);
+  }, [addLog, autoTrade, fullUniverseMode, liveQuoteAllowlistInput, setRateLimitUntil, serverStatus]);
 
   // Main Data Loading & Scanner Auto-Refresh
   useEffect(() => {
@@ -1890,11 +2037,13 @@ export default function App() {
       if (!silent && data.length === 0) setLoading(true); 
       
       try {
-        const candles = await fetchBinanceData(symbol);
+        const candles = await fetchBinanceData(symbol, STRATEGY_SIGNAL_INTERVAL, 500);
         setData(candles);
-        const inds = calculateIndicators(candles, strategyConfig);
+        // For daily strategy decisions, use the last fully closed candle.
+        const signalCandles = candles.length > 2 ? candles.slice(0, -1) : candles;
+        const inds = calculateIndicators(signalCandles, strategyConfig);
         setIndicators(inds);
-        const sig = evaluateStrategy(candles, inds, strategyConfig);
+        const sig = evaluateStrategy(signalCandles, inds, strategyConfig);
         setStrategy(sig);
         if (candles.length > 0) {
           const price = candles[candles.length - 1].close;
@@ -2582,6 +2731,34 @@ export default function App() {
 
                 <div className="p-3 bg-white/5 border border-white/10 rounded-sm space-y-3">
                   <p className="text-[10px] uppercase font-bold opacity-70">Strategy Criteria</p>
+                  <div className="flex items-center justify-between rounded-sm border border-white/10 bg-black/25 px-3 py-2">
+                    <span className="text-[12px] uppercase tracking-wide text-white/70">Important Items</span>
+                    <button
+                      type="button"
+                      onClick={() => setShowExtraCriteria(prev => !prev)}
+                      className="rounded-sm border border-cyan-400/40 bg-cyan-500/15 px-3 py-1.5 text-[12px] font-black uppercase tracking-wide text-cyan-200 hover:bg-cyan-500/30"
+                    >
+                      {showExtraCriteria ? 'Hide Extra Items' : 'Show Extra Items'}
+                    </button>
+                  </div>
+                  <div className="flex items-center justify-between rounded-sm border border-amber-300/40 bg-amber-500/10 px-3 py-2">
+                    <div className="flex flex-col">
+                      <span className="text-[12px] uppercase tracking-wide text-amber-200">Full Universe Mode</span>
+                      <span className="text-[10px] text-amber-100/70">Scans spot + futures and all quote assets. Slower, higher rate-limit risk.</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setFullUniverseMode(!fullUniverseMode)}
+                      className={`rounded-sm border px-3 py-1.5 text-[12px] font-black uppercase tracking-wide transition-colors ${fullUniverseMode ? 'border-amber-300 bg-amber-400/30 text-amber-100' : 'border-white/20 bg-white/5 text-white/60 hover:bg-white/10'}`}
+                    >
+                      {fullUniverseMode ? 'ON' : 'OFF'}
+                    </button>
+                  </div>
+                  {!showExtraCriteria && (
+                    <p className="text-[11px] uppercase tracking-wide text-white/45">
+                      Showing core controls only. Enable extra items for advanced tuning.
+                    </p>
+                  )}
                   <div className="space-y-2 rounded-sm border border-cyan-500/20 bg-cyan-500/5 p-2">
                     <p className="text-[8px] uppercase font-bold tracking-wide text-cyan-300">AI Criteria Editor</p>
                     <textarea
@@ -2590,7 +2767,7 @@ export default function App() {
                       placeholder="Example: set scan interval 60, holding poll 8, max symbols 50, rsi overbought 72"
                       className="h-16 w-full resize-none rounded-sm border border-white/10 bg-black/40 px-2 py-1 text-[10px] font-mono"
                     />
-                    <div className="flex items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <button
                         type="button"
                         onClick={applyAiCriteriaPrompt}
@@ -2598,7 +2775,19 @@ export default function App() {
                       >
                         Apply AI Command
                       </button>
-                      {aiCriteriaFeedback && <span className="text-[8px] text-cyan-200/80">{aiCriteriaFeedback}</span>}
+                      <button
+                        type="button"
+                        onClick={restoreAiCriteriaSnapshot}
+                        disabled={!aiCriteriaSnapshot}
+                        className={`rounded-xs border px-2 py-1 text-[9px] font-black uppercase tracking-wide transition-colors ${
+                          aiCriteriaSnapshot
+                            ? 'border-amber-300/60 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25'
+                            : 'border-white/20 bg-white/5 text-white/40 cursor-not-allowed'
+                        }`}
+                      >
+                        Reset to Previous
+                      </button>
+                      {aiCriteriaFeedback && <span className="text-[10px] text-cyan-200/80">{aiCriteriaFeedback}</span>}
                     </div>
                   </div>
                   <div className="grid grid-cols-2 gap-2">
@@ -2633,7 +2822,7 @@ export default function App() {
                       <input type="number" min="3" step="1" value={holdingPollIntervalSec} onChange={(e) => setHoldingPollIntervalSec(Math.max(3, parseInt(e.target.value, 10) || 3))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Max Symbols / Scan" detail={CRITERIA_HELP.maxSymbolsPerScan} />
-                      <input type="number" min="20" max="200" step="5" value={maxSymbolsPerScan} onChange={(e) => setMaxSymbolsPerScan(Math.max(20, Math.min(200, parseInt(e.target.value, 10) || 20)))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
+                      <input type="number" min="20" max="2000" step="10" value={maxSymbolsPerScan} onChange={(e) => setMaxSymbolsPerScan(Math.max(20, Math.min(2000, parseInt(e.target.value, 10) || 20)))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Soft Cooldown (m)" detail={CRITERIA_HELP.softCooldownMinutes} />
                       <input type="number" min="1" step="1" value={softCooldownMinutes} onChange={(e) => setSoftCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
@@ -2662,6 +2851,8 @@ export default function App() {
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Hard Failure Lock (m)" detail={CRITERIA_HELP.hardFailureLockMinutes} />
                       <input type="number" min="1" step="1" value={hardFailureLockMinutes} onChange={(e) => setHardFailureLockMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
+                    {showExtraCriteria && (
+                      <>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Trend SMA Period" detail={CRITERIA_HELP.trendSmaPeriod} />
                       <input type="number" min="2" step="1" value={strategyConfig.trendSmaPeriod} onChange={(e) => updateStrategyConfig({ trendSmaPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
@@ -2710,10 +2901,14 @@ export default function App() {
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Max Score" detail={CRITERIA_HELP.maxScore} />
                       <input type="number" min="1" max="10" step="0.5" value={strategyConfig.maxScore} onChange={(e) => updateStrategyConfig({ maxScore: Math.max(1, parseFloat(e.target.value) || 1) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
+                      </>
+                    )}
                   </div>
-                  <label className="text-[18px] uppercase opacity-70 block"><CriteriaInfoLabel text="Allowed Live Quotes (comma separated)" detail={CRITERIA_HELP.liveQuoteAllowlistInput} />
-                    <input type="text" value={liveQuoteAllowlistInput} onChange={(e) => setLiveQuoteAllowlistInput(e.target.value.toUpperCase())} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
-                  </label>
+                  {showExtraCriteria && (
+                    <label className="text-[18px] uppercase opacity-70 block"><CriteriaInfoLabel text="Allowed Live Quotes (comma separated)" detail={CRITERIA_HELP.liveQuoteAllowlistInput} />
+                      <input type="text" value={liveQuoteAllowlistInput} onChange={(e) => setLiveQuoteAllowlistInput(e.target.value.toUpperCase())} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
+                    </label>
+                  )}
                 </div>
 
                 <div className="pt-4 border-t border-white/10">
@@ -3035,23 +3230,23 @@ export default function App() {
               <table className="w-full text-left border-collapse">
                 <thead className="bg-gray-50 border-b-2 border-gray-100 uppercase font-mono text-[9px] opacity-40">
                   <tr>
-                    <th className="px-6 py-4 tracking-widest">Exchange</th>
-                    <th className="px-6 py-4 tracking-widest">Side</th>
-                    <th className="px-6 py-4 tracking-widest">Symbol</th>
-                    <th className="px-6 py-4 tracking-widest">Contracts</th>
-                    <th className="px-6 py-4 tracking-widest">Entry Price</th>
-                    <th className="px-6 py-4 tracking-widest">Mark Price</th>
-                    <th className="px-6 py-4 tracking-widest">Margin</th>
-                    <th className="px-6 py-4 tracking-widest">Notional</th>
-                    <th className="px-6 py-4 tracking-widest">Unrealized P&L</th>
-                    <th className="px-6 py-4 tracking-widest">P&L %</th>
-                    <th className="px-6 py-4 text-right tracking-widest">Action Control</th>
+                    <th className="px-3 py-4 tracking-widest">Exchange</th>
+                    <th className="px-3 py-4 tracking-widest">Side</th>
+                    <th className="px-3 py-4 tracking-widest">Symbol</th>
+                    <th className="px-3 py-4 tracking-widest">Contracts</th>
+                    <th className="px-3 py-4 tracking-widest">Entry Price</th>
+                    <th className="px-3 py-4 tracking-widest">Mark Price</th>
+                    <th className="px-3 py-4 tracking-widest">Margin</th>
+                    <th className="px-3 py-4 tracking-widest">Notional</th>
+                    <th className="px-3 py-4 tracking-widest">Unrealized P&L</th>
+                    <th className="px-3 py-4 tracking-widest">P&L %</th>
+                    <th className="px-3 py-4 text-right tracking-widest">Action Control</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
                   {holdings.length === 0 ? (
                     <tr>
-                      <td colSpan={11} className="px-6 py-16 text-center">
+                      <td colSpan={11} className="px-3 py-16 text-center">
                         <div className="flex flex-col items-center gap-2 opacity-30">
                           <Zap size={24} />
                           <p className="text-xs font-mono uppercase tracking-[0.2em]">Awaiting signal confluence. No open vectors.</p>
@@ -3072,37 +3267,37 @@ export default function App() {
                         : h.symbol);
                       return (
                         <tr key={i} className="hover:bg-gray-50/50 transition-colors group cursor-pointer" onClick={() => setSymbol(h.symbol)}>
-                        <td className="px-6 py-5 font-mono text-xs opacity-70">
+                        <td className="px-3 py-5 font-mono text-xs opacity-70">
                          {h.exchange || 'Binance'}
                           </td>
-                          <td className="px-6 py-5">
+                          <td className="px-3 py-5">
                               <span className={`text-[10px] font-black px-2 py-0.5 rounded-sm ${h.side === 'SHORT' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{h.side}</span>
                           </td>
-                        <td className="px-6 py-5 font-mono text-xs font-black uppercase tracking-tight">
+                        <td className="px-3 py-5 font-mono text-xs font-black uppercase tracking-tight">
                           {displaySymbol}
                         </td>
-                          <td className="px-6 py-5 font-mono text-xs opacity-60">
+                          <td className="px-3 py-5 font-mono text-xs opacity-60">
                           {contracts < 1 ? contracts.toFixed(8) : contracts.toFixed(4)}
                           </td>
-                          <td className="px-6 py-5 font-mono text-xs opacity-60">
+                          <td className="px-3 py-5 font-mono text-xs opacity-60">
                              ${formatPrice(h.entryPrice)}
                           </td>
-                          <td className="px-6 py-5 font-mono text-xs font-bold">
+                          <td className="px-3 py-5 font-mono text-xs font-bold">
                           ${formatPrice(mark)}
                           </td>
-                          <td className="px-6 py-5 font-mono text-xs font-bold">
+                          <td className="px-3 py-5 font-mono text-xs font-bold">
                           ${margin.toFixed(2)}
                         </td>
-                        <td className="px-6 py-5 font-mono text-xs font-bold">
+                        <td className="px-3 py-5 font-mono text-xs font-bold">
                           ${notional.toFixed(2)}
                         </td>
-                          <td className={`px-6 py-5 font-black text-sm ${pnlVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                          <td className={`px-3 py-5 font-black text-sm ${pnlVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                              {pnlVal >= 0 ? '+' : ''}${pnlVal.toFixed(2)}
                         </td>
-                        <td className={`px-6 py-5 font-black text-sm ${pnlPctVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                        <td className={`px-3 py-5 font-black text-sm ${pnlPctVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                           {pnlPctVal >= 0 ? '+' : ''}{pnlPctVal.toFixed(2)}%
                           </td>
-                          <td className="px-6 py-5 text-right">
+                          <td className="px-3 py-5 text-right">
                              <button 
                                onClick={(e) => {
                                  e.stopPropagation();

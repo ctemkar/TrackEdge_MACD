@@ -17,7 +17,8 @@ export async function scanMarket(
   strategyConfig?: StrategyConfig,
 ): Promise<MarketScanResult[]> {
   const results: MarketScanResult[] = [];
-  const batchSize = 5; // Reduced batch size to stay under rate limit (was 10)
+  const batchSize = 3;
+  const interBatchDelayMs = 550;
   
   for (let i = 0; i < symbols.length; i += batchSize) {
     if (shouldContinue && !shouldContinue()) break;
@@ -26,10 +27,12 @@ export async function scanMarket(
     const batchPromises = batch.map(async (symbol): Promise<MarketScanResult | null> => {
       if (shouldContinue && !shouldContinue()) return null;
       try {
-        const candles = await fetchBinanceData(symbol);
-        if (candles.length > 50) { 
-          const indicators = calculateIndicators(candles, strategyConfig);
-          const signal = evaluateStrategy(candles, indicators, strategyConfig);
+        const candles = await fetchBinanceData(symbol, '1d', 500);
+        if (candles.length > 50) {
+          // Use closed daily candles for stable crossover signals.
+          const signalCandles = candles.length > 2 ? candles.slice(0, -1) : candles;
+          const indicators = calculateIndicators(signalCandles, strategyConfig);
+          const signal = evaluateStrategy(signalCandles, indicators, strategyConfig);
           const lastCandle = candles[candles.length - 1];
           const prevCandle = candles[candles.length - 2];
           const change24h = ((lastCandle.close - prevCandle.close) / prevCandle.close) * 100;
@@ -53,10 +56,9 @@ export async function scanMarket(
     results.push(...batchResults.filter((r): r is MarketScanResult => r !== null));
     if (shouldContinue && !shouldContinue()) break;
     
-    // Adaptive delay: increase inter-batch spacing to reduce API request burst
-    // Binance limit: 2400 req/min = 40 req/sec. With 5 symbols per batch at ~3 req/symbol,
-    // 200ms per batch gives ~25 reqs/sec target
-    await new Promise(resolve => setTimeout(resolve, 200));
+    // Small jitter avoids synchronized bursts when scanner loops repeatedly.
+    const jitterMs = Math.floor(Math.random() * 120);
+    await new Promise(resolve => setTimeout(resolve, interBatchDelayMs + jitterMs));
   }
   
   return results.sort((a, b) => b.signal.score - a.signal.score);

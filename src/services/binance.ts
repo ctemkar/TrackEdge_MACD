@@ -1,6 +1,6 @@
 import { Candle } from './indicators';
 
-export async function fetchBinanceData(symbol: string = 'BTCUSD', interval: string = '15m', limit: number = 500): Promise<Candle[]> {
+export async function fetchBinanceData(symbol: string = 'BTCUSD', interval: string = '1d', limit: number = 500): Promise<Candle[]> {
   try {
     // Normalize to futures-style symbols (BTCUSDT) so proxy/futures endpoints remain valid.
     const raw = String(symbol || 'BTCUSDT').toUpperCase();
@@ -27,9 +27,24 @@ export async function fetchBinanceData(symbol: string = 'BTCUSD', interval: stri
   }
 }
 
-export async function fetchAllSymbols(): Promise<{ label: string, value: string }[]> {
+type FetchAllSymbolsOptions = {
+  includeSpot?: boolean;
+  includeFutures?: boolean;
+  fullUniverse?: boolean;
+  allowedQuotes?: string[];
+};
+
+export async function fetchAllSymbols(options?: FetchAllSymbolsOptions): Promise<{ label: string, value: string }[]> {
   try {
-    const response = await fetch('/api/binance/proxy/exchangeInfo');
+    const includeSpot = options?.includeSpot === true;
+    const includeFutures = options?.includeFutures !== false;
+    const fullUniverse = options?.fullUniverse === true;
+    const quoteSource = options?.allowedQuotes && options.allowedQuotes.length > 0
+      ? options.allowedQuotes
+      : ['USDT', 'USDC'];
+    const allowedQuotes = new Set(quoteSource.map(q => String(q || '').toUpperCase()).filter(Boolean));
+
+    const response = await fetch(`/api/binance/proxy/exchangeInfo?includeSpot=${includeSpot ? '1' : '0'}&includeFutures=${includeFutures ? '1' : '0'}`);
     const data = await response.json();
 
     // Rate limited — attach retry time so callers can surface it
@@ -40,22 +55,30 @@ export async function fetchAllSymbols(): Promise<{ label: string, value: string 
       throw err;
     }
 
-    const allowedQuotes = new Set(['USDT', 'USDC']);
     const symbols = Array.isArray(data?.symbols) ? data.symbols : [];
-    return symbols
+    const mapped = symbols
       .filter((s: any) => {
         const status = String(s?.status || '').toUpperCase();
-        const contractType = String(s?.contractType || '').toUpperCase();
         const quote = String(s?.quoteAsset || '').toUpperCase();
         const symbol = String(s?.symbol || '').toUpperCase();
-        const isPerpOrUnknown = !contractType || contractType === 'PERPETUAL';
-        const hasAllowedQuote = quote ? allowedQuotes.has(quote) : (symbol.endsWith('USDT') || symbol.endsWith('USDC'));
-        return status === 'TRADING' && isPerpOrUnknown && hasAllowedQuote;
+        const hasAllowedQuote = fullUniverse
+          ? true
+          : (quote ? allowedQuotes.has(quote) : Array.from(allowedQuotes).some(q => symbol.endsWith(q)));
+        return status === 'TRADING' && hasAllowedQuote;
       })
       .map((s: any) => ({
         label: s.symbol,
         value: s.symbol
       }));
+
+    const deduped = new Map<string, { label: string; value: string }>();
+    mapped.forEach((entry) => {
+      const key = String(entry.value || '').toUpperCase();
+      if (!key) return;
+      if (!deduped.has(key)) deduped.set(key, { label: key, value: key });
+    });
+
+    return Array.from(deduped.values());
   } catch (error: any) {
     if (error?.message === 'RATE_LIMITED') {
       throw error;

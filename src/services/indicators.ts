@@ -183,20 +183,12 @@ export function evaluateStrategy(
   let score = 0;
   if (buySignal) {
     overall = 'BUY';
-    score = config.crossoverScore; 
+    score = config.crossoverScore;
   } else if (sellSignal) {
     overall = 'SELL';
     score = config.crossoverScore;
-  } else if (macdMode === 'BULLISH' && emaCrossover === 'BULLISH') {
-    // Momentum continuation long setup when MACD line is above signal.
-    overall = 'BUY';
-    score = config.continuationScore;
-  } else if (macdMode === 'BEARISH' && emaCrossover === 'BEARISH') {
-    // Momentum continuation short setup when MACD line is below signal.
-    overall = 'SELL';
-    score = config.continuationScore;
   } else {
-    // Secondary setup recognition - Not trades, just context
+    // No crossover: stay flat and only compute context confidence.
     if (trend !== 'NEUTRAL') score += config.contextTrendScore;
     if (volumeConfirmed) score += config.contextVolumeScore;
     if (macdMode === 'BULLISH') score += config.contextMacdScore;

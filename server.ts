@@ -805,11 +805,15 @@ async function startServer() {
             authDegraded = true;
             authDegradedMessage = httpPositionResult.message || 'Binance private futures endpoint returned auth error (-2015).';
           }
-          console.log(`[TradeEdge Sync DEBUG] Direct HTTP attempt: got ${httpPositions.length} positions, authError=${httpPositionResult.authError}${httpPositionResult.message ? `, message=${httpPositionResult.message}` : ''}`);
+          logWithThrottle(
+            'log',
+            'sync-direct-http-attempt-debug',
+            `[TradeEdge Sync DEBUG] Direct HTTP attempt: got ${httpPositions.length} positions, authError=${httpPositionResult.authError}${httpPositionResult.message ? `, message=${httpPositionResult.message}` : ''}`,
+            60 * 1000,
+          );
           if (httpPositions.length > 0) {
             console.log(`[TradeEdge Sync] Successfully fetched ${httpPositions.length} positions via direct HTTP API`);
             httpPositions.forEach(pos => {
-              console.log(`[TradeEdge Sync DEBUG] Processing position: ${JSON.stringify(pos).substring(0, 100)}`);
               upsertPosition(pos);
             });
             positionsFetched = true;
@@ -841,7 +845,12 @@ async function startServer() {
             // Note: papi response structure may differ, so also fall back to calculating from CCXT info if needed
             if (accountPositionResult.accountData) {
               const acctData = accountPositionResult.accountData;
-              console.log(`[TradeEdge Sync DEBUG] Account data keys: ${Object.keys(acctData).join(', ')}`);
+              logWithThrottle(
+                'log',
+                'sync-account-data-keys-debug',
+                `[TradeEdge Sync DEBUG] Account data keys: ${Object.keys(acctData).join(', ')}`,
+                5 * 60 * 1000,
+              );
             }
           }
         }
@@ -986,21 +995,41 @@ async function startServer() {
           const u = Number((p as any)?.unrealizedPnl);
           return Number.isFinite(u) ? sum + u : sum;
         }, 0);
-        console.log(`[TradeEdge Sync DEBUG] totalUnrealizedPnl from positions: ${totalUnrealizedPnl}`);
+        logWithThrottle(
+          'log',
+          'sync-total-unrealized-pnl-debug',
+          `[TradeEdge Sync DEBUG] totalUnrealizedPnl from positions: ${totalUnrealizedPnl}`,
+          60 * 1000,
+        );
 
         // ALSO add UM unrealized PnL from the account info (UM = Unified Margin positions in futures)
         if (Array.isArray(b.info) && totalUnrealizedPnl === 0) {
           const umPnlSum = b.info.reduce((sum: number, row: any) => {
             const umPnl = Number(row?.umUnrealizedPNL || 0);
             if (Number.isFinite(umPnl) && umPnl !== 0) {
-              console.log(`[TradeEdge Sync DEBUG] ${row.asset}: umUnrealizedPNL=${umPnl}`);
+              logWithThrottle(
+                'log',
+                `sync-um-asset-pnl-${row.asset}`,
+                `[TradeEdge Sync DEBUG] ${row.asset}: umUnrealizedPNL=${umPnl}`,
+                5 * 60 * 1000,
+              );
             }
             return sum + (Number.isFinite(umPnl) ? umPnl : 0);
           }, 0);
-          console.log(`[TradeEdge Sync DEBUG] umPnlSum from info array: ${umPnlSum}`);
+          logWithThrottle(
+            'log',
+            'sync-um-pnl-sum-debug',
+            `[TradeEdge Sync DEBUG] umPnlSum from info array: ${umPnlSum}`,
+            60 * 1000,
+          );
           if (umPnlSum !== 0) {
             totalUnrealizedPnl = umPnlSum;
-            console.log(`[TradeEdge Sync DEBUG] Using umPnlSum as totalUnrealizedPnl: ${totalUnrealizedPnl}`);
+            logWithThrottle(
+              'log',
+              'sync-um-pnl-used-debug',
+              `[TradeEdge Sync DEBUG] Using umPnlSum as totalUnrealizedPnl: ${totalUnrealizedPnl}`,
+              60 * 1000,
+            );
           }
         }
       }
@@ -1618,18 +1647,24 @@ async function startServer() {
         const mapped = ohlcv.map(c => [c[0], c[1].toString(), c[2].toString(), c[3].toString(), c[4].toString(), c[5].toString(), c[0], "0", 1, "0", "0", "0"]);
         return res.json(mapped);
       } else {
-        // Binance futures default (USD-M)
-        const binanceUrl = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-        const response = await fetch(binanceUrl);
-        if (response.ok) return res.json(await response.json());
-        if (response.status === 418 || response.status === 429) {
-          const body: any = await response.json().catch(() => ({}));
-          const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
-          if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
-          else rateLimitState.backoffUntil = Date.now() + 60000;
-          console.warn(`[TradeEdge RateLimit] klines rate limited — suppressing`);
-          return res.json([]);
+        const endpoints = [
+          `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
+          `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
+        ];
+
+        for (const binanceUrl of endpoints) {
+          const response = await fetch(binanceUrl);
+          if (response.ok) return res.json(await response.json());
+          if (response.status === 418 || response.status === 429) {
+            const body: any = await response.json().catch(() => ({}));
+            const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
+            if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
+            else rateLimitState.backoffUntil = Date.now() + 60000;
+            console.warn(`[TradeEdge RateLimit] klines rate limited — suppressing`);
+            return res.json([]);
+          }
         }
+
         return res.json([]);
       }
     } catch (error: any) {
@@ -1664,19 +1699,49 @@ async function startServer() {
         });
         return res.json({ symbols });
       } else {
-        const url = 'https://fapi.binance.com/fapi/v1/exchangeInfo';
-        const response = await fetch(url);
-        if (response.ok) return res.json(await response.json());
-        if (response.status === 418 || response.status === 429) {
-          const body: any = await response.json().catch(() => ({}));
-          const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
-          if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
-          else rateLimitState.backoffUntil = Date.now() + 60000;
-          console.warn(`[TradeEdge RateLimit] exchangeInfo rate limited — suppressing`);
-          const newBlockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
-          return res.status(429).json({ status: 'rate_limited', symbols: [], bannedUntil: newBlockedUntil });
+        const includeSpot = String(req.query.includeSpot || '0') === '1';
+        const includeFutures = String(req.query.includeFutures || '1') !== '0';
+        const mergedSymbols: any[] = [];
+
+        const fetchAndCollect = async (url: string, marketType: 'spot' | 'futures') => {
+          const response = await fetch(url);
+          if (response.ok) {
+            const data: any = await response.json();
+            const symbols = Array.isArray(data?.symbols) ? data.symbols : [];
+            symbols.forEach((s: any) => mergedSymbols.push({ ...s, marketType }));
+            return;
+          }
+          if (response.status === 418 || response.status === 429) {
+            const body: any = await response.json().catch(() => ({}));
+            const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
+            if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
+            else rateLimitState.backoffUntil = Date.now() + 60000;
+            console.warn(`[TradeEdge RateLimit] exchangeInfo rate limited (${marketType}) — suppressing`);
+            const newBlockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+            res.status(429).json({ status: 'rate_limited', symbols: [], bannedUntil: newBlockedUntil });
+            return;
+          }
+          throw new Error(`Binance exchangeInfo failed (${marketType})`);
+        };
+
+        if (includeFutures) {
+          await fetchAndCollect('https://fapi.binance.com/fapi/v1/exchangeInfo', 'futures');
+          if (res.headersSent) return;
         }
-        throw new Error('Binance exchangeInfo failed');
+
+        if (includeSpot) {
+          await fetchAndCollect('https://api.binance.com/api/v3/exchangeInfo', 'spot');
+          if (res.headersSent) return;
+        }
+
+        const deduped = new Map<string, any>();
+        mergedSymbols.forEach((s: any) => {
+          const key = String(s?.symbol || '').toUpperCase();
+          if (!key) return;
+          if (!deduped.has(key)) deduped.set(key, s);
+        });
+
+        return res.json({ symbols: Array.from(deduped.values()) });
       }
     } catch (error: any) {
       res.status(500).json({ status: 'error', message: error.message });
