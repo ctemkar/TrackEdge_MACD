@@ -2035,6 +2035,10 @@ export default function App() {
           const scanResult = results.find(r => r.symbol === holding.symbol);
           if (scanResult) {
             const price = scanResult.lastPrice;
+            const reversalThreshold = Math.max(6, autoEntryMinScore);
+            const oppositeSignalStrong = holding.side === 'LONG'
+              ? (scanResult.signal.overall === 'SELL' && scanResult.signal.score >= reversalThreshold)
+              : (scanResult.signal.overall === 'BUY' && scanResult.signal.score >= reversalThreshold);
             const slTrigger = holding.side === 'SHORT'
               ? price >= holding.entryPrice * (1 + stopLossPercent / 100)
               : price <= holding.entryPrice * (1 - stopLossPercent / 100);
@@ -2047,6 +2051,16 @@ export default function App() {
               executeTrade(exitSide, holding.symbol, price, 'AUTO_EXIT: PORTFOLIO STOP LOSS', holding.id, cycleId);
             } else if (tpTrigger) {
               executeTrade(exitSide, holding.symbol, price, 'AUTO_EXIT: PORTFOLIO TAKE PROFIT', holding.id, cycleId);
+            } else if (oppositeSignalStrong) {
+              const flipTo = holding.side === 'LONG' ? 'SHORT' : 'LONG';
+              executeTrade(
+                exitSide,
+                holding.symbol,
+                price,
+                `AUTO_EXIT: STRONG REVERSAL TO ${flipTo} (${scanResult.signal.overall} ${scanResult.signal.score}/10)`,
+                holding.id,
+                cycleId,
+              );
             }
           }
         });
