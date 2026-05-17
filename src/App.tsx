@@ -46,18 +46,33 @@ const CRITERIA_HELP: Record<string, string> = {
   liveQuoteAllowlistInput: 'Comma-separated quote assets allowed for live trading (for example USDT, USDC). Restricts tradable universe for safety.',
 };
 
-const CriteriaInfoLabel = ({ text, detail }: { text: string; detail: string }) => (
-  <span className="inline-flex items-center gap-1">
-    <span>{text}</span>
-    <span
-      title={detail}
-      aria-label={`${text} details`}
-      className="inline-flex h-3.5 min-w-[14px] items-center justify-center rounded-full border border-cyan-400/50 bg-cyan-500/10 px-1 text-[7px] font-black leading-none text-cyan-300"
-    >
-      @i
+const CriteriaInfoLabel = ({ text, detail }: { text: string; detail: string }) => {
+  const [isOpen, setIsOpen] = useState(false);
+
+  return (
+    <span className="relative inline-flex items-center gap-1">
+      <span>{text}</span>
+      <button
+        type="button"
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setIsOpen(prev => !prev);
+        }}
+        aria-label={`${text} details`}
+        className="inline-flex h-3.5 min-w-[14px] items-center justify-center rounded-full border border-cyan-400/50 bg-cyan-500/10 px-1 text-[7px] font-black leading-none text-cyan-300 hover:bg-cyan-500/20"
+      >
+        @i
+      </button>
+      {isOpen && (
+        <span className="absolute left-0 top-full z-20 mt-1 w-56 rounded-sm border border-cyan-400/30 bg-[#081317] px-2 py-2 text-[9px] normal-case leading-relaxed text-cyan-100 shadow-[0_8px_24px_rgba(0,0,0,0.35)]">
+          <span className="mb-1 block text-[8px] font-black uppercase tracking-wide text-cyan-300">{text}</span>
+          <span>{detail}</span>
+        </span>
+      )}
     </span>
-  </span>
-);
+  );
+};
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'LIVE' | 'BACKTEST'>('LIVE');
