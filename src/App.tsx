@@ -285,6 +285,26 @@ export default function App() {
     time: string;
   }
 
+  type ActivePositionSortKey =
+    | 'exchange'
+    | 'side'
+    | 'symbol'
+    | 'contracts'
+    | 'entryPrice'
+    | 'markPrice'
+    | 'margin'
+    | 'notional'
+    | 'unrealizedPnl'
+    | 'pnlPct'
+    | 'action';
+
+  type ActivePositionSortDirection = 'asc' | 'desc';
+
+  interface ActivePositionSortRule {
+    key: ActivePositionSortKey;
+    direction: ActivePositionSortDirection;
+  }
+
   type ExecutionStatus = 'FILLED' | 'SKIPPED' | 'FAILED';
   interface TradeEvent {
     type: 'BUY' | 'SELL';
@@ -322,6 +342,7 @@ export default function App() {
       return [];
     }
   });
+  const [activePositionSortRules, setActivePositionSortRules] = useState<ActivePositionSortRule[]>([]);
   
   const [tradeHistory, setTradeHistory] = useState<TradeEvent[]>(() => {
     const saved = localStorage.getItem('te_history');
@@ -2239,6 +2260,152 @@ export default function App() {
   const isAuthDegradedBannerVisible = isRealMode && !isAuthDisabledBannerVisible && Boolean(authDegradedMessage);
   const authLockMinutes = Math.floor(entryLockRemainingSec / 60);
   const authLockSeconds = String(entryLockRemainingSec % 60).padStart(2, '0');
+
+  const activePositionSortDirection = React.useCallback((key: ActivePositionSortKey) => {
+    return activePositionSortRules.find(rule => rule.key === key)?.direction;
+  }, [activePositionSortRules]);
+
+  const activePositionSortPriority = React.useCallback((key: ActivePositionSortKey) => {
+    const index = activePositionSortRules.findIndex(rule => rule.key === key);
+    return index >= 0 ? index + 1 : null;
+  }, [activePositionSortRules]);
+
+  const updateActivePositionSort = React.useCallback((key: ActivePositionSortKey, additive: boolean) => {
+    setActivePositionSortRules(prev => {
+      const existingIndex = prev.findIndex(rule => rule.key === key);
+
+      if (!additive) {
+        if (existingIndex === -1) return [{ key, direction: 'asc' }];
+        const existing = prev[existingIndex];
+        if (existing.direction === 'asc') return [{ key, direction: 'desc' }];
+        return [];
+      }
+
+      if (existingIndex === -1) {
+        return [...prev, { key, direction: 'asc' }];
+      }
+
+      const next = [...prev];
+      const existing = next[existingIndex];
+      if (existing.direction === 'asc') {
+        next[existingIndex] = { ...existing, direction: 'desc' };
+        return next;
+      }
+
+      next.splice(existingIndex, 1);
+      return next;
+    });
+  }, []);
+
+  const activePositionRows = React.useMemo(() => {
+    return holdings.map((h, index) => {
+      const { mark, contracts, pnl: pnlVal } = resolveHoldingPnl(h);
+      const notional = Number(h.notional || (contracts * h.entryPrice) || 0);
+      const margin = Number(h.initialMargin || (notional > 0 ? notional / 5 : 0) || 0);
+      const pnlPctVal = margin > 0 ? (pnlVal / margin) * 100 : 0;
+      const closeSide: 'BUY' | 'SELL' = h.side === 'SHORT' ? 'BUY' : 'SELL';
+      const displaySymbol = h.displaySymbol || (h.symbol.endsWith('USDT')
+        ? `${h.symbol.slice(0, -4)}/USDT:USDT`
+        : h.symbol.endsWith('USDC')
+          ? `${h.symbol.slice(0, -4)}/USDC:USDC`
+          : h.symbol);
+
+      return {
+        holding: h,
+        index,
+        displaySymbol,
+        exchange: h.exchange || 'Binance',
+        side: h.side,
+        contracts,
+        entryPrice: Number(h.entryPrice || 0),
+        mark,
+        margin,
+        notional,
+        unrealizedPnl: pnlVal,
+        pnlPct: pnlPctVal,
+        closeSide,
+      };
+    });
+  }, [holdings, resolveHoldingPnl]);
+
+  const sortedActivePositionRows = React.useMemo(() => {
+    if (activePositionSortRules.length === 0) return activePositionRows;
+
+    const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+    const normalized = [...activePositionRows];
+
+    normalized.sort((a, b) => {
+      for (const rule of activePositionSortRules) {
+        let cmp = 0;
+
+        switch (rule.key) {
+          case 'exchange':
+            cmp = collator.compare(a.exchange, b.exchange);
+            break;
+          case 'side':
+            cmp = collator.compare(a.side, b.side);
+            break;
+          case 'symbol':
+            cmp = collator.compare(a.displaySymbol, b.displaySymbol);
+            break;
+          case 'contracts':
+            cmp = a.contracts - b.contracts;
+            break;
+          case 'entryPrice':
+            cmp = a.entryPrice - b.entryPrice;
+            break;
+          case 'markPrice':
+            cmp = a.mark - b.mark;
+            break;
+          case 'margin':
+            cmp = a.margin - b.margin;
+            break;
+          case 'notional':
+            cmp = a.notional - b.notional;
+            break;
+          case 'unrealizedPnl':
+            cmp = a.unrealizedPnl - b.unrealizedPnl;
+            break;
+          case 'pnlPct':
+            cmp = a.pnlPct - b.pnlPct;
+            break;
+          case 'action':
+            cmp = collator.compare(a.closeSide, b.closeSide);
+            break;
+          default:
+            cmp = 0;
+            break;
+        }
+
+        if (cmp !== 0) {
+          return rule.direction === 'asc' ? cmp : -cmp;
+        }
+      }
+
+      return a.index - b.index;
+    });
+
+    return normalized;
+  }, [activePositionRows, activePositionSortRules]);
+
+  const activePositionHeaders: Array<{
+    key: ActivePositionSortKey;
+    label: string;
+    rightAlign?: boolean;
+  }> = [
+    { key: 'exchange', label: 'Exchange' },
+    { key: 'side', label: 'Side' },
+    { key: 'symbol', label: 'Symbol' },
+    { key: 'contracts', label: 'Contracts' },
+    { key: 'entryPrice', label: 'Entry Price' },
+    { key: 'markPrice', label: 'Mark Price' },
+    { key: 'margin', label: 'Margin' },
+    { key: 'notional', label: 'Notional' },
+    { key: 'unrealizedPnl', label: 'Unrealized P&L' },
+    { key: 'pnlPct', label: 'P&L %' },
+    { key: 'action', label: 'Action Control', rightAlign: true },
+  ];
+
   const visibleTradeHistory = tradeHistory.filter(t => {
     // Hide SCAN skips
     if (t.symbol === 'SCAN' && t.status === 'SKIPPED') return false;
@@ -3230,23 +3397,34 @@ export default function App() {
               <table className="w-full text-left border-collapse">
                 <thead className="bg-gray-50 border-b-2 border-gray-100 uppercase font-mono text-[9px] opacity-40">
                   <tr>
-                    <th className="px-3 py-4 tracking-widest">Exchange</th>
-                    <th className="px-3 py-4 tracking-widest">Side</th>
-                    <th className="px-3 py-4 tracking-widest">Symbol</th>
-                    <th className="px-3 py-4 tracking-widest">Contracts</th>
-                    <th className="px-3 py-4 tracking-widest">Entry Price</th>
-                    <th className="px-3 py-4 tracking-widest">Mark Price</th>
-                    <th className="px-3 py-4 tracking-widest">Margin</th>
-                    <th className="px-3 py-4 tracking-widest">Notional</th>
-                    <th className="px-3 py-4 tracking-widest">Unrealized P&L</th>
-                    <th className="px-3 py-4 tracking-widest">P&L %</th>
-                    <th className="px-3 py-4 text-right tracking-widest">Action Control</th>
+                    {activePositionHeaders.map(header => {
+                      const direction = activePositionSortDirection(header.key);
+                      const priority = activePositionSortPriority(header.key);
+                      return (
+                        <th key={header.key} className={`px-2 py-2.5 tracking-widest ${header.rightAlign ? 'text-right' : ''}`}>
+                          <button
+                            type="button"
+                            onClick={(event) => updateActivePositionSort(header.key, event.shiftKey)}
+                            className={`inline-flex items-center gap-1 uppercase ${header.rightAlign ? 'justify-end w-full' : ''}`}
+                            title="Click: single-column sort. Shift+Click: add/remove this column from multi-sort."
+                          >
+                            <span>{header.label}</span>
+                            <span className="text-[8px] opacity-70 min-w-[14px] text-center">
+                              {direction === 'asc' ? '↑' : direction === 'desc' ? '↓' : ''}
+                            </span>
+                            <span className="text-[8px] opacity-60 min-w-[10px] text-center">
+                              {priority ?? ''}
+                            </span>
+                          </button>
+                        </th>
+                      );
+                    })}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
                   {holdings.length === 0 ? (
                     <tr>
-                      <td colSpan={11} className="px-3 py-16 text-center">
+                      <td colSpan={11} className="px-2 py-16 text-center">
                         <div className="flex flex-col items-center gap-2 opacity-30">
                           <Zap size={24} />
                           <p className="text-xs font-mono uppercase tracking-[0.2em]">Awaiting signal confluence. No open vectors.</p>
@@ -3254,50 +3432,42 @@ export default function App() {
                       </td>
                     </tr>
                   ) : (
-                    holdings.map((h, i) => {
-                     const { mark, contracts, pnl: pnlVal } = resolveHoldingPnl(h);
-                     const notional = Number(h.notional || (contracts * h.entryPrice) || 0);
-                     const margin = Number(h.initialMargin || (notional > 0 ? notional / 5 : 0) || 0);
-                     const pnlPctVal = margin > 0 ? (pnlVal / margin) * 100 : 0;
-                      const closeSide: 'BUY' | 'SELL' = h.side === 'SHORT' ? 'BUY' : 'SELL';
-                     const displaySymbol = h.displaySymbol || (h.symbol.endsWith('USDT')
-                      ? `${h.symbol.slice(0, -4)}/USDT:USDT`
-                      : h.symbol.endsWith('USDC')
-                        ? `${h.symbol.slice(0, -4)}/USDC:USDC`
-                        : h.symbol);
+                    sortedActivePositionRows.map((row) => {
+                      const h = row.holding;
+                      const { mark, contracts, margin, notional, unrealizedPnl: pnlVal, pnlPct: pnlPctVal, closeSide, displaySymbol } = row;
                       return (
-                        <tr key={i} className="hover:bg-gray-50/50 transition-colors group cursor-pointer" onClick={() => setSymbol(h.symbol)}>
-                        <td className="px-3 py-5 font-mono text-xs opacity-70">
-                         {h.exchange || 'Binance'}
+                        <tr key={h.id} className="hover:bg-gray-50/50 transition-colors group cursor-pointer" onClick={() => setSymbol(h.symbol)}>
+                        <td className="px-2 py-3.5 font-mono text-xs opacity-70">
+                         {row.exchange}
                           </td>
-                          <td className="px-3 py-5">
+                          <td className="px-2 py-3.5">
                               <span className={`text-[10px] font-black px-2 py-0.5 rounded-sm ${h.side === 'SHORT' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{h.side}</span>
                           </td>
-                        <td className="px-3 py-5 font-mono text-xs font-black uppercase tracking-tight">
+                        <td className="px-2 py-3.5 font-mono text-xs font-black uppercase tracking-tight">
                           {displaySymbol}
                         </td>
-                          <td className="px-3 py-5 font-mono text-xs opacity-60">
+                          <td className="px-2 py-3.5 font-mono text-xs opacity-60">
                           {contracts < 1 ? contracts.toFixed(8) : contracts.toFixed(4)}
                           </td>
-                          <td className="px-3 py-5 font-mono text-xs opacity-60">
+                          <td className="px-2 py-3.5 font-mono text-xs opacity-60">
                              ${formatPrice(h.entryPrice)}
                           </td>
-                          <td className="px-3 py-5 font-mono text-xs font-bold">
+                          <td className="px-2 py-3.5 font-mono text-xs font-bold">
                           ${formatPrice(mark)}
                           </td>
-                          <td className="px-3 py-5 font-mono text-xs font-bold">
+                          <td className="px-2 py-3.5 font-mono text-xs font-bold">
                           ${margin.toFixed(2)}
                         </td>
-                        <td className="px-3 py-5 font-mono text-xs font-bold">
+                        <td className="px-2 py-3.5 font-mono text-xs font-bold">
                           ${notional.toFixed(2)}
                         </td>
-                          <td className={`px-3 py-5 font-black text-sm ${pnlVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                          <td className={`px-2 py-3.5 font-black text-sm ${pnlVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                              {pnlVal >= 0 ? '+' : ''}${pnlVal.toFixed(2)}
                         </td>
-                        <td className={`px-3 py-5 font-black text-sm ${pnlPctVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                        <td className={`px-2 py-3.5 font-black text-sm ${pnlPctVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                           {pnlPctVal >= 0 ? '+' : ''}{pnlPctVal.toFixed(2)}%
                           </td>
-                          <td className="px-3 py-5 text-right">
+                          <td className="px-2 py-3.5 text-right">
                              <button 
                                onClick={(e) => {
                                  e.stopPropagation();
