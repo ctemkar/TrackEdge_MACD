@@ -533,6 +533,14 @@ export default function App() {
     }
   }, [pruneUnsupportedScanSymbols]);
 
+  const isUnsupportedLiveScanSymbol = React.useCallback((value: string) => {
+    const normalized = String(value || '').toUpperCase().replace(/[/:]/g, '');
+    if (!normalized) return false;
+    if (knownUnsupportedLiveSymbols.has(normalized)) return true;
+    const blockedUntil = pruneUnsupportedScanSymbols()[normalized] || 0;
+    return blockedUntil > Date.now();
+  }, [knownUnsupportedLiveSymbols, pruneUnsupportedScanSymbols]);
+
   React.useEffect(() => {
     if (!autoTrade) {
       scanningRef.current = false;
@@ -2005,7 +2013,9 @@ export default function App() {
       const isLiveBinance = isRealMode && serverConfig?.exchange === 'binance';
       const baseSymbol = isRealMode ? liveNormalized(symbol) : symbol;
       const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
-      let symbolsToScan = Array.from(new Set([baseSymbol, ...candidateValues]));
+      let symbolsToScan = isLiveBinance
+        ? Array.from(new Set(candidateValues))
+        : Array.from(new Set([baseSymbol, ...candidateValues]));
 
       if (isLiveBinance && !fullUniverseMode) {
         const beforeFilter = symbolsToScan.length;
@@ -2020,16 +2030,8 @@ export default function App() {
       }
 
       if (isLiveBinance) {
-        const blockedSymbols = pruneUnsupportedScanSymbols();
         const beforeBlockedFilter = symbolsToScan.length;
-        symbolsToScan = symbolsToScan.filter(v => {
-          const normalized = String(v || '').toUpperCase().replace(/[/:]/g, '');
-          if (knownUnsupportedLiveSymbols.has(normalized)) {
-            return false;
-          }
-          const blockedUntil = blockedSymbols[normalized] || 0;
-          return blockedUntil <= Date.now();
-        });
+        symbolsToScan = symbolsToScan.filter(v => !isUnsupportedLiveScanSymbol(v));
         if (symbolsToScan.length < beforeBlockedFilter) {
           console.log(`[Scanner] Skipped ${beforeBlockedFilter - symbolsToScan.length} unsupported symbols already rejected by market validation`);
         }
@@ -2107,6 +2109,7 @@ export default function App() {
           .filter(r => r.signal.overall === 'BUY')
           .filter(r => !isRealMode || hasAllowedQuote(r.symbol))
           .filter(r => !isLiveBinance || isLikelyBinanceFuturesSymbol(r.symbol))
+          .filter(r => !isLiveBinance || !isUnsupportedLiveScanSymbol(r.symbol))
           .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
           .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now());
 
@@ -2115,6 +2118,7 @@ export default function App() {
               .filter(r => r.signal.overall === 'SELL')
               .filter(r => hasAllowedQuote(r.symbol))
               .filter(r => !isLiveBinance || isLikelyBinanceFuturesSymbol(r.symbol))
+              .filter(r => !isLiveBinance || !isUnsupportedLiveScanSymbol(r.symbol))
               .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
               .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now())
           : [];
@@ -2160,6 +2164,10 @@ export default function App() {
               );
             }
             for (const { side, pick } of selectedTrades) {
+              if (isLiveBinance && isUnsupportedLiveScanSymbol(pick.symbol)) {
+                pushScanSkipEvent(`SKIP: ${pick.symbol} blocked by unsupported market quarantine`, cycleId);
+                continue;
+              }
               const entryType = side === 'BUY' ? 'LONG' : 'SHORT';
               await executeTrade(side, pick.symbol, pick.lastPrice, `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`, undefined, cycleId);
               if (!autoTradeRef.current || entryLockUntilRef.current > Date.now()) break;
@@ -2183,7 +2191,7 @@ export default function App() {
       setScanning(false);
       setTimeout(() => setIsBotActive(false), 2000);
     }
-  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, liveEntriesPerCycle, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode, knownUnsupportedLiveSymbols, pruneUnsupportedScanSymbols]);
+  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, liveEntriesPerCycle, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode, isUnsupportedLiveScanSymbol]);
  // Removed 'scanning' from dependencies
 
   const resetAccount = React.useCallback(() => {
