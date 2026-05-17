@@ -69,16 +69,19 @@ export async function fetchAllSymbols(options?: FetchAllSymbolsOptions): Promise
       throw err;
     }
 
+    const nonTradableBaseAssets = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
     const symbols = Array.isArray(data?.symbols) ? data.symbols : [];
     const mapped = symbols
       .filter((s: any) => {
         const status = String(s?.status || '').toUpperCase();
+        const base = String(s?.baseAsset || '').toUpperCase();
         const quote = String(s?.quoteAsset || '').toUpperCase();
         const symbol = String(s?.symbol || '').toUpperCase();
         const hasAllowedQuote = fullUniverse
           ? true
           : (quote ? allowedQuotes.has(quote) : Array.from(allowedQuotes).some(q => symbol.endsWith(q)));
-        return status === 'TRADING' && hasAllowedQuote;
+        const hasTradableBase = !base || !nonTradableBaseAssets.has(base);
+        return status === 'TRADING' && hasAllowedQuote && hasTradableBase;
       })
       .map((s: any) => ({
         label: s.symbol,

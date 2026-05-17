@@ -52,11 +52,11 @@ const CRITERIA_HELP: Record<string, string> = {
 
 const PARAMETER_DEFAULTS = {
   maxConcurrentTrades: 15,
-  takeProfitPercent: 15,
-  stopLossPercent: 5,
+  takeProfitPercent: 8,
+  stopLossPercent: 3.5,
   maxDrawdownPercent: 10,
   isDefensiveMode: false,
-  autoEntryMinScore: 4,
+  autoEntryMinScore: 6,
   liveMinOrderNotional: 10,
   liveQuoteAllowlistInput: 'USDT,USDC',
   scanIntervalSec: 40,
@@ -64,7 +64,7 @@ const PARAMETER_DEFAULTS = {
   maxSymbolsPerScan: 1500,
   duplicateOrderLockoutSec: 45,
   liveEntryDelayMs: 900,
-  liveEntriesPerCycle: 3,
+  liveEntriesPerCycle: 1,
   minPaperAllocation: 25,
   softCooldownMinutes: 30,
   successCooldownMinutes: 45,
@@ -74,6 +74,21 @@ const PARAMETER_DEFAULTS = {
   hardFailureLockMinutes: 120,
   fullUniverseMode: false,
 } as const;
+
+const NON_TRADABLE_QUOTE_BASES = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
+
+const getCompactUsdSymbolParts = (raw: string): { compact: string; base: string; quote: string } | null => {
+  const compact = String(raw || '').toUpperCase().split(':')[0].replace('/', '');
+  const match = compact.match(/^([A-Z0-9]+?)(USDT|USDC|USD)$/);
+  if (!match) return null;
+  return { compact, base: match[1], quote: match[2] };
+};
+
+const isNonTradableQuoteBaseSymbol = (raw: string) => {
+  const parts = getCompactUsdSymbolParts(raw);
+  if (!parts) return true;
+  return /(?:USDT|USDC|USD){2,}$/.test(parts.compact) || NON_TRADABLE_QUOTE_BASES.has(parts.base);
+};
 
 const CriteriaInfoLabel = ({ text, detail }: { text: string; detail: string }) => {
   const [isOpen, setIsOpen] = useState(false);
@@ -176,11 +191,11 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [stopLossPercent, setStopLossPercent] = useState(() => {
     const saved = localStorage.getItem('te_stop_loss_percent');
-    return saved ? (parseFloat(saved) || 5) : 5;
+    return saved ? (parseFloat(saved) || 3.5) : 3.5;
   });
   const [takeProfitPercent, setTakeProfitPercent] = useState(() => {
     const saved = localStorage.getItem('te_take_profit_percent');
-    return saved ? (parseFloat(saved) || 15) : 15;
+    return saved ? (parseFloat(saved) || 8) : 8;
   });
   const [autoEntryMinScore, setAutoEntryMinScore] = useState(() => {
     const saved = localStorage.getItem('te_auto_entry_min_score');
@@ -742,9 +757,18 @@ export default function App() {
         const syncedBalance = Number.isFinite(liveEquity) && liveEquity > 0 ? liveEquity : usdt;
         const syncedAvailable = Number.isFinite(liveAvailable) && liveAvailable >= 0 ? liveAvailable : usdt;
         const syncedUnrealized = Number(data?.unrealizedPnl);
+        const nextFilteredSyncSymbols = Array.isArray(data?.filteredSymbols)
+          ? data.filteredSymbols
+              .map((entry: any) => ({
+                symbol: String(entry?.symbol || '').toUpperCase(),
+                reason: String(entry?.reason || 'quote asset cross or malformed symbol'),
+              }))
+              .filter((entry: { symbol: string; reason: string }) => Boolean(entry.symbol))
+          : [];
         setBalance(syncedBalance);
         setAvailableFunds(syncedAvailable);
         setLiveUnrealizedPnl(Number.isFinite(syncedUnrealized) ? syncedUnrealized : 0);
+        setFilteredSyncSymbols(nextFilteredSyncSymbols);
         setServerConfig(prev => prev ? {
           ...prev,
           binanceRouteHealth: data?.binanceRouteHealth || prev.binanceRouteHealth,
@@ -788,9 +812,10 @@ export default function App() {
             let normalizedSymbol = fromInfoSymbol || (coinUpper.endsWith('USD') || coinUpper.endsWith('USDT') || coinUpper.endsWith('USDC')
               ? coinUpper
               : (data.exchange === 'binance' ? `${coinUpper}USDT` : `${coinUpper}USD`));
+            const symbolMatch = getCompactUsdSymbolParts(normalizedSymbol);
 
-            // STRICT VALIDATION: Reject malformed symbols (repeated quote assets like USDTUSDTUSDT)
-            if (!/^[A-Z0-9]+(USDT|USDC|USD)$/.test(normalizedSymbol) || /USDT.*USDT|USDC.*USDC/.test(normalizedSymbol)) {
+            // STRICT VALIDATION: Reject malformed symbols and quote-asset crosses like USDCUSDT.
+            if (!symbolMatch || isNonTradableQuoteBaseSymbol(normalizedSymbol)) {
               console.warn(`[TradeEdge] Rejecting malformed symbol: "${normalizedSymbol}" (doesn't match valid trading pair format)`);
               return null;
             }
@@ -929,9 +954,9 @@ export default function App() {
       return;
     }
 
-    // Reject malformed symbols (e.g., USDTUSDTUSDT, symbols with repeated quotes)
-    if (/USDT.*USDT|USDC.*USDC/.test(tradeSymbol)) {
-      addLog(`TRADE ABORTED: Malformed symbol "${tradeSymbol}" (repeated quote asset)`, 'warning');
+    // Reject malformed symbols and quote-asset crosses like USDCUSDT.
+    if (isNonTradableQuoteBaseSymbol(tradeSymbol)) {
+      addLog(`TRADE ABORTED: ${tradeSymbol} is not a tradable futures position. USDT remains cash available for trading.`, 'warning');
       setExecutionFeedback({ type: 'warning', message: `${type} blocked: invalid symbol "${tradeSymbol}".` });
       pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: Malformed symbol', status: 'SKIPPED', cycleId: eventCycleId });
       return;
@@ -1617,6 +1642,7 @@ export default function App() {
     hold: 0,
     updatedAt: 0,
   });
+  const [filteredSyncSymbols, setFilteredSyncSymbols] = useState<Array<{ symbol: string; reason: string }>>([]);
 
   const formatPrice = (price: number) => {
     if (price === 0) return '0.00';
@@ -1994,14 +2020,31 @@ export default function App() {
     try {
       setScanProgress({ current: 0, total: 0 });
       let allSymbols: { label: string; value: string }[];
+      let liveTradableSymbols = new Set<string>();
       try {
-        allSymbols = await fetchAllSymbols({
-          includeSpot: true,
-          includeFutures: true,
-          fullUniverse: true,
-          allowedQuotes: liveQuoteAllowlist,
-          forceBinancePublic: true,
-        });
+        const [universeSymbols, futuresOnlySymbols] = await Promise.all([
+          fetchAllSymbols({
+            includeSpot: true,
+            includeFutures: true,
+            fullUniverse: true,
+            allowedQuotes: liveQuoteAllowlist,
+            forceBinancePublic: true,
+          }),
+          fetchAllSymbols({
+            includeSpot: false,
+            includeFutures: true,
+            fullUniverse: true,
+            allowedQuotes: liveQuoteAllowlist,
+            forceBinancePublic: true,
+          }),
+        ]);
+        allSymbols = universeSymbols;
+        liveTradableSymbols = new Set(
+          futuresOnlySymbols.map(s => {
+            const normalized = String(s.value || '').toUpperCase();
+            return normalized.endsWith('USD') && !normalized.endsWith('USDT') ? `${normalized}T` : normalized;
+          })
+        );
       } catch (err: any) {
         const retryAt: number = err?.retryAt || 0;
         if (retryAt > Date.now()) {
@@ -2017,9 +2060,17 @@ export default function App() {
       }
       const allValues = allSymbols.map(s => s.value);
       const liveNormalized = (v: string) => (v.toUpperCase().endsWith('USD') && !v.toUpperCase().endsWith('USDT') ? `${v}T` : v);
+      const nonTradableStableBases = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
       const hasAllowedQuote = (v: string) => {
         const up = v.toUpperCase();
-        return liveQuoteAllowlist.some(q => up.endsWith(q));
+        return liveQuoteAllowlist.some((q: string) => up.endsWith(q));
+      };
+      const hasTradableBase = (v: string) => {
+        const up = v.toUpperCase();
+        const quote = liveQuoteAllowlist.find((q: string) => up.endsWith(q)) || (up.endsWith('FDUSD') ? 'FDUSD' : '');
+        if (!quote) return true;
+        const base = up.slice(0, -quote.length);
+        return Boolean(base) && !nonTradableStableBases.has(base);
       };
       const isLikelyBinanceFuturesSymbol = (v: string) => {
         const up = v.toUpperCase();
@@ -2027,11 +2078,13 @@ export default function App() {
         return validSuffixes.test(up) && up.length < 20 && !/[^A-Z0-9]/.test(up);
       };
       const isLikelyBinanceSymbol = (v: string) => /^[A-Z0-9]{5,24}$/.test(v.toUpperCase());
-      const isLiveBinance = isRealMode && serverConfig?.exchange === 'binance';
+      const normalizedLiveExchange = String(serverConfig?.exchange || '').toLowerCase();
+      const isLiveBinance = isRealMode && normalizedLiveExchange === 'binance';
       const baseSymbol = isRealMode ? liveNormalized(symbol) : symbol;
       const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
+      const isLiveTradableFuturesSymbol = (value: string) => liveTradableSymbols.size === 0 || liveTradableSymbols.has(value.toUpperCase());
       let symbolsToScan = isLiveBinance
-        ? Array.from(new Set(candidateValues)).filter(isLikelyBinanceSymbol)
+        ? Array.from(new Set(candidateValues)).filter(value => isLikelyBinanceSymbol(value) && hasTradableBase(value))
         : Array.from(new Set([baseSymbol, ...candidateValues]));
 
       if (symbolsToScan.length === 0) {
@@ -2124,6 +2177,7 @@ export default function App() {
         const potentialLongs = results
           .filter(r => r.signal.overall === 'BUY')
           .filter(r => !isLiveBinance || isLikelyBinanceFuturesSymbol(r.symbol))
+          .filter(r => !isLiveBinance || isLiveTradableFuturesSymbol(r.symbol))
           .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
           .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now());
 
@@ -2131,6 +2185,7 @@ export default function App() {
           ? results
               .filter(r => r.signal.overall === 'SELL')
               .filter(r => !isLiveBinance || isLikelyBinanceFuturesSymbol(r.symbol))
+              .filter(r => !isLiveBinance || isLiveTradableFuturesSymbol(r.symbol))
               .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
               .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now())
           : [];
@@ -2184,6 +2239,14 @@ export default function App() {
               );
             }
             for (const { side, pick } of selectedTrades) {
+              if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
+                pushScanSkipEvent(`SKIP: ${pick.symbol} blocked because quote assets are treated as cash, not tradable base positions`, cycleId);
+                continue;
+              }
+              if (isLiveBinance && !isLiveTradableFuturesSymbol(pick.symbol)) {
+                pushScanSkipEvent(`SKIP: ${pick.symbol} not present in Binance futures tradable symbol set`, cycleId);
+                continue;
+              }
               if (isLiveBinance && isUnsupportedLiveScanSymbol(pick.symbol)) {
                 pushScanSkipEvent(`SKIP: ${pick.symbol} blocked by unsupported market quarantine`, cycleId);
                 continue;
@@ -2460,6 +2523,10 @@ export default function App() {
     if (scanSignalSummary.updatedAt === 0) return 'No completed scan cycle yet in this session.';
     return `Last completed scan at ${new Date(scanSignalSummary.updatedAt).toLocaleTimeString()}.`;
   })();
+  const filteredSyncSymbolsPreview = filteredSyncSymbols.slice(0, 3).map((entry: { symbol: string; reason: string }) => entry.symbol).join(', ');
+  const filteredSyncNote = filteredSyncSymbols.length > 0
+    ? `Exchange sync filtered ${filteredSyncSymbols.length} non-tradable raw symbol${filteredSyncSymbols.length === 1 ? '' : 's'}${filteredSyncSymbolsPreview ? `: ${filteredSyncSymbolsPreview}${filteredSyncSymbols.length > 3 ? ', ...' : ''}.` : '.'} USDT remains available as cash in Cash / Available Funds and is not shown as an active position.`
+    : '';
   
   // Anti-Glitich: If equity is non-finite or impossible, it's a data core issue
   // We cap at $100,000,000 to allow "Whale" mode while still blocking glitches
@@ -2986,6 +3053,11 @@ export default function App() {
             </div>
 
             <p className="mt-2 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanStatusHint}</p>
+            {filteredSyncNote && (
+              <div className="mt-2 border border-amber-200 bg-amber-50/80 px-3 py-2 text-[10px] font-mono text-amber-900">
+                {filteredSyncNote}
+              </div>
+            )}
 
             <div className="mt-2 grid grid-cols-4 gap-2 text-[10px] font-mono uppercase">
               <div className="border border-sky-200 bg-sky-50/60 px-2 py-1">
@@ -3793,6 +3865,9 @@ export default function App() {
                           <Zap size={24} />
                           <p className="text-xs font-mono uppercase tracking-[0.2em]">Awaiting signal confluence. No open vectors.</p>
                           <p className="text-[10px] font-mono normal-case tracking-normal">Live sync currently reports zero active exchange positions.</p>
+                          {filteredSyncNote && (
+                            <p className="max-w-xl text-[10px] font-mono normal-case tracking-normal text-amber-700 opacity-100">{filteredSyncNote}</p>
+                          )}
                         </div>
                       </td>
                     </tr>

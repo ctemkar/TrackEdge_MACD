@@ -244,8 +244,8 @@ export function evaluateStrategy(
   if (!extremeVolatility) shortChecks += 1;
   if (shortRiskReward >= 1.5) shortChecks += 1;
 
-  const longQuality = longBase && longChecks >= 4;
-  const shortQuality = shortBase && shortChecks >= 4;
+  const longQuality = longBase && longChecks >= 5;
+  const shortQuality = shortBase && shortChecks >= 5;
 
   let overall: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
   let score = 0;

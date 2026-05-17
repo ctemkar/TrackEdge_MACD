@@ -27,6 +27,7 @@ async function startServer() {
     orders: 'UNKNOWN',
     updatedAt: 0,
   };
+  const nonTradableQuoteBases = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
 
   // Rate-limit state: tracks when Binance bans expire + consecutive failure count for backoff
   const rateLimitState = {
@@ -66,6 +67,19 @@ async function startServer() {
     if (level === 'warn') console.warn(message);
     else if (level === 'error') console.error(message);
     else console.log(message);
+  };
+
+  const getCompactUsdSymbolParts = (raw: string): { compact: string; base: string; quote: string } | null => {
+    const compact = String(raw || '').toUpperCase().split(':')[0].replace('/', '');
+    const match = compact.match(/^([A-Z0-9]+?)(USDT|USDC|USD)$/);
+    if (!match) return null;
+    return { compact, base: match[1], quote: match[2] };
+  };
+
+  const isNonTradableQuoteBaseSymbol = (raw: string) => {
+    const parts = getCompactUsdSymbolParts(raw);
+    if (!parts) return true;
+    return /(?:USDT|USDC|USD){2,}$/.test(parts.compact) || nonTradableQuoteBases.has(parts.base);
   };
 
   const isBinanceAuthErrorMessage = (message: string) => {
@@ -685,6 +699,14 @@ async function startServer() {
         initialMargin?: number,
         leverage?: number,
       }> = {};
+      const filteredSymbols: Array<{ symbol: string; reason: string }> = [];
+      const rememberFilteredSymbol = (symbol: string, reason: string) => {
+        const normalized = String(symbol || '').toUpperCase();
+        if (!normalized) return;
+        if (!filteredSymbols.some((entry) => entry.symbol === normalized && entry.reason === reason)) {
+          filteredSymbols.push({ symbol: normalized, reason });
+        }
+      };
 
       // CCXT standard: b.total contains all balances (coin: amount)
       const totalBalances = b.total || {};
@@ -760,21 +782,27 @@ async function startServer() {
           if (!symbolRaw) return;
           const compact = symbolRaw.split(':')[0].replace('/', '');
           const normalized = /(USDT|USDC|USD)$/.test(compact) ? compact : `${compact}USDT`;
-          const hasCompositeQuoteSuffix = /(?:USDT|USDC|USD){2,}$/.test(normalized);
+          const symbolMatch = getCompactUsdSymbolParts(normalized);
           
-          // STRICT VALIDATION: Reject malformed symbols (repeated quote assets like USDTUSDTUSDT)
-          if (!/^[A-Z0-9]+(USDT|USDC|USD)$/.test(normalized) || hasCompositeQuoteSuffix) {
-            console.warn(`[TradeEdge] Rejecting malformed symbol: "${normalized}" (doesn't match valid trading pair format)`);
+          // STRICT VALIDATION: Reject malformed symbols and quote-asset crosses like USDCUSDT.
+          if (!symbolMatch || isNonTradableQuoteBaseSymbol(normalized)) {
+            rememberFilteredSymbol(normalized, 'quote asset cross or malformed symbol');
+            logWithThrottle(
+              'warn',
+              `sync-invalid-position-${normalized}`,
+              `[TradeEdge] Rejecting malformed symbol: "${normalized}" (doesn't match valid trading pair format)`,
+              60 * 1000,
+            );
             return;
           }
 
           const displaySymbol = String(input?.symbol || '').includes('/')
             ? String(input?.symbol)
-            : (normalized.endsWith('USDT')
-              ? `${normalized.slice(0, -4)}/USDT:USDT`
-              : normalized.endsWith('USDC')
-                ? `${normalized.slice(0, -4)}/USDC:USDC`
-                : `${normalized.slice(0, -3)}/USD:USD`);
+            : (symbolMatch.quote === 'USDT'
+              ? `${symbolMatch.base}/USDT:USDT`
+              : symbolMatch.quote === 'USDC'
+                ? `${symbolMatch.base}/USDC:USDC`
+                : `${symbolMatch.base}/USD:USD`);
 
           allPositions[normalized] = {
             amount: contracts,
@@ -890,8 +918,9 @@ async function startServer() {
               const umPnl = Number(asset.umUnrealizedPNL || 0);
               if (symbol && (umBal !== 0 || umPnl !== 0)) {
                 const normalizedAssetSymbol = /(USDT|USDC|USD)$/.test(symbol) ? symbol : `${symbol}USDT`;
-                const symbolMatch = normalizedAssetSymbol.match(/^([A-Z0-9]+?)(USDT|USDC|USD)$/);
-                if (!symbolMatch || /(?:USDT|USDC|USD){2,}$/.test(normalizedAssetSymbol)) {
+                const symbolMatch = getCompactUsdSymbolParts(normalizedAssetSymbol);
+                if (!symbolMatch || isNonTradableQuoteBaseSymbol(normalizedAssetSymbol) || QUOTE_ASSETS.has(symbolMatch.base)) {
+                  rememberFilteredSymbol(normalizedAssetSymbol, 'quote asset cross or malformed symbol');
                   logWithThrottle(
                     'warn',
                     `sync-um-skip-malformed-${normalizedAssetSymbol}`,
@@ -900,8 +929,7 @@ async function startServer() {
                   );
                   return;
                 }
-                const [, base, quote] = symbolMatch;
-                const displaySymbol = `${base}/${quote}:${quote}`;
+                const displaySymbol = `${symbolMatch.base}/${symbolMatch.quote}:${symbolMatch.quote}`;
                 console.log(`[TradeEdge Sync] UM Asset: ${symbol} balance=${umBal} pnl=${umPnl}`);
                 upsertPosition({
                   symbol: displaySymbol,
@@ -1142,6 +1170,7 @@ async function startServer() {
         binanceRouteHealth,
         unrealizedPnl: Number.isFinite(totalUnrealizedPnl) ? totalUnrealizedPnl : 0,
         positions: allPositions,
+        filteredSymbols: client.id === 'binance' ? filteredSymbols : [],
         raw: { info: balanceData.info },
         _debug: process.env.NODE_ENV === 'development' ? { 
           positionsCount: Object.keys(allPositions).length, 
@@ -1207,6 +1236,16 @@ async function startServer() {
 
       const { symbol, side, amount, positionSide, reduceOnly } = req.body;
       const client = getExchange();
+      const normalizedSymbol = String(symbol || '').toUpperCase().replace('/', '').replace(':', '');
+
+      if (isNonTradableQuoteBaseSymbol(normalizedSymbol)) {
+        unsupportedSymbolSkips.set(normalizedSymbol, {
+          count: (unsupportedSymbolSkips.get(normalizedSymbol)?.count || 0) + 1,
+          until: Date.now() + (1000 * 60 * 15),
+          reason: 'quote asset cross not tradable',
+        });
+        throw new Error(`UNSUPPORTED MARKET: ${normalizedSymbol} is a quote-asset cross and cannot be opened as a futures position.`);
+      }
       
       let ccxtSymbol = symbol.toUpperCase();
       const isGemini = client.id.toLowerCase().includes('gemini');
