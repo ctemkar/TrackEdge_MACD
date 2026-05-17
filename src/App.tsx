@@ -1857,6 +1857,7 @@ export default function App() {
     paperLossCooldownMinutes,
     duplicateOrderLockoutSec,
     liveEntryDelayMs,
+    liveEntriesPerCycle,
     minPaperAllocation,
     lowMarginLockMinutes,
     closeFailureLockMinutes,
