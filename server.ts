@@ -1694,6 +1694,8 @@ async function startServer() {
     }
     try {
       const { symbol, interval, limit } = req.query;
+      const source = String(req.query.source || '').toLowerCase();
+      const forceBinancePublic = source === 'binance_public';
       const usePrivateGemini = preferGemini() && hasConfiguredKeys();
 
       if (usePrivateGemini) {
@@ -1713,6 +1715,32 @@ async function startServer() {
         const mapped = ohlcv.map(c => [c[0], c[1].toString(), c[2].toString(), c[3].toString(), c[4].toString(), c[5].toString(), c[0], "0", 1, "0", "0", "0"]);
         return res.json(mapped);
       } else {
+        if (forceBinancePublic) {
+          const nowPublic = Date.now();
+          const blockedUntilPublic = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+          if (blockedUntilPublic > nowPublic) return res.json([]);
+
+          const endpoints = [
+            `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
+            `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
+          ];
+
+          for (const binanceUrl of endpoints) {
+            const response = await fetch(binanceUrl);
+            if (response.ok) return res.json(await response.json());
+            if (response.status === 418 || response.status === 429) {
+              const body: any = await response.json().catch(() => ({}));
+              const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
+              if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
+              else rateLimitState.backoffUntil = Date.now() + 60000;
+              console.warn(`[TradeEdge RateLimit] klines Binance public source rate limited`);
+              break;
+            }
+          }
+
+          return res.json([]);
+        }
+
         // Try Bybit first (primary price source)
         const bybitCandles = await fetchBybitKlines(String(symbol), String(interval || '1d'), Number(limit) || 500);
         if (bybitCandles) {
@@ -1759,6 +1787,8 @@ async function startServer() {
       return res.status(429).json({ status: 'rate_limited', symbols: [], bannedUntil: blockedUntil });
     }
     try {
+      const source = String(req.query.source || '').toLowerCase();
+      const forceBinancePublic = source === 'binance_public';
       const usePrivateGemini = preferGemini() && hasConfiguredKeys();
       if (usePrivateGemini) {
         const client = getExchange();
@@ -1802,8 +1832,8 @@ async function startServer() {
           throw new Error(`Binance exchangeInfo failed (${marketType})`);
         };
 
-        // Try Bybit first (primary symbol source)
-        const bybitSymbolsPrimary = await fetchBybitSymbols();
+        // For scan-only mode, bypass Bybit and use Binance public metadata directly.
+        const bybitSymbolsPrimary = forceBinancePublic ? [] : await fetchBybitSymbols();
         const deduped = new Map<string, any>();
         if (bybitSymbolsPrimary.length > 0) {
           bybitSymbolsPrimary.forEach(s => deduped.set(s.symbol, s));
@@ -1834,6 +1864,8 @@ async function startServer() {
 
   app.get('/api/binance/proxy/ticker24hr', async (req, res) => {
     try {
+      const source = String(req.query.source || '').toLowerCase();
+      const forceBinancePublic = source === 'binance_public';
       const usePrivateGemini = preferGemini() && hasConfiguredKeys();
       if (usePrivateGemini) {
         const client = getExchange();
@@ -1846,6 +1878,13 @@ async function startServer() {
         }));
         return res.json(mapped);
       } else {
+        if (forceBinancePublic) {
+          const url = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
+          const response = await fetch(url);
+          if (response.ok) return res.json(await response.json());
+          throw new Error('Binance public ticker failed');
+        }
+
         // Try Bybit first (primary ticker source)
         const bybitTickers = await fetchBybitTickers();
         if (bybitTickers.length > 0) return res.json(bybitTickers);

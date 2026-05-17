@@ -27,7 +27,7 @@ export async function scanMarket(
     const batchPromises = batch.map(async (symbol): Promise<MarketScanResult | null> => {
       if (shouldContinue && !shouldContinue()) return null;
       try {
-        const candles = await fetchBinanceData(symbol, '1d', 500);
+        const candles = await fetchBinanceData(symbol, '1d', 500, { forceBinancePublic: true });
         if (candles.length > 50) {
           // Use closed daily candles for stable crossover signals.
           const signalCandles = candles.length > 2 ? candles.slice(0, -1) : candles;

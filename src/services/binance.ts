@@ -1,13 +1,24 @@
 import { Candle } from './indicators';
 
-export async function fetchBinanceData(symbol: string = 'BTCUSD', interval: string = '1d', limit: number = 500): Promise<Candle[]> {
+type FetchKlinesOptions = {
+  forceBinancePublic?: boolean;
+};
+
+export async function fetchBinanceData(
+  symbol: string = 'BTCUSD',
+  interval: string = '1d',
+  limit: number = 500,
+  options?: FetchKlinesOptions,
+): Promise<Candle[]> {
   try {
     // Normalize to futures-style symbols (BTCUSDT) so proxy/futures endpoints remain valid.
     const raw = String(symbol || 'BTCUSDT').toUpperCase();
     const targetSymbol = raw === 'BTC'
       ? 'BTCUSDT'
       : (raw.endsWith('USD') && !raw.endsWith('USDT') ? `${raw}T` : raw);
-    const response = await fetch(`/api/binance/proxy/klines?symbol=${targetSymbol}&interval=${interval}&limit=${limit}`);
+    const forceBinancePublic = options?.forceBinancePublic === true;
+    const sourceQuery = forceBinancePublic ? '&source=binance_public' : '';
+    const response = await fetch(`/api/binance/proxy/klines?symbol=${targetSymbol}&interval=${interval}&limit=${limit}${sourceQuery}`);
     const data = await response.json();
     if (!Array.isArray(data)) {
       return [];
@@ -32,6 +43,7 @@ type FetchAllSymbolsOptions = {
   includeFutures?: boolean;
   fullUniverse?: boolean;
   allowedQuotes?: string[];
+  forceBinancePublic?: boolean;
 };
 
 export async function fetchAllSymbols(options?: FetchAllSymbolsOptions): Promise<{ label: string, value: string }[]> {
@@ -44,7 +56,9 @@ export async function fetchAllSymbols(options?: FetchAllSymbolsOptions): Promise
       : ['USDT', 'USDC'];
     const allowedQuotes = new Set(quoteSource.map(q => String(q || '').toUpperCase()).filter(Boolean));
 
-    const response = await fetch(`/api/binance/proxy/exchangeInfo?includeSpot=${includeSpot ? '1' : '0'}&includeFutures=${includeFutures ? '1' : '0'}`);
+    const forceBinancePublic = options?.forceBinancePublic === true;
+    const sourceQuery = forceBinancePublic ? '&source=binance_public' : '';
+    const response = await fetch(`/api/binance/proxy/exchangeInfo?includeSpot=${includeSpot ? '1' : '0'}&includeFutures=${includeFutures ? '1' : '0'}${sourceQuery}`);
     const data = await response.json();
 
     // Rate limited — attach retry time so callers can surface it
@@ -87,9 +101,11 @@ export async function fetchAllSymbols(options?: FetchAllSymbolsOptions): Promise
     return [];
   }
 }
-export async function fetchTopSymbolsByVolume(limit: number = 20): Promise<string[]> {
+export async function fetchTopSymbolsByVolume(limit: number = 20, options?: { forceBinancePublic?: boolean }): Promise<string[]> {
   try {
-    const response = await fetch('/api/binance/proxy/ticker24hr');
+    const forceBinancePublic = options?.forceBinancePublic === true;
+    const sourceQuery = forceBinancePublic ? '?source=binance_public' : '';
+    const response = await fetch(`/api/binance/proxy/ticker24hr${sourceQuery}`);
     const data = await response.json();
     return data
       .filter((s: any) => ['USDT', 'USDC'].some(q => String(s?.symbol || '').toUpperCase().endsWith(q)))

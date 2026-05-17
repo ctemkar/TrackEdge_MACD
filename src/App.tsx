@@ -1933,6 +1933,7 @@ export default function App() {
           includeFutures: true,
           fullUniverse: fullUniverseMode,
           allowedQuotes: liveQuoteAllowlist,
+          forceBinancePublic: true,
         });
       } catch (err: any) {
         const retryAt: number = err?.retryAt || 0;
@@ -2154,6 +2155,7 @@ export default function App() {
           includeFutures: true,
           fullUniverse: fullUniverseMode,
           allowedQuotes: liveQuoteAllowlist,
+          forceBinancePublic: true,
         });
         setAvailableSymbols(all);
         addLog(`Market Metadata: ${all.length} exchange vectors mapped.`, 'info');
