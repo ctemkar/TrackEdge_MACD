@@ -177,16 +177,23 @@ export function evaluateStrategy(
   const nearResistance = lastCandle.close >= resistanceLevel * (1 - (config.nearResistancePercent / 100));
 
   let overall: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
-  const buySignal = (macdCrossover === 'BULLISH');
-  const sellSignal = (macdCrossover === 'BEARISH');
+  const bullishMacdRegime = macdMode === 'BULLISH' && emaCrossover === 'BULLISH' && trend !== 'DOWN';
+  const bearishMacdRegime = macdMode === 'BEARISH' && emaCrossover === 'BEARISH' && trend !== 'UP';
+  const buySignal = macdCrossover === 'BULLISH' || bullishMacdRegime;
+  const sellSignal = macdCrossover === 'BEARISH' || bearishMacdRegime;
 
   let score = 0;
   if (buySignal) {
     overall = 'BUY';
     score = config.crossoverScore;
+    if (bullishMacdRegime) score += config.contextMacdScore + config.contextEmaScore;
+    if (trend === 'UP') score += config.contextTrendScore;
+    if (volumeConfirmed) score += config.contextVolumeScore;
   } else if (sellSignal) {
     overall = 'SELL';
     score = config.crossoverScore;
+    if (bearishMacdRegime) score += config.contextMacdScore + config.contextEmaScore;
+    if (trend === 'DOWN') score += config.contextTrendScore;
   } else {
     // No crossover: stay flat and only compute context confidence.
     if (trend !== 'NEUTRAL') score += config.contextTrendScore;

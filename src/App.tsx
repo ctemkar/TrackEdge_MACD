@@ -329,7 +329,7 @@ export default function App() {
     direction: ActivePositionSortDirection;
   }
 
-  type ExecutionStatus = 'FILLED' | 'SKIPPED' | 'FAILED';
+  type ExecutionStatus = 'FILLED' | 'SUBMITTED' | 'SKIPPED' | 'FAILED';
   interface TradeEvent {
     type: 'BUY' | 'SELL';
     symbol: string;
@@ -351,6 +351,11 @@ export default function App() {
     groupKey: string;
     repeatCount: number;
   }
+
+  type MarketPickLifecycle = {
+    label: 'Signal Found' | 'Order Submitted' | 'Exchange Confirmed' | 'Watching';
+    className: string;
+  };
 
   const [holdings, setHoldings] = useState<Holding[]>(() => {
     const saved = localStorage.getItem('te_holdings');
@@ -543,7 +548,7 @@ export default function App() {
       setScanExecutionStats(prev => {
         if (normalized.cycleId !== prev.cycleId) return prev;
         const next = { ...prev, attempted: prev.attempted + 1 };
-        if (normalized.status === 'FILLED') next.filled += 1;
+        if (normalized.status === 'FILLED' || normalized.status === 'SUBMITTED') next.filled += 1;
         else if (normalized.status === 'FAILED') next.failed += 1;
         else next.skipped += 1;
         return next;
@@ -993,6 +998,8 @@ export default function App() {
         });
       };
 
+      let amount = 0;
+
       try {
         existingHolding = holdings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
         heldAmount = existingHolding?.amount || 0;
@@ -1002,7 +1009,6 @@ export default function App() {
           (heldSide === 'LONG' && type === 'SELL') ||
           (heldSide === 'SHORT' && type === 'BUY')
         );
-        let amount = 0;
 
         if (closingExisting) {
           amount = heldAmount;
@@ -1120,6 +1126,16 @@ export default function App() {
             const orderId = result?.order?.id || result?.order?.clientOrderId || result?.order?.info?.orderId;
             const msg = `Order accepted by exchange but live position not yet visible${orderId ? ` (order ${orderId})` : ''}.`;
             addLog(`REAL ${type} UNCONFIRMED: ${tradeSymbol} - ${msg}`, 'warning');
+            if (!closingExisting) {
+              applyOptimisticLiveFill(type, tradeSymbol, amount, price, time);
+              setExecutionFeedback({ type: 'info', message: `${type} submitted for ${tradeSymbol}. Awaiting exchange confirmation.` });
+              pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason: `SUBMITTED: ${msg}`, status: 'SUBMITTED', cycleId: eventCycleId });
+              setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * successCooldownMinutes) }));
+              setTimeout(syncRealBalance, 1500);
+              setTimeout(syncRealBalance, 4500);
+              return;
+            }
+
             setExecutionFeedback({ type: 'warning', message: `${type} unconfirmed for ${tradeSymbol}. Will retry on next cycle.` });
             pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason: `UNCONFIRMED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
             if (closingExisting) {
@@ -1254,6 +1270,19 @@ export default function App() {
         if (!isMarginOrFundsFailure && !isAuthFailure) {
           const pendingMsg = `Order submission for ${tradeSymbol} needs delayed confirmation (${msg}).`;
           addLog(`REAL ${type} UNCONFIRMED: ${pendingMsg}`, 'warning');
+          if (!closingExisting && (type === 'BUY' || openingShort)) {
+            const optimisticAmount = amount > 0 ? amount : heldAmount || 0;
+            if (optimisticAmount > 0) {
+              applyOptimisticLiveFill(type, tradeSymbol, optimisticAmount, price, time);
+            }
+            setExecutionFeedback({ type: 'info', message: `${type} submitted for ${tradeSymbol}. Waiting for exchange confirmation.` });
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: optimisticAmount, time, reason: `SUBMITTED: ${msg}`, status: 'SUBMITTED', cycleId: eventCycleId });
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * successCooldownMinutes) }));
+            setTimeout(syncRealBalance, 1500);
+            setTimeout(syncRealBalance, 4500);
+            return;
+          }
+
           setExecutionFeedback({ type: 'warning', message: `${type} unconfirmed for ${tradeSymbol}. Waiting for exchange confirmation.` });
           pushTradeEvent({ type, symbol: tradeSymbol, price, amount: heldAmount || 0, time, reason: `UNCONFIRMED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
           setTimeout(syncRealBalance, 1500);
@@ -1285,9 +1314,18 @@ export default function App() {
         return;
       }
     } else {
-      if (type === 'BUY') {
+      const existingHolding = holdings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
+      const heldSide = existingHolding?.side;
+      const closingExisting = Boolean(existingHolding) && (
+        (heldSide === 'LONG' && type === 'SELL') ||
+        (heldSide === 'SHORT' && type === 'BUY')
+      );
+      const openingShort = type === 'SELL' && !closingExisting;
+      const openingEntry = (type === 'BUY' && !closingExisting) || openingShort;
+
+      if (openingEntry) {
         if (holdings.length >= maxConcurrentTrades) {
-          addLog(`BUY SKIPPED: Max concurrent trades (${maxConcurrentTrades}) reached.`, 'warning');
+          addLog(`${type} SKIPPED: Max concurrent trades (${maxConcurrentTrades}) reached.`, 'warning');
           pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: Max concurrent trades (${maxConcurrentTrades}) reached`, status: 'SKIPPED', cycleId: eventCycleId });
           return;
         }
@@ -1311,10 +1349,10 @@ export default function App() {
         if (useBNBFees && serverConfig?.exchange !== 'gemini') commission *= 0.75; 
 
         setBalance(prev => prev - allocation);
-        setHoldings(prev => [...prev, { id: holdingId, symbol: tradeSymbol, amount, side: 'LONG', entryPrice: price, time }]);
+        setHoldings(prev => [...prev, { id: holdingId, symbol: tradeSymbol, amount, side: openingShort ? 'SHORT' : 'LONG', entryPrice: price, time }]);
         pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason, status: 'FILLED', cycleId: eventCycleId });
-        addLog(`PAPER BUY: ${tradeSymbol} @ $${price} [${reason}]`, 'success');
-        setExecutionFeedback({ type: 'success', message: `Paper BUY filled for ${tradeSymbol}.` });
+        addLog(`PAPER ${openingShort ? 'SHORT' : 'BUY'}: ${tradeSymbol} @ $${price} [${reason}]`, 'success');
+        setExecutionFeedback({ type: 'success', message: `Paper ${openingShort ? 'SHORT' : 'BUY'} filled for ${tradeSymbol}.` });
       } else {
         // If targetId is provided, close ONLY that one. Otherwise close ALL for this symbol.
         const holdingsToClose = targetId 
@@ -1322,27 +1360,32 @@ export default function App() {
           : holdings.filter(h => h.symbol === tradeSymbol);
 
         if (holdingsToClose.length > 0) {
-          let totalFinalSellValue = 0;
+          let totalReleaseValue = 0;
           let totalEntryValue = 0;
           let totalAmount = 0;
+          let totalPnl = 0;
 
           holdingsToClose.forEach(h => {
-             const sellValue = h.amount * price;
+             const exitValue = h.amount * price;
              const entryValue = h.amount * h.entryPrice;
              
              const commissionRate = serverConfig?.exchange === 'gemini' ? 0.004 : 0.001;
-             const sellCommission = sellValue * commissionRate;
-             const finalSellValue = sellValue - sellCommission;
+             const exitCommission = exitValue * commissionRate;
+             const pnlForHolding = h.side === 'SHORT'
+               ? (entryValue - exitValue - exitCommission)
+               : (exitValue - exitCommission - entryValue);
+             const releasedCapital = entryValue + pnlForHolding;
 
-             totalFinalSellValue += finalSellValue;
+             totalReleaseValue += releasedCapital;
              totalEntryValue += entryValue;
              totalAmount += h.amount;
+             totalPnl += pnlForHolding;
           });
 
-          const pnl = totalFinalSellValue - totalEntryValue;
-          const pnlPct = (pnl / totalEntryValue) * 100;
+          const pnl = totalPnl;
+          const pnlPct = totalEntryValue > 0 ? (pnl / totalEntryValue) * 100 : 0;
 
-          setBalance(prev => prev + totalFinalSellValue);
+          setBalance(prev => prev + totalReleaseValue);
           
           if (targetId) {
             setHoldings(prev => prev.filter(h => h.id !== targetId));
@@ -1853,9 +1896,9 @@ export default function App() {
   }, [holdings.length, autoTrade]);
 
   // Market Scanner Logic
-  const performScan = React.useCallback(async () => {
+  const performScan = React.useCallback(async (manual = false) => {
     if (scanningRef.current) return;
-    if (!autoTradeRef.current) return;
+    if (!manual && !autoTradeRef.current) return;
     if (rateLimitedUntilRef.current > Date.now()) {
       setScanProgress({ current: 0, total: 0 });
       return;
@@ -1948,11 +1991,11 @@ export default function App() {
           lastLoggedCount = safeCurrent;
         }
         },
-        () => autoTradeRef.current && rateLimitedUntilRef.current <= Date.now(),
+        () => rateLimitedUntilRef.current <= Date.now() && (manual || autoTradeRef.current),
         strategyConfig,
       );
 
-      if (!autoTradeRef.current || rateLimitedUntilRef.current > Date.now()) {
+      if ((!manual && !autoTradeRef.current) || rateLimitedUntilRef.current > Date.now()) {
         setScanProgress({ current: 0, total: 0 });
         return;
       }
@@ -2235,12 +2278,14 @@ export default function App() {
       });
     }
     
-    // 4. Current Symbol Auto-Buy (if not held and slot available)
-    if (!isRealMode && holdings.length < maxConcurrentTrades && strategy && strategy.overall === 'BUY' && autoTrade && currentPrice && strategy.score >= autoEntryMinScore) {
+    // 4. Current Symbol Auto-Entry (paper mode only)
+    if (!isRealMode && holdings.length < maxConcurrentTrades && strategy && (strategy.overall === 'BUY' || strategy.overall === 'SELL') && autoTrade && currentPrice && strategy.score >= autoEntryMinScore) {
       const isAlreadyHeld = holdings.some(h => h.symbol === symbol);
       const isOnCooldown = cooldowns[symbol] && cooldowns[symbol] > Date.now();
       if (!isAlreadyHeld && !isOnCooldown) {
-        executeTrade('BUY', symbol, currentPrice, `AUTO_ENTRY: CROSSOVER SIGNAL [${strategy.score}/10]`);
+        const entrySide: 'BUY' | 'SELL' = strategy.overall === 'SELL' ? 'SELL' : 'BUY';
+        const entryType = entrySide === 'SELL' ? 'SHORT' : 'LONG';
+        executeTrade(entrySide, symbol, currentPrice, `AUTO_ENTRY: ${entryType} SIGNAL [${strategy.score}/10]`);
       }
     }
   }, [currentPrice, strategy, autoTrade, holdings, symbol, executeTrade, stopLossPercent, takeProfitPercent, maxConcurrentTrades, holdingPrices, cooldowns, isRealMode]);
@@ -2271,7 +2316,12 @@ export default function App() {
     const exchangePnl = Number(h.unrealizedPnl);
     const hasExchangePnl = Number.isFinite(exchangePnl);
     const hasMeaningfulPriceMove = Math.abs(mark - h.entryPrice) > Math.max(Math.abs(h.entryPrice) * 1e-8, 1e-8);
-    const pnl = !hasExchangePnl || (Math.abs(exchangePnl) < 1e-12 && hasMeaningfulPriceMove)
+    const signMismatch = hasExchangePnl
+      && hasMeaningfulPriceMove
+      && Math.abs(computedPnl) > 1e-8
+      && Math.abs(exchangePnl) > 1e-8
+      && Math.sign(computedPnl) !== Math.sign(exchangePnl);
+    const pnl = !hasExchangePnl || signMismatch || (Math.abs(exchangePnl) < 1e-12 && hasMeaningfulPriceMove)
       ? computedPnl
       : exchangePnl;
 
@@ -2463,6 +2513,71 @@ export default function App() {
     { key: 'pnlPct', label: 'P&L %' },
     { key: 'action', label: 'Action Control', rightAlign: true },
   ];
+
+  const heldSymbols = React.useMemo(() => {
+    return new Set(holdings.map(h => String(h.symbol || '').toUpperCase()));
+  }, [holdings]);
+
+  const latestTradeBySymbol = React.useMemo(() => {
+    const latest = new Map<string, TradeEvent>();
+    for (const trade of tradeHistory) {
+      const key = String(trade.symbol || '').toUpperCase();
+      if (!key || latest.has(key)) continue;
+      latest.set(key, trade);
+    }
+    return latest;
+  }, [tradeHistory]);
+
+  const getMarketPickLifecycle = React.useCallback((pick: MarketScanResult): MarketPickLifecycle => {
+    const normalizedSymbol = String(pick.symbol || '').toUpperCase();
+    if (heldSymbols.has(normalizedSymbol)) {
+      return {
+        label: 'Exchange Confirmed',
+        className: 'bg-emerald-100 text-emerald-800',
+      };
+    }
+
+    const latestTrade = latestTradeBySymbol.get(normalizedSymbol);
+    const reason = String(latestTrade?.reason || '').toUpperCase();
+    if (latestTrade?.type === 'BUY' && reason.includes('UNCONFIRMED')) {
+      return {
+        label: 'Order Submitted',
+        className: 'bg-amber-100 text-amber-800',
+      };
+    }
+
+    if (pick.signal.overall === 'BUY') {
+      return {
+        label: 'Signal Found',
+        className: 'bg-sky-100 text-sky-800',
+      };
+    }
+
+    return {
+      label: 'Watching',
+      className: 'bg-gray-100 text-gray-500',
+    };
+  }, [heldSymbols, latestTradeBySymbol]);
+
+  const marketPickLifecycleSummary = React.useMemo(() => {
+    let signalFound = 0;
+    let orderSubmitted = 0;
+    let exchangeConfirmed = 0;
+
+    for (const pick of marketPicks) {
+      const lifecycle = getMarketPickLifecycle(pick);
+      if (pick.signal.overall === 'BUY') signalFound += 1;
+      if (lifecycle.label === 'Order Submitted') orderSubmitted += 1;
+      if (lifecycle.label === 'Exchange Confirmed') exchangeConfirmed += 1;
+    }
+
+    return {
+      signalFound,
+      orderSubmitted,
+      exchangeConfirmed,
+      openPositions: holdings.length,
+    };
+  }, [getMarketPickLifecycle, holdings.length, marketPicks]);
 
   const visibleTradeHistory = tradeHistory.filter(t => {
     // Hide SCAN skips
@@ -2701,7 +2816,7 @@ export default function App() {
               <div className="flex items-center gap-2">
                 <span className="text-[9px] font-mono opacity-40">{scanning ? 'Scanning now' : 'Auto scan ready'}</span>
                 <button 
-                  onClick={performScan} 
+                  onClick={() => performScan(true)} 
                   className="cursor-pointer"
                   disabled={scanning}
                 >
@@ -2741,6 +2856,25 @@ export default function App() {
                 <p className="font-black text-[10px] text-amber-700">{scanExecutionStats.skipped}</p>
               </div>
             </div>
+
+            <div className="mt-2 grid grid-cols-4 gap-2 text-[8px] font-mono uppercase">
+              <div className="border border-sky-200 bg-sky-50/60 px-2 py-1">
+                <span className="opacity-50">Signals Found</span>
+                <p className="font-black text-[10px] text-sky-700">{marketPickLifecycleSummary.signalFound}</p>
+              </div>
+              <div className="border border-amber-200 bg-amber-50/60 px-2 py-1">
+                <span className="opacity-50">Submitted</span>
+                <p className="font-black text-[10px] text-amber-700">{marketPickLifecycleSummary.orderSubmitted}</p>
+              </div>
+              <div className="border border-emerald-200 bg-emerald-50/60 px-2 py-1">
+                <span className="opacity-50">Confirmed</span>
+                <p className="font-black text-[10px] text-emerald-700">{marketPickLifecycleSummary.exchangeConfirmed}</p>
+              </div>
+              <div className="border border-[#F27D26]/30 bg-[#F27D26]/10 px-2 py-1">
+                <span className="opacity-50">Open Positions</span>
+                <p className="font-black text-[10px] text-[#C85E13]">{marketPickLifecycleSummary.openPositions}</p>
+              </div>
+            </div>
           </section>
 
           <section className="bg-white border-2 border-[#141414] p-4 shadow-[8px_8px_0px_0px_#141414]">
@@ -2757,13 +2891,18 @@ export default function App() {
                 <span className="text-right">Action</span>
               </div>
               <div className="space-y-2 max-h-[520px] overflow-y-auto custom-scrollbar pr-2">
-                {marketPicks.slice(0, 150).map((pick) => (
+                {marketPicks.slice(0, 150).map((pick) => {
+                  const lifecycle = getMarketPickLifecycle(pick);
+                  return (
                   <div key={pick.symbol} className="grid grid-cols-5 items-center group py-1.5 hover:bg-gray-50/50 px-2 border-b border-gray-50 transition-colors">
                     <button 
                       onClick={() => setSymbol(pick.symbol)}
-                      className="text-[10px] font-black hover:text-[#F27D26] transition-colors text-left"
+                      className="flex flex-col items-start text-left text-[10px] font-black hover:text-[#F27D26] transition-colors"
                     >
-                      {pick.symbol.replace('USDT', '')}
+                      <span>{pick.symbol.replace('USDT', '')}</span>
+                      <span className={`mt-1 rounded-sm px-1.5 py-0.5 text-[7px] font-black uppercase tracking-wide ${lifecycle.className}`}>
+                        {lifecycle.label}
+                      </span>
                     </button>
                     
                     <div className="text-center flex flex-col">
@@ -2796,15 +2935,15 @@ export default function App() {
 
                     <div className="flex justify-end">
                       <button 
-                        onClick={() => executeTrade('BUY', pick.symbol, pick.lastPrice, `AI_DISCOVERY_${pick.signal.score}`)}
-                        disabled={entryLockActive || holdings.length >= maxConcurrentTrades || holdings.some(h => h.symbol === pick.symbol)}
+                        onClick={() => executeTrade(pick.signal.overall === 'SELL' ? 'SELL' : 'BUY', pick.symbol, pick.lastPrice, `AI_${pick.signal.overall}_DISCOVERY_${pick.signal.score}`)}
+                        disabled={pick.signal.overall === 'HOLD' || entryLockActive || holdings.length >= maxConcurrentTrades || holdings.some(h => h.symbol === pick.symbol)}
                         className="text-[#141414] hover:bg-[#F27D26] hover:text-white border border-[#141414]/10 text-[7px] px-2 py-0.5 font-bold uppercase transition-all disabled:opacity-0"
                       >
-                        Execute
+                        {pick.signal.overall === 'SELL' ? 'Short' : pick.signal.overall === 'BUY' ? 'Long' : 'Hold'}
                       </button>
                     </div>
                   </div>
-                ))}
+                )})}
               </div>
             </div>
           </section>
@@ -3597,9 +3736,11 @@ export default function App() {
                                     <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-sm ${
                                       (trade.status || 'FILLED') === 'FILLED'
                                         ? 'bg-emerald-100 text-emerald-700'
-                                        : (trade.status || 'FILLED') === 'SKIPPED'
-                                          ? 'bg-amber-100 text-amber-700'
-                                          : 'bg-rose-100 text-rose-700'
+                                        : (trade.status || 'FILLED') === 'SUBMITTED'
+                                          ? 'bg-sky-100 text-sky-700'
+                                          : (trade.status || 'FILLED') === 'SKIPPED'
+                                            ? 'bg-amber-100 text-amber-700'
+                                            : 'bg-rose-100 text-rose-700'
                                     }`}>
                                       {trade.status || 'FILLED'}
                                     </span>
