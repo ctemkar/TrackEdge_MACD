@@ -1977,15 +1977,6 @@ export default function App() {
         symbolsToScan = symbolsToScan.filter(isLikelyBinanceSymbol);
       }
 
-      if (isLiveBinance && !fullUniverseMode) {
-        const cap = Math.max(20, Math.min(2000, maxSymbolsPerScan));
-        const reduced = symbolsToScan.slice(0, Math.min(cap, symbolsToScan.length));
-        if (baseSymbol && !reduced.includes(baseSymbol) && reduced.length > 0) {
-          reduced[reduced.length - 1] = baseSymbol;
-        }
-        symbolsToScan = Array.from(new Set(reduced));
-      }
-
       if (symbolsToScan.length === 0) {
         setScanProgress({ current: 0, total: 0 });
         addLog('Scanner idle: no symbols available to scan.', 'warning');
@@ -2634,6 +2625,10 @@ export default function App() {
   }, [isDataBroken]);
 
   const showInitialLoading = loading && data.length === 0;
+  const visibleSignalTableLimit = 30;
+  const visibleSignalTablePicks = marketPicks
+    .filter((pick) => pick.signal.overall === 'BUY' || pick.signal.overall === 'SELL')
+    .slice(0, visibleSignalTableLimit);
 
   return (
     <div className="min-h-screen bg-[#E4E3E0] text-[#141414] p-4 md:p-8 font-sans selection:bg-[#F27D26] selection:text-white overflow-x-hidden">
@@ -2918,8 +2913,8 @@ export default function App() {
           <section className="bg-white border-2 border-[#141414] p-4 shadow-[8px_8px_0px_0px_#141414]">
             <div className="space-y-4">
               <div className="flex items-center justify-between">
-                <h3 className="font-mono text-[12px] uppercase tracking-[0.2em] opacity-75">Signal Table</h3>
-                <span className="text-[10px] font-mono uppercase opacity-50">{Math.min(150, marketPicks.length)} shown</span>
+                <h3 className="font-mono text-[12px] uppercase tracking-[0.2em] opacity-75">Top Ranked Signals</h3>
+                <span className="text-[10px] font-mono uppercase opacity-50">{visibleSignalTablePicks.length} shown</span>
               </div>
               <div className="grid grid-cols-5 items-center border-b pb-2 text-[10px] font-mono opacity-50 uppercase tracking-wide px-2">
                 <span>Asset</span>
@@ -2929,7 +2924,7 @@ export default function App() {
                 <span className="text-right">Action</span>
               </div>
               <div className="space-y-2 max-h-[520px] overflow-y-auto custom-scrollbar pr-2">
-                {marketPicks.slice(0, 150).map((pick) => {
+                {visibleSignalTablePicks.map((pick) => {
                   const lifecycle = getMarketPickLifecycle(pick);
                   return (
                   <div key={pick.symbol} className="grid grid-cols-5 items-center group py-1.5 hover:bg-gray-50/50 px-2 border-b border-gray-50 transition-colors">

@@ -117,6 +117,31 @@ export async function fetchTopSymbolsByVolume(limit: number = 20, options?: { fo
     return ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT', 'DOTUSDT'];
   }
 }
+
+export async function fetchTicker24hStats(options?: { forceBinancePublic?: boolean }): Promise<Map<string, { quoteVolume: number; priceChangePercent: number }>> {
+  try {
+    const forceBinancePublic = options?.forceBinancePublic === true;
+    const sourceQuery = forceBinancePublic ? '?source=binance_public' : '';
+    const response = await fetch(`/api/binance/proxy/ticker24hr${sourceQuery}`);
+    const data = await response.json();
+    if (!Array.isArray(data)) return new Map();
+
+    const stats = new Map<string, { quoteVolume: number; priceChangePercent: number }>();
+    data.forEach((row: any) => {
+      const symbol = String(row?.symbol || '').toUpperCase();
+      if (!symbol) return;
+      stats.set(symbol, {
+        quoteVolume: Number.parseFloat(String(row?.quoteVolume || '0')) || 0,
+        priceChangePercent: Number.parseFloat(String(row?.priceChangePercent || row?.price24hPcnt || '0')) || 0,
+      });
+    });
+    return stats;
+  } catch (error) {
+    console.error('Error fetching ticker stats:', error);
+    return new Map();
+  }
+}
+
 export function subscribeToTicker(
   symbol: string,
   onUpdate: (price: number) => void,
