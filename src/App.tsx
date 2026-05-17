@@ -433,6 +433,7 @@ export default function App() {
   } | null>(null);
   const [isBotActive, setIsBotActive] = useState(false);
   const [scanExecutionStats, setScanExecutionStats] = useState({ cycleId: 0, attempted: 0, filled: 0, failed: 0, skipped: 0 });
+  const [scanExecutionTotals, setScanExecutionTotals] = useState({ attempted: 0, filled: 0, failed: 0, skipped: 0 });
   const [executionFeedback, setExecutionFeedback] = useState<{ type: 'info' | 'success' | 'warning', message: string } | null>(null);
   const [entryLockUntil, setEntryLockUntil] = useState(0);
   const lastRateLimitWarnAtRef = React.useRef(0);
@@ -595,6 +596,14 @@ export default function App() {
   const pushTradeEvent = React.useCallback((event: TradeEvent) => {
     const normalized = { ...event, status: event.status || 'FILLED' };
     setTradeHistory(prev => [normalized, ...prev]);
+
+    setScanExecutionTotals(prev => {
+      const next = { ...prev, attempted: prev.attempted + 1 };
+      if (normalized.status === 'FILLED' || normalized.status === 'SUBMITTED') next.filled += 1;
+      else if (normalized.status === 'FAILED') next.failed += 1;
+      else next.skipped += 1;
+      return next;
+    });
 
     if (typeof normalized.cycleId === 'number' && normalized.cycleId > 0) {
       setScanExecutionStats(prev => {
@@ -1600,6 +1609,14 @@ export default function App() {
     : 0;
 
   const [scanProgress, setScanProgress] = useState({ current: 0, total: 0 });
+  const [scanSignalSummary, setScanSignalSummary] = useState({
+    analyzed: 0,
+    total: 0,
+    buy: 0,
+    sell: 0,
+    hold: 0,
+    updatedAt: 0,
+  });
 
   const formatPrice = (price: number) => {
     if (price === 0) return '0.00';
@@ -2048,6 +2065,25 @@ export default function App() {
       }
 
       setMarketPicks(results);
+      const signalCounts = results.reduce((acc, row) => {
+        const key = row.signal.overall;
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, { BUY: 0, SELL: 0, HOLD: 0 } as Record<'BUY' | 'SELL' | 'HOLD', number>);
+      setScanSignalSummary({
+        analyzed: results.length,
+        total: symbolsToScan.length,
+        buy: signalCounts.BUY,
+        sell: signalCounts.SELL,
+        hold: signalCounts.HOLD,
+        updatedAt: Date.now(),
+      });
+      const scanSummary = `SCAN SUMMARY: ${results.length}/${symbolsToScan.length} analyzed | BUY=${signalCounts.BUY} SELL=${signalCounts.SELL} HOLD=${signalCounts.HOLD}`;
+      addLog(
+        scanSummary,
+        signalCounts.BUY > 0 || signalCounts.SELL > 0 ? 'success' : 'info'
+      );
+      console.log(`[TradeEdge] ${scanSummary}`);
       // Wait a moment before resetting progress to let the user see "Complete" in the UI
       setTimeout(() => setScanProgress({ current: 0, total: 0 }), 3000);
       
@@ -2417,6 +2453,13 @@ export default function App() {
     ? Math.min(100, Math.max(0, (scanProgress.current / scanProgress.total) * 100))
     : 0;
   const isScanPreparing = scanning && scanProgress.total === 0;
+  const scanStatusHint = (() => {
+    if (!autoTrade) return 'Auto trading is OFF. Scans only run when manually triggered.';
+    if (rateLimitedUntilRef.current > Date.now()) return `Scanner paused by rate-limit until ${new Date(rateLimitedUntilRef.current).toLocaleTimeString()}.`;
+    if (scanning) return 'Scanner cycle is currently running.';
+    if (scanSignalSummary.updatedAt === 0) return 'No completed scan cycle yet in this session.';
+    return `Last completed scan at ${new Date(scanSignalSummary.updatedAt).toLocaleTimeString()}.`;
+  })();
   
   // Anti-Glitich: If equity is non-finite or impossible, it's a data core issue
   // We cap at $100,000,000 to allow "Whale" mode while still blocking glitches
@@ -2661,8 +2704,6 @@ export default function App() {
   const visibleTradeHistory = tradeHistory.filter(t => {
     // Hide SCAN skips
     if (t.symbol === 'SCAN' && t.status === 'SKIPPED') return false;
-    // Hide malformed/truncated symbols (TUSDT, USDTUSDTUSDT, etc)
-    if (!/^[A-Z0-9]+(USDT|USDC|USD)$/.test(t.symbol) || /USDT.*USDT|USDC.*USDC/.test(t.symbol)) return false;
     return true;
   });
 
@@ -2925,20 +2966,26 @@ export default function App() {
               <div className="border border-gray-200 px-2 py-1">
                 <span className="opacity-50">Attempted</span>
                 <p className="font-black text-[14px]">{scanExecutionStats.attempted}</p>
+                <p className="text-[9px] opacity-50">Total {scanExecutionTotals.attempted}</p>
               </div>
               <div className="border border-emerald-200 bg-emerald-50/50 px-2 py-1">
                 <span className="opacity-50">Filled</span>
                 <p className="font-black text-[14px] text-emerald-700">{scanExecutionStats.filled}</p>
+                <p className="text-[9px] opacity-50">Total {scanExecutionTotals.filled}</p>
               </div>
               <div className="border border-rose-200 bg-rose-50/50 px-2 py-1">
                 <span className="opacity-50">Failed</span>
                 <p className="font-black text-[14px] text-rose-700">{scanExecutionStats.failed}</p>
+                <p className="text-[9px] opacity-50">Total {scanExecutionTotals.failed}</p>
               </div>
               <div className="border border-amber-200 bg-amber-50/50 px-2 py-1">
                 <span className="opacity-50">Skipped</span>
                 <p className="font-black text-[14px] text-amber-700">{scanExecutionStats.skipped}</p>
+                <p className="text-[9px] opacity-50">Total {scanExecutionTotals.skipped}</p>
               </div>
             </div>
+
+            <p className="mt-2 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanStatusHint}</p>
 
             <div className="mt-2 grid grid-cols-4 gap-2 text-[10px] font-mono uppercase">
               <div className="border border-sky-200 bg-sky-50/60 px-2 py-1">
@@ -2956,6 +3003,31 @@ export default function App() {
               <div className="border border-[#F27D26]/30 bg-[#F27D26]/10 px-2 py-1">
                 <span className="opacity-50">Open Positions</span>
                 <p className="font-black text-[14px] text-[#C85E13]">{marketPickLifecycleSummary.openPositions}</p>
+              </div>
+            </div>
+
+            <div className="mt-3 border border-indigo-200 bg-indigo-50/60 px-3 py-2 text-[10px] font-mono uppercase">
+              <div className="flex items-center justify-between text-indigo-900/70">
+                <span>Last Scan Summary</span>
+                <span>{scanSignalSummary.updatedAt ? new Date(scanSignalSummary.updatedAt).toLocaleTimeString() : '--:--:--'}</span>
+              </div>
+              <div className="mt-2 grid grid-cols-4 gap-2">
+                <div className="border border-indigo-200 bg-white/60 px-2 py-1">
+                  <span className="opacity-50">Analyzed</span>
+                  <p className="font-black text-[13px] text-indigo-800">{scanSignalSummary.analyzed}/{scanSignalSummary.total}</p>
+                </div>
+                <div className="border border-emerald-200 bg-emerald-50/70 px-2 py-1">
+                  <span className="opacity-50">BUY</span>
+                  <p className="font-black text-[13px] text-emerald-700">{scanSignalSummary.buy}</p>
+                </div>
+                <div className="border border-rose-200 bg-rose-50/70 px-2 py-1">
+                  <span className="opacity-50">SELL</span>
+                  <p className="font-black text-[13px] text-rose-700">{scanSignalSummary.sell}</p>
+                </div>
+                <div className="border border-gray-200 bg-gray-50/70 px-2 py-1">
+                  <span className="opacity-50">HOLD</span>
+                  <p className="font-black text-[13px] text-gray-700">{scanSignalSummary.hold}</p>
+                </div>
               </div>
             </div>
           </section>
@@ -3720,6 +3792,7 @@ export default function App() {
                         <div className="flex flex-col items-center gap-2 opacity-30">
                           <Zap size={24} />
                           <p className="text-xs font-mono uppercase tracking-[0.2em]">Awaiting signal confluence. No open vectors.</p>
+                          <p className="text-[10px] font-mono normal-case tracking-normal">Live sync currently reports zero active exchange positions.</p>
                         </div>
                       </td>
                     </tr>
