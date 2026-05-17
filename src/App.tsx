@@ -102,6 +102,10 @@ export default function App() {
     s.label.toLowerCase().includes(searchQuery.toLowerCase()) || 
     s.value.toLowerCase().includes(searchQuery.toLowerCase())
   ).slice(0, 300); // increased limit for broader discovery
+  const liveQuoteAllowlist = liveQuoteAllowlistInput
+    .split(',')
+    .map(value => value.trim().toUpperCase())
+    .filter(Boolean);
   
   // Persistence-enabled state
   const [balance, setBalance] = useState(() => {
@@ -449,12 +453,12 @@ export default function App() {
           : null);
 
         // Hard live safety: pause autonomous mode before scanner/order logic when margin is below minimum order notional.
-        if (isRealMode && autoTradeRef.current && syncedAvailable < LIVE_MIN_ORDER_NOTIONAL) {
-          const lockMs = 2 * 60 * 1000;
+        if (isRealMode && autoTradeRef.current && syncedAvailable < liveMinOrderNotional) {
+          const lockMs = lowMarginLockMinutes * 60 * 1000;
           autoTradeRef.current = false;
           setAutoTrade(false);
           setEntryLockUntil(prev => Math.max(prev, Date.now() + lockMs));
-          const lowMarginMsg = `AUTONOMOUS PAUSED: Free margin $${syncedAvailable.toFixed(2)} below minimum order $${LIVE_MIN_ORDER_NOTIONAL.toFixed(2)}.`;
+          const lowMarginMsg = `AUTONOMOUS PAUSED: Free margin $${syncedAvailable.toFixed(2)} below minimum order $${liveMinOrderNotional.toFixed(2)}.`;
           addLog(lowMarginMsg, 'warning');
           setExecutionFeedback({ type: 'warning', message: lowMarginMsg });
         }
@@ -638,7 +642,7 @@ export default function App() {
       return;
     }
     tradeLockout.current.add(lockKey);
-    setTimeout(() => tradeLockout.current.delete(lockKey), 15000);
+    setTimeout(() => tradeLockout.current.delete(lockKey), duplicateOrderLockoutSec * 1000);
 
 
     if (isRealMode) {
@@ -773,12 +777,12 @@ export default function App() {
             ? realFreeCapital
             : Math.max(0, balance);
           let allocation = Math.min(tradableCapital, tradableCapital / slotsAvailable);
-          const minLiveNotional = LIVE_MIN_ORDER_NOTIONAL;
+          const minLiveNotional = liveMinOrderNotional;
 
           // Avoid over-fragmenting capital across many slots; if we can fund at least one
           // minimal order, keep per-trade allocation at $10+ instead of skipping every entry.
-          if (tradableCapital >= 10) {
-            allocation = Math.max(allocation, 10);
+          if (tradableCapital >= minLiveNotional) {
+            allocation = Math.max(allocation, minLiveNotional);
           }
 
           allocation = Math.min(allocation, tradableCapital);
@@ -883,9 +887,9 @@ export default function App() {
             setExecutionFeedback({ type: 'warning', message: `${type} submitted for ${tradeSymbol}. Waiting for position sync.` });
             pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason: `PENDING CONFIRMATION: ${msg}`, status: 'FILLED', cycleId: eventCycleId });
             if (closingExisting) {
-              lockEntries(5 * 60 * 1000, `Close verification failed for ${tradeSymbol}. New entries paused for 5m.`);
+              lockEntries(closeFailureLockMinutes * 60 * 1000, `Close verification failed for ${tradeSymbol}. New entries paused for ${closeFailureLockMinutes}m.`);
             }
-            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 2) }));
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * softCooldownMinutes) }));
             setTimeout(syncRealBalance, 1500);
             setTimeout(syncRealBalance, 4500);
             return;
@@ -906,7 +910,7 @@ export default function App() {
               status: 'FILLED',
               cycleId: eventCycleId,
             });
-            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 5) }));
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * successCooldownMinutes) }));
             setTimeout(syncRealBalance, 2000);
             return;
           }
@@ -953,7 +957,7 @@ export default function App() {
 
           addLog(`REAL ${type} SUCCESS: ${tradeSymbol}`, 'success');
           setExecutionFeedback({ type: 'success', message: `${type} confirmed on exchange for ${tradeSymbol}.` });
-          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 5) }));
+          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * successCooldownMinutes) }));
           setTimeout(syncRealBalance, 1500); 
         } else {
           throw new Error(result.message || 'Order failed');
@@ -968,7 +972,7 @@ export default function App() {
           addLog(`REAL ${type} SKIPPED: ${msg}`, 'warning');
           setExecutionFeedback({ type: 'warning', message: `${type} skipped for ${tradeSymbol}: ${msg}` });
           pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${msg}`, status: 'SKIPPED', cycleId: eventCycleId });
-          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 2) }));
+          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * softCooldownMinutes) }));
           return;
         }
 
@@ -1029,7 +1033,7 @@ export default function App() {
           // Hard fail-safe: disable autonomous trading immediately on exchange-level hard failures.
           autoTradeRef.current = false;
           setAutoTrade(false);
-          lockEntries(15 * 60 * 1000, `Entry lock engaged after hard exchange failure (${isAuthFailure ? 'auth/permission' : 'margin'}).`);
+          lockEntries(hardFailureLockMinutes * 60 * 1000, `Entry lock engaged after hard exchange failure (${isAuthFailure ? 'auth/permission' : 'margin'}).`);
           if (isAuthFailure) {
             setIsRealMode(false);
             addLog('LIVE MODE DISABLED: Exchange auth/permission failure detected.', 'warning');
@@ -1039,9 +1043,9 @@ export default function App() {
         }
 
         if (closingExisting) {
-          lockEntries(5 * 60 * 1000, `Close order failed for ${tradeSymbol}. New entries paused for 5m.`);
+          lockEntries(closeFailureLockMinutes * 60 * 1000, `Close order failed for ${tradeSymbol}. New entries paused for ${closeFailureLockMinutes}m.`);
         }
-        setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 2) }));
+        setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * softCooldownMinutes) }));
         return;
       }
     } else {
@@ -1056,9 +1060,9 @@ export default function App() {
         const currentBalance = Math.max(0, balance);
         let allocation = Math.min(currentBalance / slotsAvailable, currentBalance);
         
-        if (allocation < 10) {
-          addLog(`PAPER TRADE SKIPPED: Insufficient balance for minimum $10 allocation.`, 'warning');
-          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: 'SKIP: Insufficient balance for $10 minimum', status: 'SKIPPED', cycleId: eventCycleId });
+        if (allocation < minPaperAllocation) {
+          addLog(`PAPER TRADE SKIPPED: Insufficient balance for minimum $${minPaperAllocation.toFixed(2)} allocation.`, 'warning');
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: Insufficient balance for $${minPaperAllocation.toFixed(2)} minimum`, status: 'SKIPPED', cycleId: eventCycleId });
           return;
         }
 
@@ -1111,7 +1115,7 @@ export default function App() {
           }
 
           if (pnlPct < 0) {
-             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 30) }));
+             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * paperLossCooldownMinutes) }));
              addLog(`TRADE EXIT [${tradeSymbol}]: Loss of $${Math.abs(pnl).toFixed(2)} (${pnlPct.toFixed(2)}%)`, 'warning');
           } else {
              addLog(`TRADE EXIT [${tradeSymbol}]: Profit of $${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)`, 'success');
@@ -1192,7 +1196,28 @@ export default function App() {
     localStorage.setItem('te_benchmark_capital', benchmarkCapital.toString());
     localStorage.setItem('te_auto_trade', autoTrade.toString());
     localStorage.setItem('te_real_mode', isRealMode.toString());
-  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode]);
+    localStorage.setItem('te_stop_loss_percent', stopLossPercent.toString());
+    localStorage.setItem('te_take_profit_percent', takeProfitPercent.toString());
+    localStorage.setItem('te_use_bnb_fees', useBNBFees.toString());
+    localStorage.setItem('te_max_concurrent_trades', maxConcurrentTrades.toString());
+    localStorage.setItem('te_max_drawdown_percent', maxDrawdownPercent.toString());
+    localStorage.setItem('te_is_defensive_mode', isDefensiveMode.toString());
+    localStorage.setItem('te_auto_entry_min_score', autoEntryMinScore.toString());
+    localStorage.setItem('te_live_min_order_notional', liveMinOrderNotional.toString());
+    localStorage.setItem('te_live_quote_allowlist', liveQuoteAllowlistInput);
+    localStorage.setItem('te_scan_interval_sec', scanIntervalSec.toString());
+    localStorage.setItem('te_holding_poll_interval_sec', holdingPollIntervalSec.toString());
+    localStorage.setItem('te_duplicate_order_lockout_sec', duplicateOrderLockoutSec.toString());
+    localStorage.setItem('te_live_entry_delay_ms', liveEntryDelayMs.toString());
+    localStorage.setItem('te_min_paper_allocation', minPaperAllocation.toString());
+    localStorage.setItem('te_soft_cooldown_minutes', softCooldownMinutes.toString());
+    localStorage.setItem('te_success_cooldown_minutes', successCooldownMinutes.toString());
+    localStorage.setItem('te_paper_loss_cooldown_minutes', paperLossCooldownMinutes.toString());
+    localStorage.setItem('te_low_margin_lock_minutes', lowMarginLockMinutes.toString());
+    localStorage.setItem('te_close_failure_lock_minutes', closeFailureLockMinutes.toString());
+    localStorage.setItem('te_hard_failure_lock_minutes', hardFailureLockMinutes.toString());
+    localStorage.setItem('te_strategy_config', JSON.stringify(strategyConfig));
+  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, duplicateOrderLockoutSec, liveEntryDelayMs, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
 
   // Baseline Safety: If paper trading and baseline is from a ghost real-sync session, fix it.
   useEffect(() => {
@@ -1317,7 +1342,7 @@ export default function App() {
       const liveNormalized = (v: string) => (v.toUpperCase().endsWith('USD') && !v.toUpperCase().endsWith('USDT') ? `${v}T` : v);
       const hasAllowedQuote = (v: string) => {
         const up = v.toUpperCase();
-        return LIVE_QUOTE_ALLOWLIST.some(q => up.endsWith(q));
+        return liveQuoteAllowlist.some(q => up.endsWith(q));
       };
       const isLikelyBinanceFuturesSymbol = (v: string) => {
         const up = v.toUpperCase();
@@ -1358,7 +1383,8 @@ export default function App() {
           lastLoggedCount = safeCurrent;
         }
         },
-        () => autoTradeRef.current && rateLimitedUntilRef.current <= Date.now()
+        () => autoTradeRef.current && rateLimitedUntilRef.current <= Date.now(),
+        strategyConfig,
       );
 
       if (!autoTradeRef.current || rateLimitedUntilRef.current > Date.now()) {
@@ -1405,7 +1431,7 @@ export default function App() {
 
       if (currentAutoTrade) {
         const potentialLongs = results
-          .filter(r => r.signal.overall === 'BUY' && r.signal.score >= AUTO_ENTRY_MIN_SCORE)
+          .filter(r => r.signal.overall === 'BUY' && r.signal.score >= autoEntryMinScore)
           .filter(r => !isRealMode || hasAllowedQuote(r.symbol))
           .filter(r => !isLiveBinance || isLikelyBinanceFuturesSymbol(r.symbol))
           .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
@@ -1413,7 +1439,7 @@ export default function App() {
 
         const potentialShorts = isRealMode
           ? results
-              .filter(r => r.signal.overall === 'SELL' && r.signal.score >= AUTO_ENTRY_MIN_SCORE)
+              .filter(r => r.signal.overall === 'SELL' && r.signal.score >= autoEntryMinScore)
               .filter(r => hasAllowedQuote(r.symbol))
               .filter(r => !isLiveBinance || isLikelyBinanceFuturesSymbol(r.symbol))
               .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
@@ -1429,10 +1455,10 @@ export default function App() {
           const availableSlots = currentMaxTrades - currentHoldings.length;
           const realFreeCapital = Math.max(0, availableFunds * 0.95);
           const realTradableCapital = realFreeCapital;
-          if (isRealMode && realTradableCapital < LIVE_MIN_ORDER_NOTIONAL) {
-            const marginLockUntil = Date.now() + (2 * 60 * 1000);
+          if (isRealMode && realTradableCapital < liveMinOrderNotional) {
+            const marginLockUntil = Date.now() + (lowMarginLockMinutes * 60 * 1000);
             setEntryLockUntil(prev => Math.max(prev, marginLockUntil));
-            pushScanSkipEvent(`SKIP: Free margin too low for minimum order ($${realFreeCapital.toFixed(2)} effective $${realTradableCapital.toFixed(2)} < $${LIVE_MIN_ORDER_NOTIONAL.toFixed(2)})`, cycleId);
+            pushScanSkipEvent(`SKIP: Free margin too low for minimum order ($${realFreeCapital.toFixed(2)} effective $${realTradableCapital.toFixed(2)} < $${liveMinOrderNotional.toFixed(2)})`, cycleId);
             return;
           }
           const toTrade = entries.slice(0, availableSlots);
@@ -1446,7 +1472,7 @@ export default function App() {
               await executeTrade(side, pick.symbol, pick.lastPrice, `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`, undefined, cycleId);
               if (!autoTradeRef.current || entryLockUntilRef.current > Date.now()) break;
               if (isRealMode) {
-                await new Promise(r => setTimeout(r, 400));
+                await new Promise(r => setTimeout(r, liveEntryDelayMs));
               }
             }
           } else {
@@ -1522,9 +1548,9 @@ export default function App() {
       try {
         const candles = await fetchBinanceData(symbol);
         setData(candles);
-        const inds = calculateIndicators(candles);
+        const inds = calculateIndicators(candles, strategyConfig);
         setIndicators(inds);
-        const sig = evaluateStrategy(candles, inds);
+        const sig = evaluateStrategy(candles, inds, strategyConfig);
         setStrategy(sig);
         if (candles.length > 0) {
           const price = candles[candles.length - 1].close;
@@ -1545,11 +1571,11 @@ export default function App() {
       loadData(true);
       if (autoTradeRef.current) {
         performScan();
-        setNextScanSec(40);  // Increased from 30s to reduce rate limit pressure
+        setNextScanSec(scanIntervalSec);
       } else {
         setNextScanSec(0);
       }
-    }, 40000);  // Increased from 30s to 40s: Binance limit 2400 req/min means ~67 req/sec budget; 5-symbol batch every 40s = 1.75 req/sec target
+    }, scanIntervalSec * 1000);
 
     const countdownInterval = setInterval(() => {
       setNextScanSec(prev => Math.max(0, prev - 1));
@@ -1604,7 +1630,7 @@ export default function App() {
       }
     };
 
-    const interval = setInterval(pollHoldingPrices, 3000);
+    const interval = setInterval(pollHoldingPrices, holdingPollIntervalSec * 1000);
     pollHoldingPrices();
 
     return () => clearInterval(interval);
@@ -1638,7 +1664,7 @@ export default function App() {
     }
     
     // 4. Current Symbol Auto-Buy (if not held and slot available)
-    if (!isRealMode && holdings.length < maxConcurrentTrades && strategy && strategy.overall === 'BUY' && autoTrade && currentPrice && strategy.score >= AUTO_ENTRY_MIN_SCORE) {
+    if (!isRealMode && holdings.length < maxConcurrentTrades && strategy && strategy.overall === 'BUY' && autoTrade && currentPrice && strategy.score >= autoEntryMinScore) {
       const isAlreadyHeld = holdings.some(h => h.symbol === symbol);
       const isOnCooldown = cooldowns[symbol] && cooldowns[symbol] > Date.now();
       if (!isAlreadyHeld && !isOnCooldown) {
@@ -2717,7 +2743,7 @@ export default function App() {
           {/* Strategy Laboratory (Backtest Module) */}
           <div className={activeTab === 'BACKTEST' ? 'block' : 'hidden'}>
             <div className="w-full">
-              <BacktestModule symbol={symbol} availableSymbols={availableSymbols} />
+              <BacktestModule symbol={symbol} availableSymbols={availableSymbols} strategyConfig={strategyConfig} />
             </div>
           </div>
   </div>
