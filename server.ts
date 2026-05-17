@@ -1618,6 +1618,72 @@ async function startServer() {
     }
   });
 
+  // ---- Bybit public-API helpers ----
+  const BYBIT_INTERVAL_MAP: Record<string, string> = {
+    '1m': '1', '3m': '3', '5m': '5', '15m': '15', '30m': '30',
+    '1h': '60', '2h': '120', '4h': '240', '6h': '360', '12h': '720',
+    '1d': 'D', '3d': 'D', '1w': 'W', '1M': 'M',
+  };
+
+  async function fetchBybitKlines(symbol: string, interval: string, limit: number): Promise<any[] | null> {
+    try {
+      const bybitInterval = BYBIT_INTERVAL_MAP[interval] || 'D';
+      const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=${bybitInterval}&limit=${limit}`;
+      const resp = await fetch(url);
+      if (!resp.ok) return null;
+      const json: any = await resp.json();
+      const list: any[][] = json?.result?.list;
+      if (!Array.isArray(list) || list.length === 0) return null;
+      // Bybit returns newest-first; reverse to match Binance oldest-first order
+      return list.slice().reverse().map(c => [
+        Number(c[0]),   // openTime
+        c[1],           // open
+        c[2],           // high
+        c[3],           // low
+        c[4],           // close
+        c[5],           // volume
+        Number(c[0]) + 60000, '0', 1, '0', '0', '0'
+      ]);
+    } catch {
+      return null;
+    }
+  }
+
+  async function fetchBybitSymbols(): Promise<{ symbol: string; status: string; baseAsset: string; quoteAsset: string; permissions: string[] }[]> {
+    try {
+      const resp = await fetch('https://api.bybit.com/v5/market/instruments-info?category=linear&status=Trading&limit=1000');
+      if (!resp.ok) return [];
+      const json: any = await resp.json();
+      const list: any[] = json?.result?.list || [];
+      return list.map((s: any) => ({
+        symbol: String(s.symbol || '').toUpperCase(),
+        status: 'TRADING',
+        baseAsset: String(s.baseCoin || s.symbol?.replace('USDT','').replace('USDC','') || ''),
+        quoteAsset: String(s.quoteCoin || 'USDT'),
+        permissions: ['FUTURES'],
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  async function fetchBybitTickers(): Promise<{ symbol: string; lastPrice: string; quoteVolume: string }[]> {
+    try {
+      const resp = await fetch('https://api.bybit.com/v5/market/tickers?category=linear');
+      if (!resp.ok) return [];
+      const json: any = await resp.json();
+      const list: any[] = json?.result?.list || [];
+      return list.map((t: any) => ({
+        symbol: String(t.symbol || '').toUpperCase(),
+        lastPrice: String(t.lastPrice || '0'),
+        quoteVolume: String(t.turnover24h || t.volume24h || '0'),
+      }));
+    } catch {
+      return [];
+    }
+  }
+  // ---- end Bybit helpers ----
+
   // Public Proxies with User-Preferred Exchange Logic
   app.get('/api/binance/proxy/klines', async (req, res) => {
     // Honour rate-limit ban window
@@ -1647,6 +1713,18 @@ async function startServer() {
         const mapped = ohlcv.map(c => [c[0], c[1].toString(), c[2].toString(), c[3].toString(), c[4].toString(), c[5].toString(), c[0], "0", 1, "0", "0", "0"]);
         return res.json(mapped);
       } else {
+        // Try Bybit first (primary price source)
+        const bybitCandles = await fetchBybitKlines(String(symbol), String(interval || '1d'), Number(limit) || 500);
+        if (bybitCandles) {
+          return res.json(bybitCandles);
+        }
+
+        // Bybit failed — fall back to Binance
+        console.log(`[TradeEdge] klines: Bybit returned no data for ${symbol}, falling back to Binance`);
+        const now2 = Date.now();
+        const blockedUntil2 = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+        if (blockedUntil2 > now2) return res.json([]);
+
         const endpoints = [
           `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
           `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
@@ -1660,8 +1738,8 @@ async function startServer() {
             const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
             if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
             else rateLimitState.backoffUntil = Date.now() + 60000;
-            console.warn(`[TradeEdge RateLimit] klines rate limited — suppressing`);
-            return res.json([]);
+            console.warn(`[TradeEdge RateLimit] klines Binance fallback also rate limited`);
+            break;
           }
         }
 
@@ -1724,22 +1802,28 @@ async function startServer() {
           throw new Error(`Binance exchangeInfo failed (${marketType})`);
         };
 
-        if (includeFutures) {
-          await fetchAndCollect('https://fapi.binance.com/fapi/v1/exchangeInfo', 'futures');
-          if (res.headersSent) return;
-        }
-
-        if (includeSpot) {
-          await fetchAndCollect('https://api.binance.com/api/v3/exchangeInfo', 'spot');
-          if (res.headersSent) return;
-        }
-
+        // Try Bybit first (primary symbol source)
+        const bybitSymbolsPrimary = await fetchBybitSymbols();
         const deduped = new Map<string, any>();
-        mergedSymbols.forEach((s: any) => {
-          const key = String(s?.symbol || '').toUpperCase();
-          if (!key) return;
-          if (!deduped.has(key)) deduped.set(key, s);
-        });
+        if (bybitSymbolsPrimary.length > 0) {
+          bybitSymbolsPrimary.forEach(s => deduped.set(s.symbol, s));
+        } else {
+          // Bybit failed — fall back to Binance
+          console.log('[TradeEdge] exchangeInfo: Bybit returned 0 symbols, falling back to Binance');
+          if (includeFutures) {
+            await fetchAndCollect('https://fapi.binance.com/fapi/v1/exchangeInfo', 'futures');
+            if (res.headersSent) return;
+          }
+          if (includeSpot) {
+            await fetchAndCollect('https://api.binance.com/api/v3/exchangeInfo', 'spot');
+            if (res.headersSent) return;
+          }
+          mergedSymbols.forEach((s: any) => {
+            const key = String(s?.symbol || '').toUpperCase();
+            if (!key) return;
+            if (!deduped.has(key)) deduped.set(key, s);
+          });
+        }
 
         return res.json({ symbols: Array.from(deduped.values()) });
       }
@@ -1762,10 +1846,15 @@ async function startServer() {
         }));
         return res.json(mapped);
       } else {
+        // Try Bybit first (primary ticker source)
+        const bybitTickers = await fetchBybitTickers();
+        if (bybitTickers.length > 0) return res.json(bybitTickers);
+        // Bybit failed — fall back to Binance
+        console.log('[TradeEdge] ticker24hr: Bybit returned no data, falling back to Binance');
         const url = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
         const response = await fetch(url);
         if (response.ok) return res.json(await response.json());
-        throw new Error('Binance ticker failed');
+        throw new Error('Both Bybit and Binance ticker failed');
       }
     } catch (error: any) {
       res.status(500).json({ status: 'error', message: error.message });
