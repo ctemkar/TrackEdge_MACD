@@ -451,6 +451,9 @@ export default function App() {
   const scanningRef = React.useRef(false);
   const rateLimitedUntilRef = React.useRef(0);
   const RATE_LIMIT_UNTIL_KEY = 'te_rate_limited_until';
+  const knownUnsupportedLiveSymbols = React.useMemo(() => new Set(['NMRUSDC', 'KGSTUSDT']), []);
+  const unsupportedScanSymbolsRef = React.useRef<Record<string, number>>({});
+  const UNSUPPORTED_SCAN_SYMBOLS_KEY = 'te_unsupported_scan_symbols';
   const currentScanCycleRef = React.useRef(0);
   const entryLockUntilRef = React.useRef(0);
   const lastScanSkipLogRef = React.useRef<Record<string, number>>({});
@@ -494,6 +497,41 @@ export default function App() {
       localStorage.removeItem(RATE_LIMIT_UNTIL_KEY);
     }
   }, []);
+
+  const pruneUnsupportedScanSymbols = React.useCallback(() => {
+    const now = Date.now();
+    const nextEntries = Object.entries(unsupportedScanSymbolsRef.current as Record<string, number>)
+      .filter(([, until]) => Number.isFinite(until) && until > now);
+    unsupportedScanSymbolsRef.current = Object.fromEntries(nextEntries);
+    if (nextEntries.length > 0) {
+      localStorage.setItem(UNSUPPORTED_SCAN_SYMBOLS_KEY, JSON.stringify(unsupportedScanSymbolsRef.current));
+    } else {
+      localStorage.removeItem(UNSUPPORTED_SCAN_SYMBOLS_KEY);
+    }
+    return unsupportedScanSymbolsRef.current;
+  }, []);
+
+  const blockUnsupportedScanSymbol = React.useCallback((value: string, ttlMs = 12 * 60 * 60 * 1000) => {
+    const normalized = String(value || '').toUpperCase().replace(/[/:]/g, '');
+    if (!normalized) return;
+    unsupportedScanSymbolsRef.current = {
+      ...unsupportedScanSymbolsRef.current,
+      [normalized]: Date.now() + ttlMs,
+    };
+    localStorage.setItem(UNSUPPORTED_SCAN_SYMBOLS_KEY, JSON.stringify(unsupportedScanSymbolsRef.current));
+  }, []);
+
+  React.useEffect(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(UNSUPPORTED_SCAN_SYMBOLS_KEY) || '{}') as Record<string, number>;
+      if (parsed && typeof parsed === 'object') {
+        unsupportedScanSymbolsRef.current = parsed;
+        pruneUnsupportedScanSymbols();
+      }
+    } catch {
+      localStorage.removeItem(UNSUPPORTED_SCAN_SYMBOLS_KEY);
+    }
+  }, [pruneUnsupportedScanSymbols]);
 
   React.useEffect(() => {
     if (!autoTrade) {
@@ -1224,9 +1262,13 @@ export default function App() {
         const msg = String(e?.message || 'Unknown order failure');
         const isMarginOrFundsFailure = /-2019|margin is insufficient|insufficient margin|insufficient balance/i.test(msg);
         const isAuthFailure = /-2015|invalid api-key|invalid api key|ip|permissions for action|whitelist/i.test(msg);
-        const softSkip = /(SYMBOL SKIPPED|UNSUPPORTED MARKET|INVALID ORDER SIZE|ORDER SIZE UNDERFLOW|allocation below|Unable to size|No open position|Duplicate order lockout)/i.test(msg);
+        const unsupportedMarketFailure = /(SYMBOL SKIPPED|UNSUPPORTED MARKET|does not have market symbol)/i.test(msg);
+        const softSkip = /(SYMBOL SKIPPED|UNSUPPORTED MARKET|does not have market symbol|INVALID ORDER SIZE|ORDER SIZE UNDERFLOW|allocation below|Unable to size|No open position|Duplicate order lockout)/i.test(msg);
 
         if (softSkip) {
+          if (unsupportedMarketFailure) {
+            blockUnsupportedScanSymbol(tradeSymbol);
+          }
           addLog(`REAL ${type} SKIPPED: ${msg}`, 'warning');
           setExecutionFeedback({ type: 'warning', message: `${type} skipped for ${tradeSymbol}: ${msg}` });
           pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${msg}`, status: 'SKIPPED', cycleId: eventCycleId });
@@ -1977,6 +2019,22 @@ export default function App() {
         symbolsToScan = symbolsToScan.filter(isLikelyBinanceSymbol);
       }
 
+      if (isLiveBinance) {
+        const blockedSymbols = pruneUnsupportedScanSymbols();
+        const beforeBlockedFilter = symbolsToScan.length;
+        symbolsToScan = symbolsToScan.filter(v => {
+          const normalized = String(v || '').toUpperCase().replace(/[/:]/g, '');
+          if (knownUnsupportedLiveSymbols.has(normalized)) {
+            return false;
+          }
+          const blockedUntil = blockedSymbols[normalized] || 0;
+          return blockedUntil <= Date.now();
+        });
+        if (symbolsToScan.length < beforeBlockedFilter) {
+          console.log(`[Scanner] Skipped ${beforeBlockedFilter - symbolsToScan.length} unsupported symbols already rejected by market validation`);
+        }
+      }
+
       if (symbolsToScan.length === 0) {
         setScanProgress({ current: 0, total: 0 });
         addLog('Scanner idle: no symbols available to scan.', 'warning');
@@ -2125,7 +2183,7 @@ export default function App() {
       setScanning(false);
       setTimeout(() => setIsBotActive(false), 2000);
     }
-  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, liveEntriesPerCycle, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode]);
+  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, liveEntriesPerCycle, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode, knownUnsupportedLiveSymbols, pruneUnsupportedScanSymbols]);
  // Removed 'scanning' from dependencies
 
   const resetAccount = React.useCallback(() => {
