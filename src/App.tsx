@@ -883,9 +883,9 @@ export default function App() {
           if (!verified) {
             const orderId = result?.order?.id || result?.order?.clientOrderId || result?.order?.info?.orderId;
             const msg = `Order accepted by exchange but live position not yet visible${orderId ? ` (order ${orderId})` : ''}.`;
-            addLog(`REAL ${type} PENDING CONFIRMATION: ${tradeSymbol} - ${msg}`, 'warning');
-            setExecutionFeedback({ type: 'warning', message: `${type} submitted for ${tradeSymbol}. Waiting for position sync.` });
-            pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason: `PENDING CONFIRMATION: ${msg}`, status: 'FILLED', cycleId: eventCycleId });
+            addLog(`REAL ${type} UNCONFIRMED: ${tradeSymbol} - ${msg}`, 'warning');
+            setExecutionFeedback({ type: 'warning', message: `${type} unconfirmed for ${tradeSymbol}. Will retry on next cycle.` });
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason: `UNCONFIRMED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
             if (closingExisting) {
               lockEntries(closeFailureLockMinutes * 60 * 1000, `Close verification failed for ${tradeSymbol}. New entries paused for ${closeFailureLockMinutes}m.`);
             }
@@ -1017,9 +1017,9 @@ export default function App() {
 
         if (!isMarginOrFundsFailure && !isAuthFailure) {
           const pendingMsg = `Order submission for ${tradeSymbol} needs delayed confirmation (${msg}).`;
-          addLog(`REAL ${type} PENDING CONFIRMATION: ${pendingMsg}`, 'warning');
-          setExecutionFeedback({ type: 'warning', message: `${type} submitted for ${tradeSymbol}. Waiting for exchange confirmation.` });
-          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: heldAmount || 0, time, reason: `PENDING CONFIRMATION: ${msg}`, status: 'FILLED', cycleId: eventCycleId });
+          addLog(`REAL ${type} UNCONFIRMED: ${pendingMsg}`, 'warning');
+          setExecutionFeedback({ type: 'warning', message: `${type} unconfirmed for ${tradeSymbol}. Waiting for exchange confirmation.` });
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: heldAmount || 0, time, reason: `UNCONFIRMED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
           setTimeout(syncRealBalance, 1500);
           setTimeout(syncRealBalance, 4500);
           return;
@@ -1140,7 +1140,7 @@ export default function App() {
         }
       }
     }
-  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, loading, pushTradeEvent]);
+  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, loading, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes]);
 
 
 
@@ -1262,6 +1262,10 @@ export default function App() {
     if (price < 1) return price.toFixed(6);
     return price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 });
   };
+
+  const updateStrategyConfig = React.useCallback((partial: Partial<StrategyConfig>) => {
+    setStrategyConfig(prev => ({ ...prev, ...partial }));
+  }, []);
 
   // Emergency Drawdown Watcher
   useEffect(() => {
@@ -1491,7 +1495,7 @@ export default function App() {
       setScanning(false);
       setTimeout(() => setIsBotActive(false), 2000);
     }
-  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil]);
+  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, strategyConfig, liveQuoteAllowlistInput]);
  // Removed 'scanning' from dependencies
 
   const resetAccount = React.useCallback(() => {
@@ -1595,7 +1599,7 @@ export default function App() {
       clearInterval(refreshInterval);
       clearInterval(countdownInterval);
     };
-  }, [symbol, performScan, isRealMode, serverConfig?.exchange, serverStatus]);
+  }, [symbol, performScan, isRealMode, serverConfig?.exchange, serverStatus, scanIntervalSec, strategyConfig]);
 
   // Dedicated Portfolio Price Watcher (High Frequency)
   useEffect(() => {
@@ -1634,7 +1638,7 @@ export default function App() {
     pollHoldingPrices();
 
     return () => clearInterval(interval);
-  }, [holdings, serverStatus]);
+  }, [holdings, serverStatus, holdingPollIntervalSec]);
 
   useEffect(() => {
     if (holdings.length > 0) {
@@ -2232,6 +2236,120 @@ export default function App() {
                    >
                      {isDefensiveMode ? 'ACTIVE' : 'OFF'}
                    </button>
+                </div>
+
+                <div className="p-3 bg-white/5 border border-white/10 rounded-sm space-y-3">
+                  <p className="text-[10px] uppercase font-bold opacity-70">Strategy Criteria</p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <label className="text-[8px] uppercase opacity-60">Auto Entry Score
+                      <input type="number" min="0" max="10" step="0.5" value={autoEntryMinScore} onChange={(e) => setAutoEntryMinScore(parseFloat(e.target.value) || 0)} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Min Live Notional
+                      <input type="number" min="1" step="1" value={liveMinOrderNotional} onChange={(e) => setLiveMinOrderNotional(parseFloat(e.target.value) || 1)} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">MACD Fast
+                      <input type="number" min="1" step="1" value={strategyConfig.macdFastPeriod} onChange={(e) => updateStrategyConfig({ macdFastPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">MACD Slow
+                      <input type="number" min="2" step="1" value={strategyConfig.macdSlowPeriod} onChange={(e) => updateStrategyConfig({ macdSlowPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">MACD Signal
+                      <input type="number" min="1" step="1" value={strategyConfig.macdSignalPeriod} onChange={(e) => updateStrategyConfig({ macdSignalPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Continuation Score
+                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.continuationScore} onChange={(e) => updateStrategyConfig({ continuationScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">RSI Overbought
+                      <input type="number" min="50" max="95" step="1" value={strategyConfig.rsiOverbought} onChange={(e) => updateStrategyConfig({ rsiOverbought: parseFloat(e.target.value) || 70 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">RSI Oversold
+                      <input type="number" min="5" max="50" step="1" value={strategyConfig.rsiOversold} onChange={(e) => updateStrategyConfig({ rsiOversold: parseFloat(e.target.value) || 45 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Scan Interval (s)
+                      <input type="number" min="10" step="1" value={scanIntervalSec} onChange={(e) => setScanIntervalSec(Math.max(10, parseInt(e.target.value, 10) || 10))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Holding Poll (s)
+                      <input type="number" min="1" step="1" value={holdingPollIntervalSec} onChange={(e) => setHoldingPollIntervalSec(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Soft Cooldown (m)
+                      <input type="number" min="1" step="1" value={softCooldownMinutes} onChange={(e) => setSoftCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Success Cooldown (m)
+                      <input type="number" min="1" step="1" value={successCooldownMinutes} onChange={(e) => setSuccessCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Paper Loss Cooldown (m)
+                      <input type="number" min="1" step="1" value={paperLossCooldownMinutes} onChange={(e) => setPaperLossCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Order Lockout (s)
+                      <input type="number" min="1" step="1" value={duplicateOrderLockoutSec} onChange={(e) => setDuplicateOrderLockoutSec(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Live Entry Delay (ms)
+                      <input type="number" min="0" step="50" value={liveEntryDelayMs} onChange={(e) => setLiveEntryDelayMs(Math.max(0, parseInt(e.target.value, 10) || 0))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Min Paper Allocation
+                      <input type="number" min="1" step="1" value={minPaperAllocation} onChange={(e) => setMinPaperAllocation(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Low Margin Lock (m)
+                      <input type="number" min="1" step="1" value={lowMarginLockMinutes} onChange={(e) => setLowMarginLockMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Close Failure Lock (m)
+                      <input type="number" min="1" step="1" value={closeFailureLockMinutes} onChange={(e) => setCloseFailureLockMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Hard Failure Lock (m)
+                      <input type="number" min="1" step="1" value={hardFailureLockMinutes} onChange={(e) => setHardFailureLockMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Trend SMA Period
+                      <input type="number" min="2" step="1" value={strategyConfig.trendSmaPeriod} onChange={(e) => updateStrategyConfig({ trendSmaPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">RSI Period
+                      <input type="number" min="2" step="1" value={strategyConfig.rsiPeriod} onChange={(e) => updateStrategyConfig({ rsiPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">EMA Fast Period
+                      <input type="number" min="1" step="1" value={strategyConfig.emaFastPeriod} onChange={(e) => updateStrategyConfig({ emaFastPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">EMA Slow Period
+                      <input type="number" min="2" step="1" value={strategyConfig.emaSlowPeriod} onChange={(e) => updateStrategyConfig({ emaSlowPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Volume Lookback
+                      <input type="number" min="2" step="1" value={strategyConfig.volumeLookback} onChange={(e) => updateStrategyConfig({ volumeLookback: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Volume Multiplier
+                      <input type="number" min="0.1" step="0.1" value={strategyConfig.volumeMultiplier} onChange={(e) => updateStrategyConfig({ volumeMultiplier: Math.max(0.1, parseFloat(e.target.value) || 0.1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Support Lookback
+                      <input type="number" min="2" step="1" value={strategyConfig.supportLookback} onChange={(e) => updateStrategyConfig({ supportLookback: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Near Support (%)
+                      <input type="number" min="0.1" step="0.1" value={strategyConfig.nearSupportPercent} onChange={(e) => updateStrategyConfig({ nearSupportPercent: Math.max(0.1, parseFloat(e.target.value) || 0.1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Near Resistance (%)
+                      <input type="number" min="0.1" step="0.1" value={strategyConfig.nearResistancePercent} onChange={(e) => updateStrategyConfig({ nearResistancePercent: Math.max(0.1, parseFloat(e.target.value) || 0.1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Crossover Score
+                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.crossoverScore} onChange={(e) => updateStrategyConfig({ crossoverScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Trend Context Score
+                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextTrendScore} onChange={(e) => updateStrategyConfig({ contextTrendScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Volume Context Score
+                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextVolumeScore} onChange={(e) => updateStrategyConfig({ contextVolumeScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">MACD Context Score
+                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextMacdScore} onChange={(e) => updateStrategyConfig({ contextMacdScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">EMA Context Score
+                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextEmaScore} onChange={(e) => updateStrategyConfig({ contextEmaScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">RSI Context Score
+                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextRsiScore} onChange={(e) => updateStrategyConfig({ contextRsiScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                    <label className="text-[8px] uppercase opacity-60">Max Score
+                      <input type="number" min="1" max="10" step="0.5" value={strategyConfig.maxScore} onChange={(e) => updateStrategyConfig({ maxScore: Math.max(1, parseFloat(e.target.value) || 1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    </label>
+                  </div>
+                  <label className="text-[8px] uppercase opacity-60 block">Allowed Live Quotes (comma separated)
+                    <input type="text" value={liveQuoteAllowlistInput} onChange={(e) => setLiveQuoteAllowlistInput(e.target.value.toUpperCase())} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                  </label>
                 </div>
 
                 <div className="pt-4 border-t border-white/10">

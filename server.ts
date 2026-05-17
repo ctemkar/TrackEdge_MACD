@@ -1281,15 +1281,59 @@ async function startServer() {
             order = await submitMarketOrder(orderParams);
           } catch (primaryErr: any) {
             const primaryMsg = String(primaryErr?.message || '');
-            const isPositionModeMismatch = /position side does not match|positionSide|hedge mode/i.test(primaryMsg);
+            const isPositionModeMismatch = /position side does not match|positionSide|hedge mode|\b-4061\b|\"code\":-4061/i.test(primaryMsg);
+            const isReduceOnlyNotRequired = /reduceOnly.+not required|Parameter 'reduceOnly' sent when not required|\"code\":-1106/i.test(primaryMsg);
 
-            if (isPositionModeMismatch && orderParams.positionSide) {
-              // Retry once for one-way mode accounts that reject LONG/SHORT positionSide.
-              const retryParams = { ...orderParams };
-              delete retryParams.positionSide;
-              order = await submitMarketOrder(retryParams);
-            } else {
+            const retryVariants: Record<string, any>[] = [];
+            const pushVariant = (params: Record<string, any>) => {
+              const key = JSON.stringify(params, Object.keys(params).sort());
+              if (!retryVariants.some(v => JSON.stringify(v, Object.keys(v).sort()) === key)) {
+                retryVariants.push(params);
+              }
+            };
+
+            if (isPositionModeMismatch) {
+              // Try BOTH for one-way accounts first, then omit positionSide entirely.
+              const bothVariant = { ...orderParams, positionSide: 'BOTH' };
+              pushVariant(bothVariant);
+              const noSideVariant = { ...orderParams };
+              delete noSideVariant.positionSide;
+              pushVariant(noSideVariant);
+
+              // Strict fallbacks: remove optional flags that can conflict with account mode.
+              pushVariant({ positionSide: 'BOTH' });
+              pushVariant({});
+            }
+
+            if (isReduceOnlyNotRequired) {
+              const noReduceVariant = { ...orderParams };
+              delete noReduceVariant.reduceOnly;
+              pushVariant(noReduceVariant);
+            }
+
+            // Combined fallback: same strict variants should be re-tried if both errors occur together.
+            if (isPositionModeMismatch && isReduceOnlyNotRequired) {
+              pushVariant({ positionSide: 'BOTH' });
+              pushVariant({});
+            }
+
+            if (retryVariants.length === 0) {
               throw primaryErr;
+            }
+
+            let lastRetryErr: any = primaryErr;
+            for (const retryParams of retryVariants) {
+              try {
+                order = await submitMarketOrder(retryParams);
+                lastRetryErr = null;
+                break;
+              } catch (retryErr: any) {
+                lastRetryErr = retryErr;
+              }
+            }
+
+            if (!order && lastRetryErr) {
+              throw lastRetryErr;
             }
           }
       }
