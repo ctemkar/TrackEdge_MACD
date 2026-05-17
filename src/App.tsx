@@ -1979,9 +1979,9 @@ export default function App() {
       let allSymbols: { label: string; value: string }[];
       try {
         allSymbols = await fetchAllSymbols({
-          includeSpot: fullUniverseMode,
+          includeSpot: true,
           includeFutures: true,
-          fullUniverse: fullUniverseMode,
+          fullUniverse: true,
           allowedQuotes: liveQuoteAllowlist,
           forceBinancePublic: true,
         });
@@ -2014,28 +2014,8 @@ export default function App() {
       const baseSymbol = isRealMode ? liveNormalized(symbol) : symbol;
       const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
       let symbolsToScan = isLiveBinance
-        ? Array.from(new Set(candidateValues))
+        ? Array.from(new Set(candidateValues)).filter(isLikelyBinanceSymbol)
         : Array.from(new Set([baseSymbol, ...candidateValues]));
-
-      if (isLiveBinance && !fullUniverseMode) {
-        const beforeFilter = symbolsToScan.length;
-        symbolsToScan = symbolsToScan.filter(v => hasAllowedQuote(v) && isLikelyBinanceFuturesSymbol(v));
-        if (symbolsToScan.length < beforeFilter) {
-          console.log(`[Scanner] Filtered ${beforeFilter - symbolsToScan.length} non-futures symbols from scan universe`);
-        }
-      }
-
-      if (isLiveBinance && fullUniverseMode) {
-        symbolsToScan = symbolsToScan.filter(isLikelyBinanceSymbol);
-      }
-
-      if (isLiveBinance) {
-        const beforeBlockedFilter = symbolsToScan.length;
-        symbolsToScan = symbolsToScan.filter(v => !isUnsupportedLiveScanSymbol(v));
-        if (symbolsToScan.length < beforeBlockedFilter) {
-          console.log(`[Scanner] Skipped ${beforeBlockedFilter - symbolsToScan.length} unsupported symbols already rejected by market validation`);
-        }
-      }
 
       if (symbolsToScan.length === 0) {
         setScanProgress({ current: 0, total: 0 });
@@ -2107,28 +2087,32 @@ export default function App() {
       if (currentAutoTrade) {
         const potentialLongs = results
           .filter(r => r.signal.overall === 'BUY')
-          .filter(r => !isRealMode || hasAllowedQuote(r.symbol))
           .filter(r => !isLiveBinance || isLikelyBinanceFuturesSymbol(r.symbol))
-          .filter(r => !isLiveBinance || !isUnsupportedLiveScanSymbol(r.symbol))
           .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
           .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now());
 
         const potentialShorts = isRealMode
           ? results
               .filter(r => r.signal.overall === 'SELL')
-              .filter(r => hasAllowedQuote(r.symbol))
               .filter(r => !isLiveBinance || isLikelyBinanceFuturesSymbol(r.symbol))
-              .filter(r => !isLiveBinance || !isUnsupportedLiveScanSymbol(r.symbol))
               .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
               .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now())
           : [];
 
         const sortedLongs = potentialLongs
           .map(pick => ({ side: 'BUY' as const, pick }))
-          .sort((a, b) => b.pick.signal.score - a.pick.signal.score);
+          .sort((a, b) => {
+            const priorityDelta = (b.pick.priorityRank || 0) - (a.pick.priorityRank || 0);
+            if (priorityDelta !== 0) return priorityDelta;
+            return b.pick.signal.score - a.pick.signal.score;
+          });
         const sortedShorts = potentialShorts
           .map(pick => ({ side: 'SELL' as const, pick }))
-          .sort((a, b) => b.pick.signal.score - a.pick.signal.score);
+          .sort((a, b) => {
+            const priorityDelta = (b.pick.priorityRank || 0) - (a.pick.priorityRank || 0);
+            if (priorityDelta !== 0) return priorityDelta;
+            return b.pick.signal.score - a.pick.signal.score;
+          });
 
         const entries: Array<{ side: 'BUY' | 'SELL'; pick: typeof results[number] }> = [];
         const maxEntryCandidates = Math.max(sortedLongs.length, sortedShorts.length);
@@ -2217,9 +2201,9 @@ export default function App() {
       }
       try {
         const all = await fetchAllSymbols({
-          includeSpot: fullUniverseMode,
+          includeSpot: true,
           includeFutures: true,
-          fullUniverse: fullUniverseMode,
+          fullUniverse: true,
           allowedQuotes: liveQuoteAllowlist,
           forceBinancePublic: true,
         });

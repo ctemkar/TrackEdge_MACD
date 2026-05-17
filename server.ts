@@ -1848,12 +1848,14 @@ async function startServer() {
 
         // For scan-only mode, bypass Bybit and use Binance public metadata directly.
         const bybitSymbolsPrimary = forceBinancePublic ? [] : await fetchBybitSymbols();
+        const triedBybitSymbols = !forceBinancePublic;
         const deduped = new Map<string, any>();
         if (bybitSymbolsPrimary.length > 0) {
           bybitSymbolsPrimary.forEach(s => deduped.set(s.symbol, s));
         } else {
-          // Bybit failed — fall back to Binance
-          console.log('[TradeEdge] exchangeInfo: Bybit returned 0 symbols, falling back to Binance');
+          if (triedBybitSymbols) {
+            console.log('[TradeEdge] exchangeInfo: Bybit returned 0 symbols, falling back to Binance');
+          }
           if (includeFutures) {
             await fetchAndCollect('https://fapi.binance.com/fapi/v1/exchangeInfo', 'futures');
             if (res.headersSent) return;

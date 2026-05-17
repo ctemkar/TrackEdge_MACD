@@ -10,6 +10,7 @@ export interface MarketScanResult {
   quoteVolume?: number;
   rsi?: number;
   trend?: string;
+  priorityRank?: number;
 }
 
 function computeProfitabilityRank(result: MarketScanResult): number {
@@ -62,7 +63,7 @@ export async function scanMarket(
             : 0;
           const tickerStat = tickerStats.get(symbol.toUpperCase());
           
-          return {
+          const baseResult: MarketScanResult = {
             symbol,
             signal,
             lastPrice: lastCandle.close,
@@ -71,6 +72,11 @@ export async function scanMarket(
             quoteVolume: tickerStat?.quoteVolume || 0,
             rsi: indicators.rsi[indicators.rsi.length - 1],
             trend: signal.trend
+          };
+
+          return {
+            ...baseResult,
+            priorityRank: computeProfitabilityRank(baseResult),
           };
         }
       } catch (e) {
@@ -89,11 +95,11 @@ export async function scanMarket(
   }
   
   return results.sort((a, b) => {
+    const profitabilityDelta = (b.priorityRank || 0) - (a.priorityRank || 0);
+    if (profitabilityDelta !== 0) return profitabilityDelta;
+
     const scoreDelta = b.signal.score - a.signal.score;
     if (scoreDelta !== 0) return scoreDelta;
-
-    const profitabilityDelta = computeProfitabilityRank(b) - computeProfitabilityRank(a);
-    if (profitabilityDelta !== 0) return profitabilityDelta;
 
     const macdSpreadDelta = (b.macdSpread || 0) - (a.macdSpread || 0);
     if (macdSpreadDelta !== 0) return macdSpreadDelta;

@@ -224,44 +224,47 @@ export function evaluateStrategy(
   const trendBullish = trend === 'UP' && emaCrossover === 'BULLISH';
   const trendBearish = trend === 'DOWN' && emaCrossover === 'BEARISH';
 
-  const longQuality = (
-    (macdCrossover === 'BULLISH' || bullishMomentum) &&
-    trendBullish &&
-    volumeConfirmed &&
-    (nearSupport || !nearResistance) &&
-    !lateEntryRisk &&
-    !choppyMarket &&
-    !extremeVolatility &&
-    longRiskReward >= 2
-  );
+  // Keep EMA + trend alignment as mandatory regime filter; score the rest.
+  const longBase = (macdCrossover === 'BULLISH' || bullishMomentum) && trendBullish;
+  const shortBase = (macdCrossover === 'BEARISH' || bearishMomentum) && trendBearish;
 
-  const shortQuality = (
-    (macdCrossover === 'BEARISH' || bearishMomentum) &&
-    trendBearish &&
-    volumeConfirmed &&
-    (nearResistance || !nearSupport) &&
-    !lateEntryRisk &&
-    !choppyMarket &&
-    !extremeVolatility &&
-    shortRiskReward >= 2
-  );
+  let longChecks = 0;
+  if (volumeConfirmed) longChecks += 1;
+  if (nearSupport || !nearResistance) longChecks += 1;
+  if (!lateEntryRisk) longChecks += 1;
+  if (!choppyMarket) longChecks += 1;
+  if (!extremeVolatility) longChecks += 1;
+  if (longRiskReward >= 1.5) longChecks += 1;
+
+  let shortChecks = 0;
+  if (volumeConfirmed) shortChecks += 1;
+  if (nearResistance || !nearSupport) shortChecks += 1;
+  if (!lateEntryRisk) shortChecks += 1;
+  if (!choppyMarket) shortChecks += 1;
+  if (!extremeVolatility) shortChecks += 1;
+  if (shortRiskReward >= 1.5) shortChecks += 1;
+
+  const longQuality = longBase && longChecks >= 4;
+  const shortQuality = shortBase && shortChecks >= 4;
 
   let overall: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
   let score = 0;
   if (longQuality) {
     overall = 'BUY';
-    score = 6;
+    score = 5;
     if (macdCrossover === 'BULLISH') score += 1;
     if (bullishMomentum) score += 1;
-    if (longRiskReward >= 2.5) score += 1;
+    if (longRiskReward >= 2) score += 1;
     if (!weakeningMomentum) score += 1;
+    if (longChecks >= 5) score += 1;
   } else if (shortQuality) {
     overall = 'SELL';
-    score = 6;
+    score = 5;
     if (macdCrossover === 'BEARISH') score += 1;
     if (bearishMomentum) score += 1;
-    if (shortRiskReward >= 2.5) score += 1;
+    if (shortRiskReward >= 2) score += 1;
     if (!weakeningMomentum) score += 1;
+    if (shortChecks >= 5) score += 1;
   } else {
     // Conservative default: if confirmation is incomplete, hold.
     score = 0;
