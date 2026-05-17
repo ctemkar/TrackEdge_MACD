@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { TrendingUp, Activity, ShieldAlert, ShieldCheck, Info, Wallet, DollarSign, ArrowUpRight, ArrowDownRight, Search, Zap, Loader2, History, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { fetchBinanceData, subscribeToTicker, fetchAllSymbols, fetchTopSymbolsByVolume } from './services/binance';
@@ -48,11 +49,62 @@ const CRITERIA_HELP: Record<string, string> = {
 
 const CriteriaInfoLabel = ({ text, detail }: { text: string; detail: string }) => {
   const [isOpen, setIsOpen] = useState(false);
+  const [popoverPos, setPopoverPos] = useState<{ top: number; left: number } | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLSpanElement | null>(null);
+
+  useLayoutEffect(() => {
+    if (!isOpen) return;
+
+    const updatePopoverPosition = () => {
+      const trigger = triggerRef.current;
+      if (!trigger) return;
+
+      const rect = trigger.getBoundingClientRect();
+      const maxWidth = Math.min(352, window.innerWidth - 32);
+      const left = Math.max(16, Math.min(rect.left, window.innerWidth - maxWidth - 16));
+      const top = rect.bottom + 8;
+      setPopoverPos({ top, left });
+    };
+
+    updatePopoverPosition();
+    window.addEventListener('resize', updatePopoverPosition);
+    window.addEventListener('scroll', updatePopoverPosition, true);
+
+    return () => {
+      window.removeEventListener('resize', updatePopoverPosition);
+      window.removeEventListener('scroll', updatePopoverPosition, true);
+    };
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (triggerRef.current?.contains(target)) return;
+      if (popoverRef.current?.contains(target)) return;
+      setIsOpen(false);
+    };
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsOpen(false);
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleEscape);
+
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleEscape);
+    };
+  }, [isOpen]);
 
   return (
     <span className="relative inline-flex items-center gap-1">
       <span>{text}</span>
       <button
+        ref={triggerRef}
         type="button"
         onClick={(event) => {
           event.preventDefault();
@@ -60,15 +112,20 @@ const CriteriaInfoLabel = ({ text, detail }: { text: string; detail: string }) =
           setIsOpen(prev => !prev);
         }}
         aria-label={`${text} details`}
-        className="inline-flex h-3.5 min-w-[14px] items-center justify-center rounded-full border border-cyan-400/50 bg-cyan-500/10 px-1 text-[7px] font-black leading-none text-cyan-300 hover:bg-cyan-500/20"
+        className="inline-flex h-5 min-w-[20px] items-center justify-center rounded-full border border-cyan-400/60 bg-cyan-500/15 px-1.5 text-[10px] font-black leading-none text-cyan-200 hover:bg-cyan-500/25"
       >
         @i
       </button>
-      {isOpen && (
-        <span className="absolute left-0 top-full z-[9999] mt-1 w-56 rounded-sm border border-cyan-400/40 bg-[#0a1a20] px-2 py-2 text-[9px] normal-case leading-relaxed text-cyan-100 shadow-[0_8px_32px_rgba(0,0,0,0.8)]">
-          <span className="mb-1 block text-[8px] font-black uppercase tracking-wide text-cyan-300">{text}</span>
+      {isOpen && popoverPos && createPortal(
+        <span
+          ref={popoverRef}
+          className="fixed z-[9999] w-[min(28rem,calc(100vw-2rem))] rounded-sm border border-cyan-400/40 bg-[#0a1a20] px-4 py-3.5 text-[16px] normal-case leading-relaxed text-cyan-100 shadow-[0_8px_32px_rgba(0,0,0,0.8)]"
+          style={{ top: popoverPos.top, left: popoverPos.left }}
+        >
+          <span className="mb-2 block text-[14px] font-black uppercase tracking-wide text-cyan-300">{text}</span>
           <span>{detail}</span>
-        </span>
+        </span>,
+        document.body
       )}
     </span>
   );
@@ -1978,7 +2035,6 @@ export default function App() {
   };
   
   const equity = calculateEquity();
-  const totalInvested = holdings.reduce((acc, h) => acc + (h.amount * h.entryPrice), 0);
   const resolveHoldingPnl = (h: Holding) => {
     const mark = h.markPrice || holdingPrices[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice) || h.entryPrice;
     const contracts = Number(h.contracts || h.amount || 0);
@@ -2016,8 +2072,11 @@ export default function App() {
   const totalPnl = pnl;
   const openPnl = displayedUnrealizedRisk;
   const realizedPnl = totalPnl - openPnl;
-  const investedPct = equity > 0 ? (totalInvested / equity) * 100 : 0;
   const displayedAvailableFunds = isRealMode ? availableFunds : balance;
+  const usedCapital = Math.max(0, equity - displayedAvailableFunds);
+  const investedPct = equity > 0
+    ? Math.min(100, Math.max(0, (usedCapital / equity) * 100))
+    : 0;
   const entryLockActive = entryLockUntil > Date.now();
   const entryLockRemainingSec = entryLockActive ? Math.max(1, Math.ceil((entryLockUntil - Date.now()) / 1000)) : 0;
   const entryLockRetryTime = entryLockActive ? new Date(entryLockUntil).toLocaleTimeString() : '';
@@ -2543,117 +2602,117 @@ export default function App() {
                     </div>
                   </div>
                   <div className="grid grid-cols-2 gap-2">
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Auto Entry Score" detail={CRITERIA_HELP.autoEntryMinScore} />
-                      <input type="number" min="0" max="10" step="0.5" value={autoEntryMinScore} onChange={(e) => setAutoEntryMinScore(parseFloat(e.target.value) || 0)} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Auto Entry Score" detail={CRITERIA_HELP.autoEntryMinScore} />
+                      <input type="number" min="0" max="10" step="0.5" value={autoEntryMinScore} onChange={(e) => setAutoEntryMinScore(parseFloat(e.target.value) || 0)} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Min Live Notional" detail={CRITERIA_HELP.liveMinOrderNotional} />
-                      <input type="number" min="1" step="1" value={liveMinOrderNotional} onChange={(e) => setLiveMinOrderNotional(parseFloat(e.target.value) || 1)} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Min Live Notional" detail={CRITERIA_HELP.liveMinOrderNotional} />
+                      <input type="number" min="1" step="1" value={liveMinOrderNotional} onChange={(e) => setLiveMinOrderNotional(parseFloat(e.target.value) || 1)} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="MACD Fast" detail={CRITERIA_HELP.macdFastPeriod} />
-                      <input type="number" min="1" step="1" value={strategyConfig.macdFastPeriod} onChange={(e) => updateStrategyConfig({ macdFastPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="MACD Fast" detail={CRITERIA_HELP.macdFastPeriod} />
+                      <input type="number" min="1" step="1" value={strategyConfig.macdFastPeriod} onChange={(e) => updateStrategyConfig({ macdFastPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="MACD Slow" detail={CRITERIA_HELP.macdSlowPeriod} />
-                      <input type="number" min="2" step="1" value={strategyConfig.macdSlowPeriod} onChange={(e) => updateStrategyConfig({ macdSlowPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="MACD Slow" detail={CRITERIA_HELP.macdSlowPeriod} />
+                      <input type="number" min="2" step="1" value={strategyConfig.macdSlowPeriod} onChange={(e) => updateStrategyConfig({ macdSlowPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="MACD Signal" detail={CRITERIA_HELP.macdSignalPeriod} />
-                      <input type="number" min="1" step="1" value={strategyConfig.macdSignalPeriod} onChange={(e) => updateStrategyConfig({ macdSignalPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="MACD Signal" detail={CRITERIA_HELP.macdSignalPeriod} />
+                      <input type="number" min="1" step="1" value={strategyConfig.macdSignalPeriod} onChange={(e) => updateStrategyConfig({ macdSignalPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Continuation Score" detail={CRITERIA_HELP.continuationScore} />
-                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.continuationScore} onChange={(e) => updateStrategyConfig({ continuationScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Continuation Score" detail={CRITERIA_HELP.continuationScore} />
+                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.continuationScore} onChange={(e) => updateStrategyConfig({ continuationScore: parseFloat(e.target.value) || 0 })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="RSI Overbought" detail={CRITERIA_HELP.rsiOverbought} />
-                      <input type="number" min="50" max="95" step="1" value={strategyConfig.rsiOverbought} onChange={(e) => updateStrategyConfig({ rsiOverbought: parseFloat(e.target.value) || 70 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="RSI Overbought" detail={CRITERIA_HELP.rsiOverbought} />
+                      <input type="number" min="50" max="95" step="1" value={strategyConfig.rsiOverbought} onChange={(e) => updateStrategyConfig({ rsiOverbought: parseFloat(e.target.value) || 70 })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="RSI Oversold" detail={CRITERIA_HELP.rsiOversold} />
-                      <input type="number" min="5" max="50" step="1" value={strategyConfig.rsiOversold} onChange={(e) => updateStrategyConfig({ rsiOversold: parseFloat(e.target.value) || 45 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="RSI Oversold" detail={CRITERIA_HELP.rsiOversold} />
+                      <input type="number" min="5" max="50" step="1" value={strategyConfig.rsiOversold} onChange={(e) => updateStrategyConfig({ rsiOversold: parseFloat(e.target.value) || 45 })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Scan Interval (s)" detail={CRITERIA_HELP.scanIntervalSec} />
-                      <input type="number" min="10" step="1" value={scanIntervalSec} onChange={(e) => setScanIntervalSec(Math.max(10, parseInt(e.target.value, 10) || 10))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Scan Interval (s)" detail={CRITERIA_HELP.scanIntervalSec} />
+                      <input type="number" min="10" step="1" value={scanIntervalSec} onChange={(e) => setScanIntervalSec(Math.max(10, parseInt(e.target.value, 10) || 10))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Holding Poll (s)" detail={CRITERIA_HELP.holdingPollIntervalSec} />
-                      <input type="number" min="3" step="1" value={holdingPollIntervalSec} onChange={(e) => setHoldingPollIntervalSec(Math.max(3, parseInt(e.target.value, 10) || 3))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Holding Poll (s)" detail={CRITERIA_HELP.holdingPollIntervalSec} />
+                      <input type="number" min="3" step="1" value={holdingPollIntervalSec} onChange={(e) => setHoldingPollIntervalSec(Math.max(3, parseInt(e.target.value, 10) || 3))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Max Symbols / Scan" detail={CRITERIA_HELP.maxSymbolsPerScan} />
-                      <input type="number" min="20" max="200" step="5" value={maxSymbolsPerScan} onChange={(e) => setMaxSymbolsPerScan(Math.max(20, Math.min(200, parseInt(e.target.value, 10) || 20)))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Max Symbols / Scan" detail={CRITERIA_HELP.maxSymbolsPerScan} />
+                      <input type="number" min="20" max="200" step="5" value={maxSymbolsPerScan} onChange={(e) => setMaxSymbolsPerScan(Math.max(20, Math.min(200, parseInt(e.target.value, 10) || 20)))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Soft Cooldown (m)" detail={CRITERIA_HELP.softCooldownMinutes} />
-                      <input type="number" min="1" step="1" value={softCooldownMinutes} onChange={(e) => setSoftCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Soft Cooldown (m)" detail={CRITERIA_HELP.softCooldownMinutes} />
+                      <input type="number" min="1" step="1" value={softCooldownMinutes} onChange={(e) => setSoftCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Success Cooldown (m)" detail={CRITERIA_HELP.successCooldownMinutes} />
-                      <input type="number" min="1" step="1" value={successCooldownMinutes} onChange={(e) => setSuccessCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Success Cooldown (m)" detail={CRITERIA_HELP.successCooldownMinutes} />
+                      <input type="number" min="1" step="1" value={successCooldownMinutes} onChange={(e) => setSuccessCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Paper Loss Cooldown (m)" detail={CRITERIA_HELP.paperLossCooldownMinutes} />
-                      <input type="number" min="1" step="1" value={paperLossCooldownMinutes} onChange={(e) => setPaperLossCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Paper Loss Cooldown (m)" detail={CRITERIA_HELP.paperLossCooldownMinutes} />
+                      <input type="number" min="1" step="1" value={paperLossCooldownMinutes} onChange={(e) => setPaperLossCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Order Lockout (s)" detail={CRITERIA_HELP.duplicateOrderLockoutSec} />
-                      <input type="number" min="1" step="1" value={duplicateOrderLockoutSec} onChange={(e) => setDuplicateOrderLockoutSec(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Order Lockout (s)" detail={CRITERIA_HELP.duplicateOrderLockoutSec} />
+                      <input type="number" min="1" step="1" value={duplicateOrderLockoutSec} onChange={(e) => setDuplicateOrderLockoutSec(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Live Entry Delay (ms)" detail={CRITERIA_HELP.liveEntryDelayMs} />
-                      <input type="number" min="0" step="50" value={liveEntryDelayMs} onChange={(e) => setLiveEntryDelayMs(Math.max(0, parseInt(e.target.value, 10) || 0))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Live Entry Delay (ms)" detail={CRITERIA_HELP.liveEntryDelayMs} />
+                      <input type="number" min="0" step="50" value={liveEntryDelayMs} onChange={(e) => setLiveEntryDelayMs(Math.max(0, parseInt(e.target.value, 10) || 0))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Min Paper Allocation" detail={CRITERIA_HELP.minPaperAllocation} />
-                      <input type="number" min="1" step="1" value={minPaperAllocation} onChange={(e) => setMinPaperAllocation(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Min Paper Allocation" detail={CRITERIA_HELP.minPaperAllocation} />
+                      <input type="number" min="1" step="1" value={minPaperAllocation} onChange={(e) => setMinPaperAllocation(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Low Margin Lock (m)" detail={CRITERIA_HELP.lowMarginLockMinutes} />
-                      <input type="number" min="1" step="1" value={lowMarginLockMinutes} onChange={(e) => setLowMarginLockMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Low Margin Lock (m)" detail={CRITERIA_HELP.lowMarginLockMinutes} />
+                      <input type="number" min="1" step="1" value={lowMarginLockMinutes} onChange={(e) => setLowMarginLockMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Close Failure Lock (m)" detail={CRITERIA_HELP.closeFailureLockMinutes} />
-                      <input type="number" min="1" step="1" value={closeFailureLockMinutes} onChange={(e) => setCloseFailureLockMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Close Failure Lock (m)" detail={CRITERIA_HELP.closeFailureLockMinutes} />
+                      <input type="number" min="1" step="1" value={closeFailureLockMinutes} onChange={(e) => setCloseFailureLockMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Hard Failure Lock (m)" detail={CRITERIA_HELP.hardFailureLockMinutes} />
-                      <input type="number" min="1" step="1" value={hardFailureLockMinutes} onChange={(e) => setHardFailureLockMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Hard Failure Lock (m)" detail={CRITERIA_HELP.hardFailureLockMinutes} />
+                      <input type="number" min="1" step="1" value={hardFailureLockMinutes} onChange={(e) => setHardFailureLockMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Trend SMA Period" detail={CRITERIA_HELP.trendSmaPeriod} />
-                      <input type="number" min="2" step="1" value={strategyConfig.trendSmaPeriod} onChange={(e) => updateStrategyConfig({ trendSmaPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Trend SMA Period" detail={CRITERIA_HELP.trendSmaPeriod} />
+                      <input type="number" min="2" step="1" value={strategyConfig.trendSmaPeriod} onChange={(e) => updateStrategyConfig({ trendSmaPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="RSI Period" detail={CRITERIA_HELP.rsiPeriod} />
-                      <input type="number" min="2" step="1" value={strategyConfig.rsiPeriod} onChange={(e) => updateStrategyConfig({ rsiPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="RSI Period" detail={CRITERIA_HELP.rsiPeriod} />
+                      <input type="number" min="2" step="1" value={strategyConfig.rsiPeriod} onChange={(e) => updateStrategyConfig({ rsiPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="EMA Fast Period" detail={CRITERIA_HELP.emaFastPeriod} />
-                      <input type="number" min="1" step="1" value={strategyConfig.emaFastPeriod} onChange={(e) => updateStrategyConfig({ emaFastPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="EMA Fast Period" detail={CRITERIA_HELP.emaFastPeriod} />
+                      <input type="number" min="1" step="1" value={strategyConfig.emaFastPeriod} onChange={(e) => updateStrategyConfig({ emaFastPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="EMA Slow Period" detail={CRITERIA_HELP.emaSlowPeriod} />
-                      <input type="number" min="2" step="1" value={strategyConfig.emaSlowPeriod} onChange={(e) => updateStrategyConfig({ emaSlowPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="EMA Slow Period" detail={CRITERIA_HELP.emaSlowPeriod} />
+                      <input type="number" min="2" step="1" value={strategyConfig.emaSlowPeriod} onChange={(e) => updateStrategyConfig({ emaSlowPeriod: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Volume Lookback" detail={CRITERIA_HELP.volumeLookback} />
-                      <input type="number" min="2" step="1" value={strategyConfig.volumeLookback} onChange={(e) => updateStrategyConfig({ volumeLookback: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Volume Lookback" detail={CRITERIA_HELP.volumeLookback} />
+                      <input type="number" min="2" step="1" value={strategyConfig.volumeLookback} onChange={(e) => updateStrategyConfig({ volumeLookback: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Volume Multiplier" detail={CRITERIA_HELP.volumeMultiplier} />
-                      <input type="number" min="0.1" step="0.1" value={strategyConfig.volumeMultiplier} onChange={(e) => updateStrategyConfig({ volumeMultiplier: Math.max(0.1, parseFloat(e.target.value) || 0.1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Volume Multiplier" detail={CRITERIA_HELP.volumeMultiplier} />
+                      <input type="number" min="0.1" step="0.1" value={strategyConfig.volumeMultiplier} onChange={(e) => updateStrategyConfig({ volumeMultiplier: Math.max(0.1, parseFloat(e.target.value) || 0.1) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Support Lookback" detail={CRITERIA_HELP.supportLookback} />
-                      <input type="number" min="2" step="1" value={strategyConfig.supportLookback} onChange={(e) => updateStrategyConfig({ supportLookback: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Support Lookback" detail={CRITERIA_HELP.supportLookback} />
+                      <input type="number" min="2" step="1" value={strategyConfig.supportLookback} onChange={(e) => updateStrategyConfig({ supportLookback: Math.max(2, parseInt(e.target.value, 10) || 2) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Near Support (%)" detail={CRITERIA_HELP.nearSupportPercent} />
-                      <input type="number" min="0.1" step="0.1" value={strategyConfig.nearSupportPercent} onChange={(e) => updateStrategyConfig({ nearSupportPercent: Math.max(0.1, parseFloat(e.target.value) || 0.1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Near Support (%)" detail={CRITERIA_HELP.nearSupportPercent} />
+                      <input type="number" min="0.1" step="0.1" value={strategyConfig.nearSupportPercent} onChange={(e) => updateStrategyConfig({ nearSupportPercent: Math.max(0.1, parseFloat(e.target.value) || 0.1) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Near Resistance (%)" detail={CRITERIA_HELP.nearResistancePercent} />
-                      <input type="number" min="0.1" step="0.1" value={strategyConfig.nearResistancePercent} onChange={(e) => updateStrategyConfig({ nearResistancePercent: Math.max(0.1, parseFloat(e.target.value) || 0.1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Near Resistance (%)" detail={CRITERIA_HELP.nearResistancePercent} />
+                      <input type="number" min="0.1" step="0.1" value={strategyConfig.nearResistancePercent} onChange={(e) => updateStrategyConfig({ nearResistancePercent: Math.max(0.1, parseFloat(e.target.value) || 0.1) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Crossover Score" detail={CRITERIA_HELP.crossoverScore} />
-                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.crossoverScore} onChange={(e) => updateStrategyConfig({ crossoverScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Crossover Score" detail={CRITERIA_HELP.crossoverScore} />
+                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.crossoverScore} onChange={(e) => updateStrategyConfig({ crossoverScore: parseFloat(e.target.value) || 0 })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Trend Context Score" detail={CRITERIA_HELP.contextTrendScore} />
-                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextTrendScore} onChange={(e) => updateStrategyConfig({ contextTrendScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Trend Context Score" detail={CRITERIA_HELP.contextTrendScore} />
+                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextTrendScore} onChange={(e) => updateStrategyConfig({ contextTrendScore: parseFloat(e.target.value) || 0 })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Volume Context Score" detail={CRITERIA_HELP.contextVolumeScore} />
-                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextVolumeScore} onChange={(e) => updateStrategyConfig({ contextVolumeScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Volume Context Score" detail={CRITERIA_HELP.contextVolumeScore} />
+                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextVolumeScore} onChange={(e) => updateStrategyConfig({ contextVolumeScore: parseFloat(e.target.value) || 0 })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="MACD Context Score" detail={CRITERIA_HELP.contextMacdScore} />
-                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextMacdScore} onChange={(e) => updateStrategyConfig({ contextMacdScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="MACD Context Score" detail={CRITERIA_HELP.contextMacdScore} />
+                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextMacdScore} onChange={(e) => updateStrategyConfig({ contextMacdScore: parseFloat(e.target.value) || 0 })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="EMA Context Score" detail={CRITERIA_HELP.contextEmaScore} />
-                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextEmaScore} onChange={(e) => updateStrategyConfig({ contextEmaScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="EMA Context Score" detail={CRITERIA_HELP.contextEmaScore} />
+                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextEmaScore} onChange={(e) => updateStrategyConfig({ contextEmaScore: parseFloat(e.target.value) || 0 })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="RSI Context Score" detail={CRITERIA_HELP.contextRsiScore} />
-                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextRsiScore} onChange={(e) => updateStrategyConfig({ contextRsiScore: parseFloat(e.target.value) || 0 })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="RSI Context Score" detail={CRITERIA_HELP.contextRsiScore} />
+                      <input type="number" min="0" max="10" step="0.5" value={strategyConfig.contextRsiScore} onChange={(e) => updateStrategyConfig({ contextRsiScore: parseFloat(e.target.value) || 0 })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
-                    <label className="text-[8px] uppercase opacity-60"><CriteriaInfoLabel text="Max Score" detail={CRITERIA_HELP.maxScore} />
-                      <input type="number" min="1" max="10" step="0.5" value={strategyConfig.maxScore} onChange={(e) => updateStrategyConfig({ maxScore: Math.max(1, parseFloat(e.target.value) || 1) })} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Max Score" detail={CRITERIA_HELP.maxScore} />
+                      <input type="number" min="1" max="10" step="0.5" value={strategyConfig.maxScore} onChange={(e) => updateStrategyConfig({ maxScore: Math.max(1, parseFloat(e.target.value) || 1) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
                   </div>
-                  <label className="text-[8px] uppercase opacity-60 block"><CriteriaInfoLabel text="Allowed Live Quotes (comma separated)" detail={CRITERIA_HELP.liveQuoteAllowlistInput} />
-                    <input type="text" value={liveQuoteAllowlistInput} onChange={(e) => setLiveQuoteAllowlistInput(e.target.value.toUpperCase())} className="mt-1 w-full bg-black/40 border border-white/10 rounded-sm px-2 py-1 text-[10px] font-mono" />
+                  <label className="text-[18px] uppercase opacity-70 block"><CriteriaInfoLabel text="Allowed Live Quotes (comma separated)" detail={CRITERIA_HELP.liveQuoteAllowlistInput} />
+                    <input type="text" value={liveQuoteAllowlistInput} onChange={(e) => setLiveQuoteAllowlistInput(e.target.value.toUpperCase())} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                   </label>
                 </div>
 
@@ -2950,7 +3009,7 @@ export default function App() {
               icon={<Activity className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Budget Efficiency"
               value={`${investedPct.toFixed(1)}%`}
-              subValue="Asset Allocation %"
+              subValue="Used Equity %"
             />
           </div>
 
