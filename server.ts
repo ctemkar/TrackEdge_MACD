@@ -140,6 +140,110 @@ async function startServer() {
     }
   };
 
+  // Secondary direct Binance helper: fetch positions from account endpoints.
+  // Useful when /fapi/v2/positionRisk is blocked but account endpoints are still allowed.
+  const fetchBinancePositionsFromAccountViaHttp = async (
+    apiKey: string,
+    apiSecret: string,
+  ): Promise<{ 
+    positions: any[]; 
+    authError: boolean; 
+    message?: string;
+    accountData?: any;
+  }> => {
+    const signedGet = async (baseUrl: string, endpoint: string) => {
+      const timestamp = Date.now();
+      const params = new URLSearchParams({ timestamp: String(timestamp) });
+      const queryString = params.toString();
+      const signature = crypto
+        .createHmac('sha256', apiSecret)
+        .update(queryString)
+        .digest('hex');
+
+      const url = `${baseUrl}${endpoint}?${queryString}&signature=${signature}`;
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'X-MBX-APIKEY': apiKey,
+          'Content-Type': 'application/json',
+        },
+      });
+
+      const text = await response.text();
+      let data: any = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = null;
+      }
+
+      return { ok: response.ok, status: response.status, text, data };
+    };
+
+    try {
+      const attempts = [
+        { label: 'fapi-account', baseUrl: 'https://fapi.binance.com', endpoint: '/fapi/v2/account' },
+        { label: 'papi-um-account', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/account' },
+      ];
+
+      let sawAuthError = false;
+      const errors: string[] = [];
+      let lastAccountData: any = null;
+
+      for (const attempt of attempts) {
+        try {
+          const response = await signedGet(attempt.baseUrl, attempt.endpoint);
+          if (!response.ok) {
+            const preview = String(response.text || '').substring(0, 140);
+            const authFail = response.status === 401 || isBinanceAuthErrorMessage(preview);
+            sawAuthError = sawAuthError || authFail;
+            errors.push(`${attempt.label}:${response.status}:${preview}`);
+            continue;
+          }
+
+          lastAccountData = response.data;
+          const rows = Array.isArray(response.data?.positions) ? response.data.positions : [];
+          const activeRows = rows.filter((p: any) => {
+            const amt = Number(p?.positionAmt || 0);
+            return Number.isFinite(amt) && Math.abs(amt) > 0;
+          });
+
+          if (activeRows.length > 0 || rows.length === 0) {
+            logWithThrottle(
+              'log',
+              `binance-account-positions-${attempt.label}-${activeRows.length}`,
+              `[TradeEdge] ${attempt.label} returned ${activeRows.length} active positions, totalWalletBalance=${response.data?.totalWalletBalance}, totalUnrealizedProfit=${response.data?.totalUnrealizedProfit}, canWithdraw=${response.data?.canWithdraw}`,
+              60 * 1000,
+            );
+            return { 
+              positions: activeRows, 
+              authError: false,
+              accountData: response.data
+            };
+          }
+        } catch (e: any) {
+          const msg = String(e?.message || 'unknown error');
+          if (isBinanceAuthErrorMessage(msg)) sawAuthError = true;
+          errors.push(`${attempt.label}:exception:${msg}`);
+        }
+      }
+
+      return {
+        positions: [],
+        authError: sawAuthError,
+        message: errors.slice(0, 2).join(' | '),
+        accountData: lastAccountData,
+      };
+    } catch (e: any) {
+      const msg = String(e?.message || 'unknown error');
+      return {
+        positions: [],
+        authError: isBinanceAuthErrorMessage(msg),
+        message: msg,
+      };
+    }
+  };
+
   // Exchange Client (Lazy Init)
   let exchangeInstance: ccxt.Exchange | null = null;
   const hasConfiguredKeys = () => !!(
@@ -547,7 +651,10 @@ async function startServer() {
           const sideRaw = String(input?.side || input?.positionSide || input?.info?.positionSide || '').toUpperCase();
           const inferredSide: 'LONG' | 'SHORT' = sideRaw === 'SHORT' || rawAmt < 0 ? 'SHORT' : 'LONG';
           const entry = Number(input?.entryPrice ?? input?.info?.entryPrice ?? 0);
-          const unrealized = Number(input?.unrealizedPnl ?? input?.unRealizedProfit ?? input?.info?.unRealizedProfit ?? 0);
+          const rawUnrealized = input?.unrealizedPnl ?? input?.unRealizedProfit ?? input?.info?.unRealizedProfit;
+          const unrealized = rawUnrealized === undefined || rawUnrealized === null || rawUnrealized === ''
+            ? undefined
+            : Number(rawUnrealized);
           const mark = Number(input?.markPrice ?? input?.info?.markPrice ?? 0);
           const leverage = Number(input?.leverage ?? input?.info?.leverage ?? 0);
           const rawNotional = Number(input?.notional ?? input?.info?.notional ?? 0);
@@ -623,6 +730,28 @@ async function startServer() {
               'sync-direct-http-zero-positions',
               `[TradeEdge Sync] Direct HTTP API returned 0 positions (may lack permissions)`,
             );
+
+            // SECONDARY: Try account endpoints to pull active positions periodically from exchange state.
+            const accountPositionResult = await fetchBinancePositionsFromAccountViaHttp(binanceKey, binanceSecret);
+            const accountPositions = accountPositionResult.positions;
+            if (accountPositionResult.authError) {
+              authDegraded = true;
+              if (!authDegradedMessage) {
+                authDegradedMessage = accountPositionResult.message || 'Binance account position endpoints returned auth error.';
+              }
+            }
+            if (accountPositions.length > 0) {
+              console.log(`[TradeEdge Sync] Recovered ${accountPositions.length} positions via Binance account endpoints`);
+              accountPositions.forEach(upsertPosition);
+              positionsFetched = true;
+            }
+            
+            // CAPTURE account balance data from the response (totalWalletBalance, totalUnrealizedProfit, etc.)
+            // Note: papi response structure may differ, so also fall back to calculating from CCXT info if needed
+            if (accountPositionResult.accountData) {
+              const acctData = accountPositionResult.accountData;
+              console.log(`[TradeEdge Sync DEBUG] Account data keys: ${Object.keys(acctData).join(', ')}`);
+            }
           }
         }
         
@@ -631,7 +760,9 @@ async function startServer() {
           const umAssets = b.info.filter((row: any) => {
             const umBal = Number(row?.umWalletBalance || 0);
             const umPnl = Number(row?.umUnrealizedPNL || 0);
-            return umBal !== 0 || umPnl !== 0;
+            const positionInitialMargin = Number(row?.positionInitialMargin || 0);
+            const openOrderInitialMargin = Number(row?.openOrderInitialMargin || 0);
+            return umBal !== 0 || umPnl !== 0 || positionInitialMargin > 0 || openOrderInitialMargin > 0;
           });
           
           if (umAssets.length > 0) {
@@ -764,15 +895,21 @@ async function startServer() {
           const u = Number((p as any)?.unrealizedPnl);
           return Number.isFinite(u) ? sum + u : sum;
         }, 0);
+        console.log(`[TradeEdge Sync DEBUG] totalUnrealizedPnl from positions: ${totalUnrealizedPnl}`);
 
         // ALSO add UM unrealized PnL from the account info (UM = Unified Margin positions in futures)
         if (Array.isArray(b.info) && totalUnrealizedPnl === 0) {
           const umPnlSum = b.info.reduce((sum: number, row: any) => {
             const umPnl = Number(row?.umUnrealizedPNL || 0);
+            if (Number.isFinite(umPnl) && umPnl !== 0) {
+              console.log(`[TradeEdge Sync DEBUG] ${row.asset}: umUnrealizedPNL=${umPnl}`);
+            }
             return sum + (Number.isFinite(umPnl) ? umPnl : 0);
           }, 0);
+          console.log(`[TradeEdge Sync DEBUG] umPnlSum from info array: ${umPnlSum}`);
           if (umPnlSum !== 0) {
             totalUnrealizedPnl = umPnlSum;
+            console.log(`[TradeEdge Sync DEBUG] Using umPnlSum as totalUnrealizedPnl: ${totalUnrealizedPnl}`);
           }
         }
       }

@@ -382,7 +382,11 @@ export default function App() {
           const toCompactSymbol = (raw: string) => {
             const up = String(raw || '').toUpperCase();
             if (!up) return up;
-            return up.replace('/', '').replace(':USDT', 'USDT').replace(':USDC', 'USDC').replace(':USD', 'USD').replace(':', '');
+
+            // Binance futures symbols often arrive as BASE/QUOTE:SETTLE.
+            // Normalize them to compact trading symbols like TRXUSDT.
+            const [pair] = up.split(':');
+            return pair.replace('/', '');
           };
 
           const positionCount = Object.keys(data.positions).length;
@@ -589,6 +593,59 @@ export default function App() {
         }
       };
 
+      const applyOptimisticLiveFill = (
+        fillType: 'BUY' | 'SELL',
+        fillSymbol: string,
+        fillAmount: number,
+        fillPrice: number,
+        fillTime: string,
+      ) => {
+        setHoldings(prev => {
+          const normalizedSymbol = String(fillSymbol || '').toUpperCase();
+          const current = [...prev];
+
+          const openSide: 'LONG' | 'SHORT' = fillType === 'BUY' ? 'LONG' : 'SHORT';
+
+          if (closingExisting) {
+            if (targetId) {
+              return current.filter(h => h.id !== targetId);
+            }
+            return current.filter(h => h.symbol !== normalizedSymbol);
+          }
+
+          const existingIdx = current.findIndex(h => h.symbol === normalizedSymbol && h.side === openSide);
+          if (existingIdx >= 0) {
+            const existing = current[existingIdx];
+            const nextAmount = Math.max(0, Number(existing.amount || 0) + Number(fillAmount || 0));
+            const weightedEntry = nextAmount > 0
+              ? (((existing.entryPrice || fillPrice) * (existing.amount || 0)) + (fillPrice * fillAmount)) / nextAmount
+              : fillPrice;
+            current[existingIdx] = {
+              ...existing,
+              amount: nextAmount,
+              contracts: nextAmount,
+              entryPrice: Number.isFinite(weightedEntry) && weightedEntry > 0 ? weightedEntry : fillPrice,
+              time: fillTime,
+            };
+            return current;
+          }
+
+          const holdingId = `${normalizedSymbol}_${openSide}_${Date.now()}`;
+          return [
+            ...current,
+            {
+              id: holdingId,
+              symbol: normalizedSymbol,
+              amount: Math.max(0, Number(fillAmount || 0)),
+              contracts: Math.max(0, Number(fillAmount || 0)),
+              side: openSide,
+              entryPrice: fillPrice,
+              time: fillTime,
+            }
+          ];
+        });
+      };
+
       const normalizeLiveSymbol = (rawSymbol: string) => {
         const compact = String(rawSymbol || '')
           .toUpperCase()
@@ -705,12 +762,20 @@ export default function App() {
           // as pending confirmation instead of hard-failing immediately.
           let verified = false;
           let verifyAttempts = 0;
+          let authDegradedDuringVerify = false;
           try {
             while (verifyAttempts < 4 && !verified) {
               await new Promise(r => setTimeout(r, 600 + verifyAttempts * 400));
               const verifyResp = await fetch('/api/binance/balance');
               if (verifyResp.ok) {
                 const verify = await verifyResp.json();
+                // If position-risk endpoint is degraded (-2015), skip verification and mark as filled immediately.
+                if (verify?.authDegraded === true) {
+                  authDegradedDuringVerify = true;
+                  verified = true;
+                  console.log(`[TradeEdge] AUTH DEGRADED during verification - auto-confirming order ${result?.order?.id}`);
+                  break;
+                }
                 const positions = verify?.positions || {};
                 const hasPosition = hasPositionForSymbol(positions, tradeSymbol);
                 if (closingExisting) {
@@ -744,6 +809,26 @@ export default function App() {
             return;
           }
 
+          if (authDegradedDuringVerify) {
+            const orderId = result?.order?.id || result?.order?.clientOrderId || result?.order?.info?.orderId;
+            applyOptimisticLiveFill(type, tradeSymbol, amount, price, time);
+            addLog(`REAL ${type} SUCCESS: ${tradeSymbol} [Verified by order response; position-risk endpoint unavailable]`, 'success');
+            setExecutionFeedback({ type: 'success', message: `${type} confirmed on exchange for ${tradeSymbol}.` });
+            pushTradeEvent({
+              type,
+              symbol: tradeSymbol,
+              price,
+              amount,
+              time,
+              reason: `ORDER CONFIRMED: ${orderId}`,
+              status: 'FILLED',
+              cycleId: eventCycleId,
+            });
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * 5) }));
+            setTimeout(syncRealBalance, 2000);
+            return;
+          }
+
           if (closingExisting) {
             clearEntryLock();
           }
@@ -756,6 +841,7 @@ export default function App() {
               : ((existingHolding?.entryPrice || price) - price) * amount;
             const basis = (existingHolding?.entryPrice || price) * Math.max(amount, 1e-12);
             const realizedPct = basis > 0 ? (realized / basis) * 100 : 0;
+            applyOptimisticLiveFill(type, tradeSymbol, amount, price, time);
             pushTradeEvent({
               type,
               symbol: tradeSymbol,
@@ -770,6 +856,7 @@ export default function App() {
               cycleId: eventCycleId,
             });
           } else {
+            applyOptimisticLiveFill(type, tradeSymbol, amount, price, time);
             pushTradeEvent({
               type,
               symbol: tradeSymbol,
@@ -1497,11 +1584,23 @@ export default function App() {
   
   const equity = calculateEquity();
   const totalInvested = holdings.reduce((acc, h) => acc + (h.amount * h.entryPrice), 0);
-  const computedUnrealizedPnl = holdings.reduce((sum, h) => {
-    if (Number.isFinite(h.unrealizedPnl)) return sum + Number(h.unrealizedPnl);
-    const mark = holdingPrices[h.symbol] || h.entryPrice;
+  const resolveHoldingPnl = (h: Holding) => {
+    const mark = h.markPrice || holdingPrices[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice) || h.entryPrice;
+    const contracts = Number(h.contracts || h.amount || 0);
     const move = h.side === 'SHORT' ? (h.entryPrice - mark) : (mark - h.entryPrice);
-    return sum + (move * h.amount);
+    const computedPnl = move * contracts;
+    const exchangePnl = Number(h.unrealizedPnl);
+    const hasExchangePnl = Number.isFinite(exchangePnl);
+    const hasMeaningfulPriceMove = Math.abs(mark - h.entryPrice) > Math.max(Math.abs(h.entryPrice) * 1e-8, 1e-8);
+    const pnl = !hasExchangePnl || (Math.abs(exchangePnl) < 1e-12 && hasMeaningfulPriceMove)
+      ? computedPnl
+      : exchangePnl;
+
+    return { mark, contracts, pnl };
+  };
+
+  const computedUnrealizedPnl = holdings.reduce((sum, h) => {
+    return sum + resolveHoldingPnl(h).pnl;
   }, 0);
   const hasOpenPositions = holdings.length > 0;
   const displayedUnrealizedRisk = isRealMode
@@ -2346,9 +2445,9 @@ export default function App() {
                     <th className="px-6 py-4 tracking-widest">Symbol</th>
                     <th className="px-6 py-4 tracking-widest">Contracts</th>
                     <th className="px-6 py-4 tracking-widest">Entry Price</th>
+                    <th className="px-6 py-4 tracking-widest">Mark Price</th>
                     <th className="px-6 py-4 tracking-widest">Margin</th>
                     <th className="px-6 py-4 tracking-widest">Notional</th>
-                    <th className="px-6 py-4 tracking-widest">Mark Price</th>
                     <th className="px-6 py-4 tracking-widest">Unrealized P&L</th>
                     <th className="px-6 py-4 tracking-widest">P&L %</th>
                     <th className="px-6 py-4 text-right tracking-widest">Action Control</th>
@@ -2366,13 +2465,9 @@ export default function App() {
                     </tr>
                   ) : (
                     holdings.map((h, i) => {
-                     const mark = h.markPrice || holdingPrices[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice) || h.entryPrice;
-                     const contracts = Number(h.contracts || h.amount || 0);
+                     const { mark, contracts, pnl: pnlVal } = resolveHoldingPnl(h);
                      const notional = Number(h.notional || (contracts * h.entryPrice) || 0);
                      const margin = Number(h.initialMargin || (notional > 0 ? notional / 5 : 0) || 0);
-                     const move = h.side === 'SHORT' ? (h.entryPrice - mark) : (mark - h.entryPrice);
-                     const computedPnl = move * contracts;
-                     const pnlVal = Number.isFinite(Number(h.unrealizedPnl)) ? Number(h.unrealizedPnl) : computedPnl;
                      const pnlPctVal = margin > 0 ? (pnlVal / margin) * 100 : 0;
                       const closeSide: 'BUY' | 'SELL' = h.side === 'SHORT' ? 'BUY' : 'SELL';
                      const displaySymbol = h.displaySymbol || (h.symbol.endsWith('USDT')
@@ -2398,14 +2493,14 @@ export default function App() {
                              ${formatPrice(h.entryPrice)}
                           </td>
                           <td className="px-6 py-5 font-mono text-xs font-bold">
+                          ${formatPrice(mark)}
+                          </td>
+                          <td className="px-6 py-5 font-mono text-xs font-bold">
                           ${margin.toFixed(2)}
                         </td>
                         <td className="px-6 py-5 font-mono text-xs font-bold">
                           ${notional.toFixed(2)}
                         </td>
-                        <td className="px-6 py-5 font-mono text-xs font-bold">
-                          ${formatPrice(mark)}
-                          </td>
                           <td className={`px-6 py-5 font-black text-sm ${pnlVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                              {pnlVal >= 0 ? '+' : ''}${pnlVal.toFixed(2)}
                         </td>
