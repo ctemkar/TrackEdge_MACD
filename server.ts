@@ -71,9 +71,12 @@ async function startServer() {
     else console.log(message);
   };
 
-  const setPublicSourceHeaders = (res: express.Response, source: string, cached = false) => {
+  const setPublicSourceHeaders = (res: express.Response, source: string, cached = false, blockedUntil = 0) => {
     res.setHeader('X-TradeEdge-Source', source);
     res.setHeader('X-TradeEdge-Cached', cached ? '1' : '0');
+    if (blockedUntil > 0) {
+      res.setHeader('X-TradeEdge-Blocked-Until', String(blockedUntil));
+    }
   };
 
   const getCompactUsdSymbolParts = (raw: string): { compact: string; base: string; quote: string } | null => {
@@ -1658,8 +1661,47 @@ async function startServer() {
   app.get('/api/binance/price/:symbol', async (req, res) => {
     try {
       const { symbol } = req.params;
-      const client = getExchange();
       let target = symbol.toUpperCase();
+      const source = String(req.query.source || '').toLowerCase();
+      const forceBinancePublic = source === 'binance_public';
+
+      if (forceBinancePublic) {
+        const blockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+        if (blockedUntil <= Date.now()) {
+          const endpoints = [
+            `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${target}`,
+            `https://api.binance.com/api/v3/ticker/price?symbol=${target}`,
+          ];
+
+          for (const url of endpoints) {
+            const response = await fetch(url);
+            if (response.ok) {
+              setPublicSourceHeaders(res, 'BINANCE_PUBLIC');
+              const data: any = await response.json().catch(() => ({}));
+              return res.json({ status: 'success', price: data?.price ?? null });
+            }
+            if (response.status === 418 || response.status === 429) {
+              const body: any = await response.json().catch(() => ({}));
+              const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
+              if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
+              else rateLimitState.backoffUntil = Date.now() + 60000;
+              break;
+            }
+          }
+        }
+
+        const bybitTickers = await fetchBybitTickers();
+        const bybitMatch = bybitTickers.find(row => String(row.symbol || '').toUpperCase() === target);
+        if (bybitMatch) {
+          setPublicSourceHeaders(res, 'BYBIT_PUBLIC_FALLBACK');
+          return res.json({ status: 'success', price: bybitMatch.lastPrice || null });
+        }
+
+        setPublicSourceHeaders(res, 'BINANCE_PUBLIC_FAILED');
+        return res.json({ status: 'error', price: null, message: 'Public price unavailable' });
+      }
+
+      const client = getExchange();
       
       if (client.id === 'gemini') {
         // Normalize symbol for Gemini
@@ -1780,7 +1822,7 @@ async function startServer() {
               setPublicSourceHeaders(res, 'BYBIT_PUBLIC_FALLBACK');
               return res.json(bybitFallback);
             }
-            setPublicSourceHeaders(res, 'BINANCE_PUBLIC_BLOCKED');
+            setPublicSourceHeaders(res, 'BINANCE_PUBLIC_BLOCKED', false, blockedUntilPublic);
             return res.json([]);
           }
 
@@ -1812,7 +1854,7 @@ async function startServer() {
             return res.json(bybitFallback);
           }
 
-          setPublicSourceHeaders(res, 'BINANCE_PUBLIC_FAILED');
+          setPublicSourceHeaders(res, 'BINANCE_PUBLIC_FAILED', false, Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil));
           return res.json([]);
         }
 

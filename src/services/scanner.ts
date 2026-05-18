@@ -18,6 +18,7 @@ export interface MarketScanResult {
 type ScanMarketOptions = {
   shortlistLimit?: number;
   prioritySymbols?: string[];
+  onRateLimit?: (retryAt: number) => void;
 };
 
 function getDirectionalSignalStrength(signal: StrategySignal): number {
@@ -59,6 +60,7 @@ export async function scanMarket(
   const results: MarketScanResult[] = [];
   const batchSize = 3;
   const interBatchDelayMs = 550;
+  let rateLimitedUntil = 0;
   const tickerStats = await fetchTicker24hStats({ forceBinancePublic: true });
   const prioritySymbols = new Set((options?.prioritySymbols || []).map(symbol => String(symbol || '').toUpperCase()).filter(Boolean));
   const shortlistLimit = Math.max(prioritySymbols.size, Math.min(symbols.length, options?.shortlistLimit || symbols.length));
@@ -78,13 +80,14 @@ export async function scanMarket(
     return bMove - aMove;
   });
   const symbolsToAnalyze = rankedSymbols.slice(0, shortlistLimit);
+  const canContinue = () => rateLimitedUntil <= Date.now() && (!shouldContinue || shouldContinue());
   
   for (let i = 0; i < symbolsToAnalyze.length; i += batchSize) {
-    if (shouldContinue && !shouldContinue()) break;
+    if (!canContinue()) break;
     if (onProgress) onProgress(i, symbolsToAnalyze.length);
     const batch = symbolsToAnalyze.slice(i, i + batchSize);
     const batchPromises = batch.map(async (symbol): Promise<MarketScanResult | null> => {
-      if (shouldContinue && !shouldContinue()) return null;
+      if (!canContinue()) return null;
       try {
         const candles = await fetchBinanceData(symbol, '1d', 500, { forceBinancePublic: true });
         if (candles.length > 50) {
@@ -123,6 +126,12 @@ export async function scanMarket(
           };
         }
       } catch (e) {
+        const retryAt = Number((e as any)?.retryAt || 0);
+        if (retryAt > Date.now()) {
+          rateLimitedUntil = Math.max(rateLimitedUntil, retryAt);
+          options?.onRateLimit?.(retryAt);
+          return null;
+        }
         console.error(`Scanner error for ${symbol}:`, e);
       }
       return null;
@@ -130,7 +139,7 @@ export async function scanMarket(
 
     const batchResults = await Promise.all(batchPromises);
     results.push(...batchResults.filter((r): r is MarketScanResult => r !== null));
-    if (shouldContinue && !shouldContinue()) break;
+    if (!canContinue()) break;
     
     // Small jitter avoids synchronized bursts when scanner loops repeatedly.
     const jitterMs = Math.floor(Math.random() * 120);

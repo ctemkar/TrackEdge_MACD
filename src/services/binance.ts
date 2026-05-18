@@ -25,6 +25,12 @@ type FetchKlinesOptions = {
   forceBinancePublic?: boolean;
 };
 
+const buildRateLimitedError = (retryAt: number) => {
+  const error: any = new Error('RATE_LIMITED');
+  error.retryAt = retryAt;
+  return error;
+};
+
 export async function fetchBinanceData(
   symbol: string = 'BTCUSD',
   interval: string = '1d',
@@ -41,7 +47,12 @@ export async function fetchBinanceData(
     const sourceQuery = forceBinancePublic ? '&source=binance_public' : '';
     const response = await fetch(`/api/binance/proxy/klines?symbol=${targetSymbol}&interval=${interval}&limit=${limit}${sourceQuery}`);
     rememberPublicDataSource('klines', response);
+    const source = response.headers.get('x-tradeedge-source') || '';
+    const retryAt = Number(response.headers.get('x-tradeedge-blocked-until') || '0');
     const data = await response.json();
+    if ((source === 'BINANCE_PUBLIC_BLOCKED' || source === 'BINANCE_PUBLIC_FAILED') && retryAt > Date.now()) {
+      throw buildRateLimitedError(retryAt);
+    }
     if (!Array.isArray(data)) {
       return [];
     }
@@ -55,8 +66,27 @@ export async function fetchBinanceData(
       volume: parseFloat(d[5])
     }));
   } catch (error) {
+    if ((error as any)?.message === 'RATE_LIMITED') {
+      throw error;
+    }
     console.error('Error fetching Binance data:', error);
     return [];
+  }
+}
+
+export async function fetchLatestPrice(symbol: string): Promise<number | null> {
+  try {
+    const raw = String(symbol || 'BTCUSDT').toUpperCase();
+    const targetSymbol = raw === 'BTC'
+      ? 'BTCUSDT'
+      : (raw.endsWith('USD') && !raw.endsWith('USDT') ? `${raw}T` : raw);
+    const response = await fetch(`/api/binance/price/${targetSymbol}?source=binance_public`);
+    const data = await response.json();
+    const price = Number(data?.price);
+    return Number.isFinite(price) && price > 0 ? price : null;
+  } catch (error) {
+    console.error('Error fetching latest price:', error);
+    return null;
   }
 }
 
@@ -190,7 +220,7 @@ export function subscribeToTicker(
     console.log(`[TradeEdge] Using polling for ${symbol} node sync...`);
     const interval = setInterval(async () => {
       try {
-        const resp = await fetch(`/api/binance/price/${symbol}`);
+        const resp = await fetch(`/api/binance/price/${symbol}?source=binance_public`);
         const data = await resp.json();
         if (data.status === 'success' && data.price) {
           onUpdate(parseFloat(data.price));

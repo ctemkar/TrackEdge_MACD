@@ -2,12 +2,13 @@ import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { TrendingUp, Activity, ShieldAlert, ShieldCheck, Info, Wallet, DollarSign, ArrowUpRight, ArrowDownRight, Search, Zap, Loader2, History, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { fetchBinanceData, subscribeToTicker, fetchAllSymbols, fetchTopSymbolsByVolume, getPublicDataSourceSnapshot } from './services/binance';
+import { fetchBinanceData, fetchLatestPrice, subscribeToTicker, fetchAllSymbols, fetchTopSymbolsByVolume, getPublicDataSourceSnapshot } from './services/binance';
 import { calculateIndicators, evaluateStrategy, Candle, DEFAULT_STRATEGY_CONFIG, IndicatorResult, StrategyConfig, StrategySignal } from './services/indicators';
 import { scanMarket, MarketScanResult } from './services/scanner';
 import { BacktestModule } from './components/BacktestModule';
 
 const STRATEGY_SIGNAL_INTERVAL = '1d';
+const SCAN_SHORTLIST_SAFE_CAP = 120;
 
 const CRITERIA_HELP: Record<string, string> = {
   autoEntryMinScore: 'Minimum strategy confidence required before opening a new position. Higher values reduce trade frequency and prioritize stronger setups.',
@@ -60,8 +61,8 @@ const PARAMETER_DEFAULTS = {
   liveMinOrderNotional: 10,
   liveQuoteAllowlistInput: 'USDT,USDC',
   scanIntervalSec: 40,
-  holdingPollIntervalSec: 5,
-  maxSymbolsPerScan: 1500,
+  holdingPollIntervalSec: 10,
+  maxSymbolsPerScan: SCAN_SHORTLIST_SAFE_CAP,
   duplicateOrderLockoutSec: 45,
   liveEntryDelayMs: 900,
   liveEntriesPerCycle: 1,
@@ -250,26 +251,36 @@ export default function App() {
   });
   const [holdingPollIntervalSec, setHoldingPollIntervalSec] = useState(() => {
     const saved = localStorage.getItem('te_holding_poll_interval_sec');
-    return saved ? (parseInt(saved, 10) || 3) : 3;
+    return saved ? Math.max(10, parseInt(saved, 10) || 10) : 10;
   });
   const [maxSymbolsPerScan, setMaxSymbolsPerScan] = useState(() => {
     const saved = localStorage.getItem('te_max_symbols_per_scan');
     const migrated = localStorage.getItem('te_max_symbols_scan_migrated_v2') === '1';
+    const migratedSafeCap = localStorage.getItem('te_max_symbols_scan_migrated_v3') === '1';
     if (!saved) {
       localStorage.setItem('te_max_symbols_scan_migrated_v2', '1');
-      return 1500;
+      localStorage.setItem('te_max_symbols_scan_migrated_v3', '1');
+      return SCAN_SHORTLIST_SAFE_CAP;
     }
 
-    const parsed = parseInt(saved, 10) || 1500;
+    const parsed = parseInt(saved, 10) || SCAN_SHORTLIST_SAFE_CAP;
     // One-time migration: old default 60 was too restrictive for full-universe scans.
     if (!migrated && parsed === 60) {
       localStorage.setItem('te_max_symbols_scan_migrated_v2', '1');
-      localStorage.setItem('te_max_symbols_per_scan', '1500');
-      return 1500;
+      localStorage.setItem('te_max_symbols_scan_migrated_v3', '1');
+      localStorage.setItem('te_max_symbols_per_scan', String(SCAN_SHORTLIST_SAFE_CAP));
+      return SCAN_SHORTLIST_SAFE_CAP;
+    }
+
+    if (!migratedSafeCap && parsed === 1500) {
+      localStorage.setItem('te_max_symbols_scan_migrated_v3', '1');
+      localStorage.setItem('te_max_symbols_per_scan', String(SCAN_SHORTLIST_SAFE_CAP));
+      return SCAN_SHORTLIST_SAFE_CAP;
     }
 
     localStorage.setItem('te_max_symbols_scan_migrated_v2', '1');
-    return Math.max(20, Math.min(2000, parsed));
+    localStorage.setItem('te_max_symbols_scan_migrated_v3', '1');
+    return Math.max(20, Math.min(SCAN_SHORTLIST_SAFE_CAP, parsed));
   });
   const [duplicateOrderLockoutSec, setDuplicateOrderLockoutSec] = useState(() => {
     const saved = localStorage.getItem('te_duplicate_order_lockout_sec');
@@ -2342,7 +2353,7 @@ export default function App() {
       ].filter(Boolean)));
       const shortlistLimit = Math.min(
         totalToScan,
-        Math.max(prioritySymbols.length, Math.max(60, maxSymbolsPerScan)),
+        Math.max(prioritySymbols.length, Math.max(40, Math.min(SCAN_SHORTLIST_SAFE_CAP, maxSymbolsPerScan))),
       );
       
       let lastLoggedCount = 0;
@@ -2359,7 +2370,15 @@ export default function App() {
         },
         () => rateLimitedUntilRef.current <= Date.now() && (manual || autoTradeRef.current),
         strategyConfig,
-        { shortlistLimit, prioritySymbols },
+        {
+          shortlistLimit,
+          prioritySymbols,
+          onRateLimit: (retryAt) => {
+            if (retryAt > Date.now()) {
+              setRateLimitUntil(retryAt);
+            }
+          },
+        },
       );
       setScanDataSource(formatScanSourceLabel());
 
@@ -2572,6 +2591,10 @@ export default function App() {
           setHoldingPrices(prev => ({ ...prev, [symbol]: price }));
         }
       } catch (err) {
+        const retryAt = Number((err as any)?.retryAt || 0);
+        if (retryAt > Date.now()) {
+          setRateLimitUntil(retryAt);
+        }
         console.error("Data load failed", err);
       } finally {
         setLoading(false);
@@ -2621,9 +2644,8 @@ export default function App() {
       const updates: Record<string, number> = {};
       await Promise.all(holdings.map(async (h) => {
         try {
-          const candles = await fetchBinanceData(h.symbol, '1m', 2);
-          if (candles.length > 0) {
-            const lastPrice = candles[candles.length - 1].close;
+          const lastPrice = await fetchLatestPrice(h.symbol);
+          if (lastPrice) {
             const prevPrice = holdingPrices[h.symbol] || h.entryPrice;
             
             const priceDelta = prevPrice > 1 ? Math.abs((lastPrice - prevPrice) / prevPrice) : 0;
@@ -2644,7 +2666,7 @@ export default function App() {
       }
     };
 
-    const interval = setInterval(pollHoldingPrices, holdingPollIntervalSec * 1000);
+    const interval = setInterval(pollHoldingPrices, Math.max(10, holdingPollIntervalSec) * 1000);
     pollHoldingPrices();
 
     return () => clearInterval(interval);
@@ -2997,7 +3019,6 @@ export default function App() {
   const showInitialLoading = loading && data.length === 0;
   const visibleSignalTableLimit = 30;
   const visibleSignalTablePicks = marketPicks
-    .filter((pick) => pick.signal.overall === 'BUY' || pick.signal.overall === 'SELL')
     .slice(0, visibleSignalTableLimit);
 
   return (
@@ -3639,10 +3660,10 @@ export default function App() {
                       <input type="number" min="10" step="1" value={scanIntervalSec} onChange={(e) => setScanIntervalSec(Math.max(10, parseInt(e.target.value, 10) || 10))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Holding Poll (s)" detail={CRITERIA_HELP.holdingPollIntervalSec} />
-                      <input type="number" min="3" step="1" value={holdingPollIntervalSec} onChange={(e) => setHoldingPollIntervalSec(Math.max(3, parseInt(e.target.value, 10) || 3))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
+                      <input type="number" min="10" step="1" value={holdingPollIntervalSec} onChange={(e) => setHoldingPollIntervalSec(Math.max(10, parseInt(e.target.value, 10) || 10))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Max Symbols / Scan" detail={CRITERIA_HELP.maxSymbolsPerScan} />
-                      <input type="number" min="20" max="2000" step="10" value={maxSymbolsPerScan} onChange={(e) => setMaxSymbolsPerScan(Math.max(20, Math.min(2000, parseInt(e.target.value, 10) || 20)))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
+                      <input type="number" min="20" max={SCAN_SHORTLIST_SAFE_CAP} step="10" value={maxSymbolsPerScan} onChange={(e) => setMaxSymbolsPerScan(Math.max(20, Math.min(SCAN_SHORTLIST_SAFE_CAP, parseInt(e.target.value, 10) || 20)))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Soft Cooldown (m)" detail={CRITERIA_HELP.softCooldownMinutes} />
                       <input type="number" min="1" step="1" value={softCooldownMinutes} onChange={(e) => setSoftCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
@@ -3952,13 +3973,20 @@ export default function App() {
              <div className="hidden md:flex items-center gap-6 relative z-10">
                 <div className="flex flex-col items-end">
                    <span className="text-[8px] uppercase font-bold opacity-40">Strategy Pulse</span>
-                   <div className="flex items-center gap-2">
+                   <div className="flex flex-col items-end gap-1">
+                     <div className="flex items-center gap-2">
                       <span className={`text-[10px] font-black px-2 py-0.5 rounded-sm ${
                         strategy?.overall === 'BUY' ? 'bg-emerald-500 text-white' : 
                         strategy?.overall === 'SELL' ? 'bg-rose-500 text-white' : 'bg-white/10 text-white/40'
                       }`}>
                         {strategy?.overall || 'IDLE'}
                       </span>
+                     </div>
+                     {strategy?.overall === 'HOLD' && strategy.holdReason && (
+                       <span className="max-w-[180px] text-right text-[9px] font-mono uppercase leading-tight text-amber-200/80">
+                         {describeHoldReason(strategy.holdReason)}
+                       </span>
+                     )}
                    </div>
                 </div>
              </div>
