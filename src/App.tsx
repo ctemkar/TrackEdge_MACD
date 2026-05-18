@@ -111,6 +111,21 @@ const describeMacdHistogram = (state?: string) => {
   }
 };
 
+const describeHoldReason = (reason?: string) => {
+  switch (reason) {
+    case 'UNCLEAR_SETUP':
+      return 'Why HOLD: unclear setup';
+    case 'MOVE_ALREADY_HAPPENED':
+      return 'Why HOLD: move already happened';
+    case 'WEAK_MACD':
+      return 'Why HOLD: weak MACD';
+    case 'INSUFFICIENT_CONFIRMATION':
+      return 'Why HOLD: insufficient confirmation';
+    default:
+      return '';
+  }
+};
+
 const CriteriaInfoLabel = ({ text, detail }: { text: string; detail: string }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [popoverPos, setPopoverPos] = useState<{ top: number; left: number } | null>(null);
@@ -3217,11 +3232,18 @@ export default function App() {
                     </div>
 
                     <div className="flex justify-center">
-                      <div className={`text-[10px] font-black px-1 rounded-sm ${
-                        pick.signal.overall === 'BUY' ? 'bg-emerald-100 text-emerald-800' : 
-                        pick.signal.overall === 'SELL' ? 'bg-rose-100 text-rose-800' : 'bg-gray-100 text-gray-400'
-                      }`}>
-                        {pick.signal.overall}
+                      <div className="flex flex-col items-center gap-1">
+                        <div className={`text-[10px] font-black px-1 rounded-sm ${
+                          pick.signal.overall === 'BUY' ? 'bg-emerald-100 text-emerald-800' : 
+                          pick.signal.overall === 'SELL' ? 'bg-rose-100 text-rose-800' : 'bg-gray-100 text-gray-400'
+                        }`}>
+                          {pick.signal.overall}
+                        </div>
+                        {pick.signal.overall === 'HOLD' && pick.signal.holdReason && (
+                          <span className="max-w-[120px] text-center text-[8px] font-mono uppercase leading-tight text-amber-700 opacity-80">
+                            {describeHoldReason(pick.signal.holdReason)}
+                          </span>
+                        )}
                       </div>
                     </div>
 

@@ -113,6 +113,7 @@ export interface StrategySignal {
   score: number;
   macdScore: number;
   exitSignal: 'EXIT_LONG' | 'EXIT_SHORT' | 'NONE';
+  holdReason?: 'UNCLEAR_SETUP' | 'MOVE_ALREADY_HAPPENED' | 'WEAK_MACD' | 'INSUFFICIENT_CONFIRMATION';
 }
 
 export function evaluateStrategy(
@@ -128,6 +129,7 @@ export function evaluateStrategy(
     score: 0,
     macdScore: 0,
     exitSignal: 'NONE',
+    holdReason: 'INSUFFICIENT_CONFIRMATION',
   };
 
   const lastCandle = candles[candles.length - 1];
@@ -387,13 +389,27 @@ export function evaluateStrategy(
     config.maxScore,
     Math.max(0, Number((5 + ((longWeightedScore - shortWeightedScore) / 2)).toFixed(1))),
   );
-  const longEntryQualified = longQuality && bullishMacdConfirmed && finalTradeScore >= 7.2;
-  const shortEntryQualified = shortQuality && bearishMacdConfirmed && finalTradeScore <= 2.8;
+  const directionalEdge = Math.abs(longWeightedScore - shortWeightedScore);
+  const recentReferenceIndex = Math.max(0, candles.length - 4);
+  const recentReferenceClose = candles[recentReferenceIndex]?.close || lastCandle.close;
+  const recentMovePct = recentReferenceClose > 0
+    ? ((lastCandle.close - recentReferenceClose) / recentReferenceClose) * 100
+    : 0;
+  const longMoveAlreadyHappened = recentMovePct > Math.max(2.2, avgRangePct * 1.15) || (nearResistance && candleBodyPct > Math.max(1.2, avgRangePct * 0.7));
+  const shortMoveAlreadyHappened = recentMovePct < -Math.max(2.2, avgRangePct * 1.15) || (nearSupport && candleBodyPct > Math.max(1.2, avgRangePct * 0.7));
+  const unclearSetup = directionalEdge < 1.25
+    || choppyMarket
+    || (Math.abs(finalTradeScore - 5) < 0.75)
+    || (longWeightedScore >= 6 && shortWeightedScore >= 6)
+    || (!bullishMacdConfirmed && !bearishMacdConfirmed);
+  const longEntryQualified = !unclearSetup && !longMoveAlreadyHappened && longQuality && bullishMacdConfirmed && finalTradeScore >= 7.2;
+  const shortEntryQualified = !unclearSetup && !shortMoveAlreadyHappened && shortQuality && bearishMacdConfirmed && finalTradeScore <= 2.8;
 
   let overall: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
   let score = 0;
   let macdScore = 0;
   let exitSignal: 'EXIT_LONG' | 'EXIT_SHORT' | 'NONE' = 'NONE';
+  let holdReason: StrategySignal['holdReason'] = undefined;
   if (longEntryQualified) {
     overall = 'BUY';
     macdScore = longMacdScore;
@@ -405,6 +421,15 @@ export function evaluateStrategy(
   } else {
     score = finalTradeScore;
     macdScore = Math.max(longMacdScore, shortMacdScore);
+    if (unclearSetup) {
+      holdReason = 'UNCLEAR_SETUP';
+    } else if (longMoveAlreadyHappened || shortMoveAlreadyHappened) {
+      holdReason = 'MOVE_ALREADY_HAPPENED';
+    } else if (weakMacdLong && weakMacdShort) {
+      holdReason = 'WEAK_MACD';
+    } else {
+      holdReason = 'INSUFFICIENT_CONFIRMATION';
+    }
   }
 
   if (bearishMacdReversal && longTradeDeteriorating) {
@@ -429,5 +454,6 @@ export function evaluateStrategy(
     score: Math.min(config.maxScore, score),
     macdScore,
     exitSignal,
+    holdReason,
   };
 }
