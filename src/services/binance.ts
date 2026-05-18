@@ -10,6 +10,8 @@ const publicDataSourceSnapshot: PublicDataSourceSnapshot = {
   klines: 'BINANCE_PUBLIC',
 };
 
+const failedTickerWebSocketSymbols = new Set<string>();
+
 const rememberPublicDataSource = (kind: PublicDataSourceKind, response: Response) => {
   const source = response.headers.get('x-tradeedge-source');
   const cached = response.headers.get('x-tradeedge-cached') === '1';
@@ -205,30 +207,60 @@ export function subscribeToTicker(
   onUpdate: (price: number) => void,
   options?: { preferWebSocket?: boolean }
 ) {
-  const preferWebSocket = options?.preferWebSocket === true;
-  const isBinanceSymbol = (symbol.endsWith('USDT') || symbol.endsWith('USDC')) && !symbol.includes('/');
+  const normalizedSymbol = String(symbol || '').toUpperCase();
+  const preferWebSocket = options?.preferWebSocket === true && !failedTickerWebSocketSymbols.has(normalizedSymbol);
+  const isBinanceSymbol = (normalizedSymbol.endsWith('USDT') || normalizedSymbol.endsWith('USDC')) && !normalizedSymbol.includes('/');
 
-  if (preferWebSocket && isBinanceSymbol) {
-    const ws = new WebSocket(`wss://fstream.binance.com/ws/${symbol.toLowerCase()}@ticker`);
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      onUpdate(parseFloat(data.c));
-    };
-    return () => ws.close();
-  } else {
-    // Gemini / Generic Polling Fallback
-    console.log(`[TradeEdge] Using polling for ${symbol} node sync...`);
+  const startPolling = () => {
+    console.log(`[TradeEdge] Using polling for ${normalizedSymbol} node sync...`);
     const interval = setInterval(async () => {
       try {
-        const resp = await fetch(`/api/binance/price/${symbol}?source=binance_public`);
+        const resp = await fetch(`/api/binance/price/${normalizedSymbol}?source=binance_public`);
         const data = await resp.json();
         if (data.status === 'success' && data.price) {
           onUpdate(parseFloat(data.price));
         }
-      } catch (e) {
+      } catch {
         // Silent fail to avoid log spam
       }
     }, 3000);
     return () => clearInterval(interval);
+  };
+
+  if (preferWebSocket && isBinanceSymbol) {
+    const ws = new WebSocket(`wss://fstream.binance.com/ws/${normalizedSymbol.toLowerCase()}@ticker`);
+    let fallbackCleanup: (() => void) | null = null;
+    let socketOpened = false;
+
+    const fallbackToPolling = () => {
+      if (fallbackCleanup) return;
+      failedTickerWebSocketSymbols.add(normalizedSymbol);
+      fallbackCleanup = startPolling();
+    };
+
+    ws.onopen = () => {
+      socketOpened = true;
+    };
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      onUpdate(parseFloat(data.c));
+    };
+    ws.onerror = () => {
+      fallbackToPolling();
+    };
+    ws.onclose = () => {
+      if (!socketOpened) {
+        fallbackToPolling();
+      }
+    };
+    return () => {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
+      fallbackCleanup?.();
+    };
+  } else {
+    // Gemini / Generic Polling Fallback
+    return startPolling();
   }
 }

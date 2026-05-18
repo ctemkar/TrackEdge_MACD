@@ -602,6 +602,7 @@ export default function App() {
   }, [executionFeedback]);
   const tradeLockout = React.useRef<Set<string>>(new Set());
   const isSyncingRef = React.useRef(false);
+  const loadingRef = React.useRef(loading);
   const syncRealBalanceRef = React.useRef<() => Promise<boolean>>(async () => false);
   const pendingCloseSyncRef = React.useRef<Record<string, PendingCloseSyncConfirmation>>({});
   const scanningRef = React.useRef(false);
@@ -627,12 +628,22 @@ export default function App() {
   const holdingsRef = React.useRef(holdings);
   const autoTradeRef = React.useRef(autoTrade);
   const maxConcurrentTradesRef = React.useRef(maxConcurrentTrades);
+  const strategyConfigRef = React.useRef(strategyConfig);
+  const performScanRef = React.useRef<() => Promise<void>>(async () => {});
 
   React.useEffect(() => {
     holdingsRef.current = holdings;
     autoTradeRef.current = autoTrade;
     maxConcurrentTradesRef.current = maxConcurrentTrades;
   }, [holdings, autoTrade, maxConcurrentTrades]);
+
+  React.useEffect(() => {
+    strategyConfigRef.current = strategyConfig;
+  }, [strategyConfig]);
+
+  React.useEffect(() => {
+    loadingRef.current = loading;
+  }, [loading]);
 
   React.useEffect(() => {
     // On boot: restore autonomous mode preference from localStorage
@@ -1188,7 +1199,7 @@ export default function App() {
   }, [setPrivateSyncBlockedUntil, setRateLimitUntil]);
 
   const executeTrade = React.useCallback(async (type: 'BUY' | 'SELL', tradeSymbol: string, price: number, reason: string = 'Strategy Match', targetId?: string, cycleId?: number, tradePlan?: StrategySignal['tradePlan'], requestedAmount?: number) => {
-    if (loading || !price) return;
+    if (loadingRef.current || !price) return;
     const time = new Date().toISOString();
     const eventCycleId = typeof cycleId === 'number' ? cycleId : undefined;
     const normalizedTradeSymbol = String(tradeSymbol || '').toUpperCase();
@@ -1874,7 +1885,7 @@ export default function App() {
         }
       }
     }
-  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, loading, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes]);
+  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes]);
 
   const managePlannedExit = React.useCallback((holding: Holding, price: number, signal?: StrategySignal | null, cycleId?: number) => {
     const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
@@ -1904,27 +1915,48 @@ export default function App() {
       ? signal?.exitSignal === 'EXIT_LONG' || signal?.confluence.macdHistogram === 'BULLISH_FADE' || signal?.confluence.macd === 'BEARISH'
       : signal?.exitSignal === 'EXIT_SHORT' || signal?.confluence.macdHistogram === 'BEARISH_FADE' || signal?.confluence.macd === 'BULLISH';
 
-    setHoldings(prev => prev.map(existing => {
-      if (existing.id !== holding.id) return existing;
+    setHoldings(prev => {
+      let didChange = false;
+      const next = prev.map(existing => {
+        if (existing.id !== holding.id) return existing;
 
-      if (holding.side === 'LONG') {
-        const highestPrice = Math.max(existing.highestPrice || existing.entryPrice, price);
+        if (holding.side === 'LONG') {
+          const highestPrice = Math.max(existing.highestPrice || existing.entryPrice, price);
+          const trailingStopPrice = runnerStage
+            ? Math.max(existing.trailingStopPrice || stopPrice, highestPrice * (1 - trailingBufferPct), stopPrice)
+            : (existing.trailingStopPrice || stopPrice);
+          const shouldUpdate =
+            highestPrice !== existing.highestPrice ||
+            trailingStopPrice !== existing.trailingStopPrice ||
+            stopPrice !== existing.stopPrice ||
+            tp1Price !== existing.tp1Price ||
+            tp2Price !== existing.tp2Price ||
+            trailingBufferPct !== existing.trailingBufferPct ||
+            initialAmount !== existing.initialAmount;
+          if (!shouldUpdate) return existing;
+          didChange = true;
+          return { ...existing, highestPrice, trailingStopPrice, stopPrice, tp1Price, tp2Price, trailingBufferPct, initialAmount };
+        }
+
+        const lowestPrice = Math.min(existing.lowestPrice || existing.entryPrice, price);
         const trailingStopPrice = runnerStage
-          ? Math.max(existing.trailingStopPrice || stopPrice, highestPrice * (1 - trailingBufferPct), stopPrice)
+          ? Math.min(existing.trailingStopPrice || stopPrice, lowestPrice * (1 + trailingBufferPct), stopPrice)
           : (existing.trailingStopPrice || stopPrice);
-        return (highestPrice !== existing.highestPrice || trailingStopPrice !== existing.trailingStopPrice)
-          ? { ...existing, highestPrice, trailingStopPrice, stopPrice, tp1Price, tp2Price, trailingBufferPct, initialAmount }
-          : existing;
-      }
+        const shouldUpdate =
+          lowestPrice !== existing.lowestPrice ||
+          trailingStopPrice !== existing.trailingStopPrice ||
+          stopPrice !== existing.stopPrice ||
+          tp1Price !== existing.tp1Price ||
+          tp2Price !== existing.tp2Price ||
+          trailingBufferPct !== existing.trailingBufferPct ||
+          initialAmount !== existing.initialAmount;
+        if (!shouldUpdate) return existing;
+        didChange = true;
+        return { ...existing, lowestPrice, trailingStopPrice, stopPrice, tp1Price, tp2Price, trailingBufferPct, initialAmount };
+      });
 
-      const lowestPrice = Math.min(existing.lowestPrice || existing.entryPrice, price);
-      const trailingStopPrice = runnerStage
-        ? Math.min(existing.trailingStopPrice || stopPrice, lowestPrice * (1 + trailingBufferPct), stopPrice)
-        : (existing.trailingStopPrice || stopPrice);
-      return (lowestPrice !== existing.lowestPrice || trailingStopPrice !== existing.trailingStopPrice)
-        ? { ...existing, lowestPrice, trailingStopPrice, stopPrice, tp1Price, tp2Price, trailingBufferPct, initialAmount }
-        : existing;
-    }));
+      return didChange ? next : prev;
+    });
 
     const technicalInvalidation = margin > 0
       ? currentMarginPnlPct <= -Math.abs(stopLossPercent)
@@ -2918,6 +2950,10 @@ export default function App() {
   }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, liveEntriesPerCycle, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode, isUnsupportedLiveScanSymbol]);
  // Removed 'scanning' from dependencies
 
+  React.useEffect(() => {
+    performScanRef.current = performScan;
+  }, [performScan]);
+
   const resetAccount = React.useCallback(() => {
     setBalance(seedCapital);
     setAvailableFunds(seedCapital);
@@ -2992,9 +3028,9 @@ export default function App() {
         setData(candles);
         // For daily strategy decisions, use the last fully closed candle.
         const signalCandles = candles.length > 2 ? candles.slice(0, -1) : candles;
-        const inds = calculateIndicators(signalCandles, strategyConfig);
+        const inds = calculateIndicators(signalCandles, strategyConfigRef.current);
         setIndicators(inds);
-        const sig = evaluateStrategy(signalCandles, inds, strategyConfig);
+        const sig = evaluateStrategy(signalCandles, inds, strategyConfigRef.current);
         setStrategy(sig);
         if (candles.length > 0) {
           const price = candles[candles.length - 1].close;
@@ -3013,12 +3049,12 @@ export default function App() {
     };
 
     loadData();
-    if (autoTradeRef.current) performScan();
+    if (autoTradeRef.current) void performScanRef.current();
 
     const refreshInterval = setInterval(() => {
       loadData(true);
       if (autoTradeRef.current) {
-        performScan();
+        void performScanRef.current();
         setNextScanSec(scanIntervalSec);
       } else {
         setNextScanSec(0);
@@ -3043,7 +3079,7 @@ export default function App() {
       clearInterval(refreshInterval);
       clearInterval(countdownInterval);
     };
-  }, [symbol, performScan, isRealMode, serverConfig?.exchange, serverStatus, scanIntervalSec, strategyConfig]);
+  }, [symbol, isRealMode, serverConfig?.exchange, serverStatus, scanIntervalSec]);
 
   // Dedicated Portfolio Price Watcher (High Frequency)
   useEffect(() => {
