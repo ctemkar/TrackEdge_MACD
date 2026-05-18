@@ -114,6 +114,7 @@ export interface StrategySignal {
   macdScore: number;
   exitSignal: 'EXIT_LONG' | 'EXIT_SHORT' | 'NONE';
   holdReason?: 'UNCLEAR_SETUP' | 'MOVE_ALREADY_HAPPENED' | 'WEAK_MACD' | 'INSUFFICIENT_CONFIRMATION';
+  rejectReasons?: string[];
   tradePlan?: {
     stopPrice: number;
     tp1Price: number;
@@ -137,6 +138,7 @@ export function evaluateStrategy(
     macdScore: 0,
     exitSignal: 'NONE',
     holdReason: 'INSUFFICIENT_CONFIRMATION',
+    rejectReasons: ['not enough candles for evaluation'],
     tradePlan: undefined,
   };
 
@@ -433,6 +435,7 @@ export function evaluateStrategy(
   let macdScore = 0;
   let exitSignal: 'EXIT_LONG' | 'EXIT_SHORT' | 'NONE' = 'NONE';
   let holdReason: StrategySignal['holdReason'] = undefined;
+  let rejectReasons: string[] | undefined = undefined;
   let tradePlan: StrategySignal['tradePlan'] = undefined;
   if (longEntryQualified) {
     overall = 'BUY';
@@ -447,6 +450,26 @@ export function evaluateStrategy(
   } else {
     score = finalTradeScore;
     macdScore = Math.max(longMacdScore, shortMacdScore);
+    const reasons: string[] = [];
+    const pushReason = (reason: string) => {
+      if (!reasons.includes(reason)) reasons.push(reason);
+    };
+
+    if (!trendBullish && !trendBearish) pushReason('trend and EMA regime are not aligned');
+    if (!volumeConfirmed) pushReason('volume is below confirmation threshold');
+    if (lateEntryRisk) pushReason('late-entry risk after an extended candle');
+    if (choppyMarket) pushReason('market is too choppy');
+    if (extremeVolatility) pushReason('volatility is too high');
+    if (longRiskReward < 1.5 && shortRiskReward < 1.5) pushReason('risk/reward is below target');
+    if (!bullishMacdConfirmed && !bearishMacdConfirmed) pushReason('MACD confirmation is missing');
+    if (weakMacdLong && weakMacdShort) pushReason('MACD strength is too weak');
+    if (longMoveAlreadyHappened || shortMoveAlreadyHappened) pushReason('the move already happened before entry');
+    if (directionalEdge < 1.25) pushReason('directional edge is too weak');
+    if (Math.abs(finalTradeScore - 5) < 0.75) pushReason('trade score is still near neutral');
+    if (longWeightedScore >= 6 && shortWeightedScore >= 6) pushReason('long and short cases are conflicting');
+    if (trendBullish && !longQuality) pushReason('long setup lacks enough confirmation checks');
+    if (trendBearish && !shortQuality) pushReason('short setup lacks enough confirmation checks');
+
     if (unclearSetup) {
       holdReason = 'UNCLEAR_SETUP';
     } else if (longMoveAlreadyHappened || shortMoveAlreadyHappened) {
@@ -456,6 +479,7 @@ export function evaluateStrategy(
     } else {
       holdReason = 'INSUFFICIENT_CONFIRMATION';
     }
+    rejectReasons = reasons.slice(0, 4);
   }
 
   if (bearishMacdReversal && longTradeDeteriorating) {
@@ -481,6 +505,7 @@ export function evaluateStrategy(
     macdScore,
     exitSignal,
     holdReason,
+    rejectReasons,
     tradePlan,
   };
 }

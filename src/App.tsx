@@ -133,6 +133,11 @@ const describeHoldReason = (reason?: string) => {
   }
 };
 
+const summarizeRejectReasons = (reasons?: string[], limit: number = 2) => {
+  if (!reasons || reasons.length === 0) return '';
+  return reasons.slice(0, limit).join(' | ');
+};
+
 const CriteriaInfoLabel = ({ text, detail }: { text: string; detail: string }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [popoverPos, setPopoverPos] = useState<{ top: number; left: number } | null>(null);
@@ -3191,6 +3196,22 @@ export default function App() {
       })
       .slice(0, 6);
   }, [marketPicks]);
+  const rejectReasonSummary = React.useMemo(() => {
+    const counts = new Map<string, number>();
+
+    for (const pick of marketPicks) {
+      if (pick.signal.overall !== 'HOLD') continue;
+      const reasons = pick.signal.rejectReasons || [];
+      for (const reason of reasons) {
+        counts.set(reason, (counts.get(reason) || 0) + 1);
+      }
+    }
+
+    return Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6)
+      .map(([reason, count]) => ({ reason, count }));
+  }, [marketPicks]);
   const visibleSignalTablePicks = marketPicks
     .slice(0, visibleSignalTableLimit);
 
@@ -3512,6 +3533,29 @@ export default function App() {
               </div>
             </div>
 
+            <div className="mt-3 border border-gray-300 bg-gray-50/80 px-3 py-2 text-[10px] font-mono uppercase">
+              <div className="flex items-center justify-between text-gray-800/80">
+                <span>Why Coins Were Rejected</span>
+                <span>{rejectReasonSummary.length > 0 ? `${rejectReasonSummary.length} dominant causes` : 'No rejection data yet'}</span>
+              </div>
+              {rejectReasonSummary.length === 0 ? (
+                <p className="mt-2 text-[10px] normal-case tracking-normal text-gray-700/70">
+                  No aggregated HOLD rejection reasons are available yet for this session.
+                </p>
+              ) : (
+                <div className="mt-2 space-y-2">
+                  {rejectReasonSummary.map(({ reason, count }) => (
+                    <div key={`reject-reason-${reason}`} className="border border-gray-200 bg-white/70 px-2 py-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[9px] normal-case tracking-normal text-gray-900">{reason}</span>
+                        <span className="font-black text-[11px] text-gray-700">{count}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
             <div className="mt-3 border border-rose-200 bg-rose-50/60 px-3 py-2 text-[10px] font-mono uppercase">
               <div className="flex items-center justify-between text-rose-900/80">
                 <span>Top Blocked Signals</span>
@@ -3596,6 +3640,11 @@ export default function App() {
                         <span>{describeHoldReason(pick.signal.holdReason)}</span>
                         <span>{signalDistance.toFixed(2)} from trigger</span>
                       </div>
+                      {pick.signal.rejectReasons && pick.signal.rejectReasons.length > 0 && (
+                        <p className="mt-1 text-[9px] normal-case tracking-normal text-amber-900/70">
+                          {summarizeRejectReasons(pick.signal.rejectReasons, 3)}
+                        </p>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -3667,9 +3716,16 @@ export default function App() {
                           {pick.signal.overall}
                         </div>
                         {pick.signal.overall === 'HOLD' && pick.signal.holdReason && (
-                          <span className="max-w-[120px] text-center text-[8px] font-mono uppercase leading-tight text-amber-700 opacity-80">
-                            {describeHoldReason(pick.signal.holdReason)}
-                          </span>
+                          <div className="max-w-[140px] text-center leading-tight">
+                            <span className="text-[8px] font-mono uppercase text-amber-700 opacity-80">
+                              {describeHoldReason(pick.signal.holdReason)}
+                            </span>
+                            {pick.signal.rejectReasons && pick.signal.rejectReasons.length > 0 && (
+                              <span className="mt-1 block text-[8px] normal-case font-mono text-amber-700/75">
+                                {summarizeRejectReasons(pick.signal.rejectReasons)}
+                              </span>
+                            )}
+                          </div>
                         )}
                       </div>
                     </div>
@@ -4256,9 +4312,16 @@ export default function App() {
                       </span>
                      </div>
                      {strategy?.overall === 'HOLD' && strategy.holdReason && (
-                       <span className="max-w-[180px] text-right text-[9px] font-mono uppercase leading-tight text-amber-200/80">
-                         {describeHoldReason(strategy.holdReason)}
-                       </span>
+                       <div className="max-w-[220px] text-right leading-tight text-amber-200/80">
+                         <span className="text-[9px] font-mono uppercase">
+                           {describeHoldReason(strategy.holdReason)}
+                         </span>
+                         {strategy.rejectReasons && strategy.rejectReasons.length > 0 && (
+                           <span className="mt-1 block text-[9px] normal-case font-mono text-amber-200/70">
+                             {summarizeRejectReasons(strategy.rejectReasons, 3)}
+                           </span>
+                         )}
+                       </div>
                      )}
                    </div>
                 </div>
