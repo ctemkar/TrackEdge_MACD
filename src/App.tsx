@@ -2462,6 +2462,60 @@ export default function App() {
       const currentHoldings = holdingsRef.current;
       const currentMaxTrades = maxConcurrentTradesRef.current;
       const entryLockActive = entryLockUntilRef.current > Date.now();
+      const scanNow = Date.now();
+
+      const signalCandidates = results
+        .filter(r => r.signal.overall === 'BUY' || (isRealMode && r.signal.overall === 'SELL'))
+        .map(pick => ({ side: pick.signal.overall === 'SELL' ? 'SELL' as const : 'BUY' as const, pick }));
+
+      const getEntryBlockReason = ({ pick }: { side: 'BUY' | 'SELL'; pick: MarketScanResult }) => {
+        if (isLiveBinance && !isLikelyBinanceFuturesSymbol(pick.symbol)) {
+          return 'invalid futures symbol format';
+        }
+        if (isLiveBinance && !isLiveTradableFuturesSymbol(pick.symbol)) {
+          return 'not in Binance futures tradable set';
+        }
+        if (currentHoldings.some(h => h.symbol === pick.symbol)) {
+          return 'already held';
+        }
+        const cooldownUntil = cooldowns[pick.symbol] || 0;
+        if (cooldownUntil > scanNow) {
+          const minutesRemaining = Math.max(1, Math.ceil((cooldownUntil - scanNow) / 60000));
+          return `cooldown ${minutesRemaining}m remaining`;
+        }
+        if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
+          return 'quote asset treated as cash';
+        }
+        if (isLiveBinance && isUnsupportedLiveScanSymbol(pick.symbol)) {
+          return 'unsupported market quarantine';
+        }
+        return null;
+      };
+
+      const blockedSignals = signalCandidates
+        .map(({ side, pick }) => ({
+          symbol: pick.symbol,
+          side,
+          score: pick.signal.score,
+          priorityRank: pick.priorityRank || 0,
+          reason: getEntryBlockReason({ side, pick }),
+        }))
+        .filter((entry): entry is ScanBlockedSignal => Boolean(entry.reason))
+        .sort((a, b) => {
+          const directionalScoreDelta = getDirectionalEntryScore(b.side, b.score) - getDirectionalEntryScore(a.side, a.score);
+          if (directionalScoreDelta !== 0) return directionalScoreDelta;
+          return b.priorityRank - a.priorityRank;
+        });
+
+      setScanBlockedSummary({
+        updatedAt: scanNow,
+        filteredSignals: blockedSignals.length,
+        reasonCounts: blockedSignals.reduce<Record<string, number>>((acc, entry) => {
+          acc[entry.reason] = (acc[entry.reason] || 0) + 1;
+          return acc;
+        }, {}),
+        topBlocked: blockedSignals.slice(0, 6),
+      });
 
       if (currentAutoTrade && isRealMode && entryLockActive) {
         const remainingSec = Math.max(1, Math.ceil((entryLockUntilRef.current - Date.now()) / 1000));
@@ -2484,17 +2538,10 @@ export default function App() {
           return;
         }
 
-        const entries = results
-          .filter(r => r.signal.overall === 'BUY' || (isRealMode && r.signal.overall === 'SELL'))
-          .filter(r => !isLiveBinance || isLikelyBinanceFuturesSymbol(r.symbol))
-          .filter(r => !isLiveBinance || isLiveTradableFuturesSymbol(r.symbol))
-          .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
-          .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now())
-          .map(pick => ({ side: pick.signal.overall === 'SELL' ? 'SELL' as const : 'BUY' as const, pick }))
+        const entries = signalCandidates
+          .filter(entry => !getEntryBlockReason(entry))
           .sort((a, b) => {
-            const aDirectionalScore = a.side === 'SELL' ? 10 - a.pick.signal.score : a.pick.signal.score;
-            const bDirectionalScore = b.side === 'SELL' ? 10 - b.pick.signal.score : b.pick.signal.score;
-            const directionalScoreDelta = bDirectionalScore - aDirectionalScore;
+            const directionalScoreDelta = getDirectionalEntryScore(b.side, b.pick.signal.score) - getDirectionalEntryScore(a.side, a.pick.signal.score);
             if (directionalScoreDelta !== 0) return directionalScoreDelta;
             return (b.pick.priorityRank || 0) - (a.pick.priorityRank || 0);
           });
