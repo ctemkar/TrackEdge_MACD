@@ -363,6 +363,14 @@ export default function App() {
     notional?: number;
     initialMargin?: number;
     unrealizedPnl?: number;
+    initialAmount?: number;
+    stopPrice?: number;
+    tp1Price?: number;
+    tp2Price?: number;
+    trailingStopPrice?: number;
+    trailingBufferPct?: number;
+    highestPrice?: number;
+    lowestPrice?: number;
     time: string;
   }
 
@@ -870,6 +878,8 @@ export default function App() {
             const amount = Number(info?.amount || 0);
             if (!(amount > 0)) return null;
 
+            const previousHolding = holdingsRef.current.find(prev => prev.symbol === normalizedSymbol && prev.side === (info.side === 'SHORT' ? 'SHORT' : 'LONG'));
+
             return {
               id: `${normalizedSymbol}_${info.side || 'LONG'}`,
               symbol: normalizedSymbol,
@@ -883,6 +893,14 @@ export default function App() {
               notional: Number(info.notional) > 0 ? Number(info.notional) : undefined,
               initialMargin: Number(info.initialMargin) > 0 ? Number(info.initialMargin) : undefined,
               unrealizedPnl: Number.isFinite(Number(info.unrealizedPnl)) ? Number(info.unrealizedPnl) : undefined,
+              initialAmount: previousHolding?.initialAmount || amount,
+              stopPrice: previousHolding?.stopPrice,
+              tp1Price: previousHolding?.tp1Price,
+              tp2Price: previousHolding?.tp2Price,
+              trailingStopPrice: previousHolding?.trailingStopPrice,
+              trailingBufferPct: previousHolding?.trailingBufferPct,
+              highestPrice: previousHolding?.highestPrice,
+              lowestPrice: previousHolding?.lowestPrice,
               time: new Date().toISOString()
             };
           }).filter((h): h is Holding => h !== null);
@@ -970,7 +988,7 @@ export default function App() {
     }
   }, []);
 
-  const executeTrade = React.useCallback(async (type: 'BUY' | 'SELL', tradeSymbol: string, price: number, reason: string = 'Strategy Match', targetId?: string, cycleId?: number) => {
+  const executeTrade = React.useCallback(async (type: 'BUY' | 'SELL', tradeSymbol: string, price: number, reason: string = 'Strategy Match', targetId?: string, cycleId?: number, tradePlan?: StrategySignal['tradePlan'], requestedAmount?: number) => {
     if (loading || !price) return;
     const time = new Date().toISOString();
     const eventCycleId = typeof cycleId === 'number' ? cycleId : undefined;
@@ -1107,7 +1125,16 @@ export default function App() {
 
           if (closingExisting) {
             if (targetId) {
-              return current.filter(h => h.id !== targetId);
+              return current.flatMap(h => {
+                if (h.id !== targetId) return [h];
+                const remainingAmount = Math.max(0, Number(h.amount || 0) - Number(fillAmount || 0));
+                if (remainingAmount <= 1e-12) return [];
+                return [{
+                  ...h,
+                  amount: remainingAmount,
+                  contracts: remainingAmount,
+                }];
+              });
             }
             return current.filter(h => h.symbol !== normalizedSymbol);
           }
@@ -1124,6 +1151,7 @@ export default function App() {
               amount: nextAmount,
               contracts: nextAmount,
               entryPrice: Number.isFinite(weightedEntry) && weightedEntry > 0 ? weightedEntry : fillPrice,
+              initialAmount: Math.max(existing.initialAmount || existing.amount || 0, nextAmount),
               time: fillTime,
             };
             return current;
@@ -1139,6 +1167,14 @@ export default function App() {
               contracts: Math.max(0, Number(fillAmount || 0)),
               side: openSide,
               entryPrice: fillPrice,
+              initialAmount: Math.max(0, Number(fillAmount || 0)),
+              stopPrice: tradePlan?.stopPrice,
+              tp1Price: tradePlan?.tp1Price,
+              tp2Price: tradePlan?.tp2Price,
+              trailingStopPrice: tradePlan?.stopPrice,
+              trailingBufferPct: tradePlan?.trailingBufferPct,
+              highestPrice: openSide === 'LONG' ? fillPrice : undefined,
+              lowestPrice: openSide === 'SHORT' ? fillPrice : undefined,
               time: fillTime,
             }
           ];
@@ -1183,7 +1219,7 @@ export default function App() {
         );
 
         if (closingExisting) {
-          amount = heldAmount;
+          amount = Math.min(heldAmount, requestedAmount && requestedAmount > 0 ? requestedAmount : heldAmount);
         } else if (type === 'BUY' || openingShort) {
           const effectiveSplitSlots = 1;
           const realFreeCapital = Math.max(0, availableFunds * 0.99);
@@ -1525,7 +1561,22 @@ export default function App() {
         if (useBNBFees && serverConfig?.exchange !== 'gemini') commission *= 0.75; 
 
         setBalance(prev => prev - allocation);
-        setHoldings(prev => [...prev, { id: holdingId, symbol: tradeSymbol, amount, side: openingShort ? 'SHORT' : 'LONG', entryPrice: price, time }]);
+        setHoldings(prev => [...prev, {
+          id: holdingId,
+          symbol: tradeSymbol,
+          amount,
+          initialAmount: amount,
+          side: openingShort ? 'SHORT' : 'LONG',
+          entryPrice: price,
+          stopPrice: tradePlan?.stopPrice,
+          tp1Price: tradePlan?.tp1Price,
+          tp2Price: tradePlan?.tp2Price,
+          trailingStopPrice: tradePlan?.stopPrice,
+          trailingBufferPct: tradePlan?.trailingBufferPct,
+          highestPrice: openingShort ? undefined : price,
+          lowestPrice: openingShort ? price : undefined,
+          time,
+        }]);
         pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason, status: 'FILLED', cycleId: eventCycleId });
         addLog(`PAPER ${openingShort ? 'SHORT' : 'BUY'}: ${tradeSymbol} @ $${price} [${reason}]`, 'success');
         setExecutionFeedback({ type: 'success', message: `Paper ${openingShort ? 'SHORT' : 'BUY'} filled for ${tradeSymbol}.` });
@@ -1536,14 +1587,16 @@ export default function App() {
           : holdings.filter(h => h.symbol === tradeSymbol);
 
         if (holdingsToClose.length > 0) {
+          const partialRequested = Boolean(targetId && requestedAmount && requestedAmount > 0 && holdingsToClose.length === 1);
           let totalReleaseValue = 0;
           let totalEntryValue = 0;
           let totalAmount = 0;
           let totalPnl = 0;
 
           holdingsToClose.forEach(h => {
-             const exitValue = h.amount * price;
-             const entryValue = h.amount * h.entryPrice;
+             const closingAmount = partialRequested ? Math.min(h.amount, requestedAmount || h.amount) : h.amount;
+             const exitValue = closingAmount * price;
+             const entryValue = closingAmount * h.entryPrice;
              
              const commissionRate = serverConfig?.exchange === 'gemini' ? 0.004 : 0.001;
              const exitCommission = exitValue * commissionRate;
@@ -1554,7 +1607,7 @@ export default function App() {
 
              totalReleaseValue += releasedCapital;
              totalEntryValue += entryValue;
-             totalAmount += h.amount;
+             totalAmount += closingAmount;
              totalPnl += pnlForHolding;
           });
 
@@ -1564,7 +1617,12 @@ export default function App() {
           setBalance(prev => prev + totalReleaseValue);
           
           if (targetId) {
-            setHoldings(prev => prev.filter(h => h.id !== targetId));
+            setHoldings(prev => prev.flatMap(h => {
+              if (h.id !== targetId) return [h];
+              const remainingAmount = partialRequested ? Math.max(0, h.amount - (requestedAmount || h.amount)) : 0;
+              if (remainingAmount <= 1e-12) return [];
+              return [{ ...h, amount: remainingAmount, contracts: remainingAmount }];
+            }));
           } else {
             setHoldings(prev => prev.filter(h => h.symbol !== tradeSymbol));
           }
@@ -1596,6 +1654,85 @@ export default function App() {
       }
     }
   }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, loading, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes]);
+
+  const managePlannedExit = React.useCallback((holding: Holding, price: number, signal?: StrategySignal | null, cycleId?: number) => {
+    const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
+    const fallbackStop = holding.side === 'SHORT'
+      ? holding.entryPrice * (1 + stopLossPercent / 100)
+      : holding.entryPrice * (1 - stopLossPercent / 100);
+    const stopPrice = holding.stopPrice || fallbackStop;
+    const riskPerUnit = Math.max(Math.abs(holding.entryPrice - stopPrice), holding.entryPrice * 0.005);
+    const tp1Price = holding.tp1Price || (holding.side === 'SHORT' ? holding.entryPrice - (riskPerUnit * 1.25) : holding.entryPrice + (riskPerUnit * 1.25));
+    const tp2Price = holding.tp2Price || (holding.side === 'SHORT' ? holding.entryPrice - (riskPerUnit * 2.4) : holding.entryPrice + (riskPerUnit * 2.4));
+    const trailingBufferPct = holding.trailingBufferPct || 0.012;
+    const initialAmount = Math.max(holding.initialAmount || holding.amount, holding.amount);
+    const runnerAmount = Math.max(initialAmount * 0.2, 0);
+    const tp1Completed = holding.amount <= (initialAmount * 0.55);
+    const runnerStage = holding.amount <= (runnerAmount * 1.05);
+    const histogramExpanding = holding.side === 'LONG'
+      ? signal?.confluence.macdHistogram === 'BULLISH_ACCELERATION'
+      : signal?.confluence.macdHistogram === 'BEARISH_ACCELERATION';
+    const momentumWeakening = holding.side === 'LONG'
+      ? signal?.exitSignal === 'EXIT_LONG' || signal?.confluence.macdHistogram === 'BULLISH_FADE' || signal?.confluence.macd === 'BEARISH'
+      : signal?.exitSignal === 'EXIT_SHORT' || signal?.confluence.macdHistogram === 'BEARISH_FADE' || signal?.confluence.macd === 'BULLISH';
+
+    setHoldings(prev => prev.map(existing => {
+      if (existing.id !== holding.id) return existing;
+
+      if (holding.side === 'LONG') {
+        const highestPrice = Math.max(existing.highestPrice || existing.entryPrice, price);
+        const trailingStopPrice = runnerStage
+          ? Math.max(existing.trailingStopPrice || stopPrice, highestPrice * (1 - trailingBufferPct), stopPrice)
+          : (existing.trailingStopPrice || stopPrice);
+        return (highestPrice !== existing.highestPrice || trailingStopPrice !== existing.trailingStopPrice)
+          ? { ...existing, highestPrice, trailingStopPrice, stopPrice, tp1Price, tp2Price, trailingBufferPct, initialAmount }
+          : existing;
+      }
+
+      const lowestPrice = Math.min(existing.lowestPrice || existing.entryPrice, price);
+      const trailingStopPrice = runnerStage
+        ? Math.min(existing.trailingStopPrice || stopPrice, lowestPrice * (1 + trailingBufferPct), stopPrice)
+        : (existing.trailingStopPrice || stopPrice);
+      return (lowestPrice !== existing.lowestPrice || trailingStopPrice !== existing.trailingStopPrice)
+        ? { ...existing, lowestPrice, trailingStopPrice, stopPrice, tp1Price, tp2Price, trailingBufferPct, initialAmount }
+        : existing;
+    }));
+
+    const technicalInvalidation = holding.side === 'LONG' ? price <= stopPrice : price >= stopPrice;
+    const hitTp1 = holding.side === 'LONG' ? price >= tp1Price : price <= tp1Price;
+    const hitTp2 = holding.side === 'LONG' ? price >= tp2Price : price <= tp2Price;
+    const trailingStopPrice = holding.trailingStopPrice || stopPrice;
+    const trailingBroken = runnerStage && (holding.side === 'LONG' ? price <= trailingStopPrice : price >= trailingStopPrice);
+    const weaknessConfirmed = runnerStage && momentumWeakening && (holding.side === 'LONG' ? price < trailingStopPrice : price > trailingStopPrice);
+
+    if (technicalInvalidation) {
+      executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: TECHNICAL INVALIDATION', holding.id, cycleId, undefined, holding.amount);
+      return;
+    }
+
+    if (!tp1Completed && hitTp1) {
+      executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: TP1 (1R-1.5R)', holding.id, cycleId, undefined, Math.min(holding.amount, initialAmount * 0.5));
+      return;
+    }
+
+    if (!runnerStage && hitTp2) {
+      if (histogramExpanding) {
+        executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: TP2 (2R-3R)', holding.id, cycleId, undefined, Math.max(0, holding.amount - runnerAmount));
+      } else {
+        executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: TP2 NO MOMENTUM EXPANSION', holding.id, cycleId, undefined, holding.amount);
+      }
+      return;
+    }
+
+    if (trailingBroken) {
+      executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: TRAILING STRUCTURE', holding.id, cycleId, undefined, holding.amount);
+      return;
+    }
+
+    if (weaknessConfirmed) {
+      executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: MOMENTUM WEAKNESS CONFIRMED', holding.id, cycleId, undefined, holding.amount);
+    }
+  }, [executeTrade, stopLossPercent]);
 
 
 
@@ -1698,19 +1835,21 @@ export default function App() {
     }
   }, [isRealMode, balance]);
 
+  const shouldMaintainLiveAccountSync = isRealMode && (autoTrade || holdings.length > 0);
+
   useEffect(() => {
-    if (!isRealMode) return;
+    if (!shouldMaintainLiveAccountSync) return;
     if (serverStatus !== 'OK') return;
     if (rateLimitedUntilRef.current > Date.now()) return;
 
-    // Keep live account metrics fresh after user has explicitly enabled Live mode.
+    // Keep private account sync off during public scan-only sessions.
     syncRealBalanceRef.current();
     const timer = setInterval(() => {
       syncRealBalanceRef.current();
     }, 15000);
 
     return () => clearInterval(timer);
-  }, [isRealMode, serverStatus]);
+  }, [shouldMaintainLiveAccountSync, serverStatus]);
 
   const currentHolding = holdings.find(h => h.symbol === symbol);
   const stopLossPrice = (currentHolding && currentPrice)
@@ -2180,6 +2319,14 @@ export default function App() {
       
       const totalToScan = symbolsToScan.length;
       setScanProgress({ current: 0, total: totalToScan });
+      const prioritySymbols = Array.from(new Set([
+        baseSymbol,
+        ...holdingsRef.current.map(h => h.symbol),
+      ].filter(Boolean)));
+      const shortlistLimit = Math.min(
+        totalToScan,
+        Math.max(prioritySymbols.length, Math.max(60, maxSymbolsPerScan)),
+      );
       
       let lastLoggedCount = 0;
       const results = await scanMarket(
@@ -2195,6 +2342,7 @@ export default function App() {
         },
         () => rateLimitedUntilRef.current <= Date.now() && (manual || autoTradeRef.current),
         strategyConfig,
+        { shortlistLimit, prioritySymbols },
       );
 
       if ((!manual && !autoTradeRef.current) || rateLimitedUntilRef.current > Date.now()) {
@@ -2240,24 +2388,7 @@ export default function App() {
         currentHoldings.forEach(holding => {
           const scanResult = results.find(r => r.symbol === holding.symbol);
           if (scanResult) {
-            const price = scanResult.lastPrice;
-            const macdExitTriggered = (holding.side === 'LONG' && scanResult.signal.exitSignal === 'EXIT_LONG')
-              || (holding.side === 'SHORT' && scanResult.signal.exitSignal === 'EXIT_SHORT');
-            const slTrigger = holding.side === 'SHORT'
-              ? price >= holding.entryPrice * (1 + stopLossPercent / 100)
-              : price <= holding.entryPrice * (1 - stopLossPercent / 100);
-            const tpTrigger = holding.side === 'SHORT'
-              ? price <= holding.entryPrice * (1 - takeProfitPercent / 100)
-              : price >= holding.entryPrice * (1 + takeProfitPercent / 100);
-            const exitSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
-
-            if (slTrigger) {
-              executeTrade(exitSide, holding.symbol, price, 'AUTO_EXIT: PORTFOLIO STOP LOSS', holding.id, cycleId);
-            } else if (tpTrigger) {
-              executeTrade(exitSide, holding.symbol, price, 'AUTO_EXIT: PORTFOLIO TAKE PROFIT', holding.id, cycleId);
-            } else if (macdExitTriggered) {
-              executeTrade(exitSide, holding.symbol, price, `AUTO_EXIT: PORTFOLIO MACD OVERRIDE (${scanResult.signal.macdScore}/10)`, holding.id, cycleId);
-            }
+            managePlannedExit(holding, scanResult.lastPrice, scanResult.signal, cycleId);
           }
         });
       }
@@ -2325,7 +2456,7 @@ export default function App() {
                 continue;
               }
               const entryType = side === 'BUY' ? 'LONG' : 'SHORT';
-              await executeTrade(side, pick.symbol, pick.lastPrice, `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`, undefined, cycleId);
+              await executeTrade(side, pick.symbol, pick.lastPrice, `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`, undefined, cycleId, pick.signal.tradePlan);
               if (!autoTradeRef.current || entryLockUntilRef.current > Date.now()) break;
               if (isRealMode) {
                 await new Promise(r => setTimeout(r, liveEntryDelayMs));
@@ -2506,26 +2637,7 @@ export default function App() {
         const price = holdingPrices[holding.symbol] || (holding.symbol === symbol ? currentPrice : null);
         
         if (price) {
-          const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
-          const macdExitTriggered = (holding.side === 'LONG' && strategy?.exitSignal === 'EXIT_LONG')
-            || (holding.side === 'SHORT' && strategy?.exitSignal === 'EXIT_SHORT');
-          const slTrigger = holding.side === 'SHORT'
-            ? price >= holding.entryPrice * (1 + stopLossPercent / 100)
-            : price <= holding.entryPrice * (1 - stopLossPercent / 100);
-          const tpTrigger = holding.side === 'SHORT'
-            ? price <= holding.entryPrice * (1 - takeProfitPercent / 100)
-            : price >= holding.entryPrice * (1 + takeProfitPercent / 100);
-
-          // 1. Hard Stop Loss Check (5%)
-          if (slTrigger) {
-            executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: STOP LOSS (5%)', holding.id);
-          } 
-          // 2. Take Profit Check (15%)
-          else if (tpTrigger) {
-            executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: TAKE PROFIT (15%)', holding.id);
-          } else if (macdExitTriggered) {
-            executeTrade(closeSide, holding.symbol, price, `AUTO_EXIT: MACD OVERRIDE (${strategy?.macdScore || 0}/10)`, holding.id);
-          }
+          managePlannedExit(holding, price, strategy);
         }
       });
     }
@@ -2541,10 +2653,10 @@ export default function App() {
       if (!isAlreadyHeld && !isOnCooldown) {
         const entrySide: 'BUY' | 'SELL' = strategy.overall === 'SELL' ? 'SELL' : 'BUY';
         const entryType = entrySide === 'SELL' ? 'SHORT' : 'LONG';
-        executeTrade(entrySide, symbol, currentPrice, `AUTO_ENTRY: ${entryType} SIGNAL [${strategy.score}/10]`);
+        executeTrade(entrySide, symbol, currentPrice, `AUTO_ENTRY: ${entryType} SIGNAL [${strategy.score}/10]`, undefined, undefined, strategy.tradePlan);
       }
     }
-  }, [currentPrice, strategy, autoTrade, holdings, symbol, executeTrade, stopLossPercent, takeProfitPercent, maxConcurrentTrades, holdingPrices, cooldowns, isRealMode]);
+  }, [currentPrice, strategy, autoTrade, holdings, symbol, executeTrade, maxConcurrentTrades, holdingPrices, cooldowns, isRealMode, managePlannedExit]);
 
   const calculateEquity = () => {
     if (isRealMode) {
@@ -3851,7 +3963,7 @@ export default function App() {
               </div>
             </section>
           )}
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             <MetricBox 
               icon={<Wallet className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Portfolio Value"
@@ -4150,17 +4262,17 @@ export default function App() {
 
 const MetricBox = ({ icon, label, value, trend, subValue }: { icon: React.ReactNode, label: string, value: string, trend?: 'up' | 'down', subValue?: React.ReactNode }) => {
   return (
-    <div className="bg-white border-2 border-[#141414] p-5 flex items-center justify-between group hover:bg-[#141414] hover:text-white transition-colors duration-300 font-sans">
-      <div className="flex items-center gap-4">
-        <div className="p-2.5 bg-[#141414] text-white group-hover:bg-[#F27D26] transition-colors">
+    <div className="bg-white border-2 border-[#141414] px-4 py-3.5 flex items-center justify-between group hover:bg-[#141414] hover:text-white transition-colors duration-300 font-sans">
+      <div className="flex items-center gap-3">
+        <div className="p-2 bg-[#141414] text-white group-hover:bg-[#F27D26] transition-colors">
           {icon}
         </div>
         <div className="min-w-0">
-          <p className="text-[11px] uppercase font-bold opacity-40 tracking-tighter group-hover:opacity-60">{label}</p>
+          <p className="text-[10px] uppercase font-bold opacity-40 tracking-tighter group-hover:opacity-60">{label}</p>
           <div className="flex flex-col">
-            <p className="whitespace-nowrap text-[28px] font-black tabular-nums tracking-tighter leading-none">{value}</p>
+            <p className="whitespace-nowrap text-[24px] font-black tabular-nums tracking-tighter leading-none">{value}</p>
             {subValue && (
-              <div className="mt-1 font-mono uppercase text-[9px] font-bold opacity-60 break-words">
+              <div className="mt-0.5 font-mono uppercase text-[8px] font-bold opacity-60 break-words">
                 {subValue}
               </div>
             )}
@@ -4169,7 +4281,7 @@ const MetricBox = ({ icon, label, value, trend, subValue }: { icon: React.ReactN
       </div>
       {trend && (
         <div className={trend === 'up' ? 'text-emerald-600' : 'text-rose-600'}>
-          {trend === 'up' ? <ArrowUpRight size={28} /> : <ArrowDownRight size={28} />}
+          {trend === 'up' ? <ArrowUpRight size={22} /> : <ArrowDownRight size={22} />}
         </div>
       )}
     </div>

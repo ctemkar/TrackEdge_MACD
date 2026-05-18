@@ -37,6 +37,8 @@ async function startServer() {
     authFailCount: 0,     // consecutive Binance auth/permission failures
     authBlockedUntil: 0,  // epoch ms to suppress retries for invalid keys/permissions
   };
+  const publicExchangeInfoCache = new Map<string, { symbols: any[]; updatedAt: number }>();
+  let publicTicker24hCache: { rows: any[]; updatedAt: number } | null = null;
   const MAX_BACKOFF_MS = 5 * 60 * 1000; // cap backoff at 5 minutes
   const MAX_AUTH_BLOCK_MS = 10 * 60 * 1000; // cap auth block at 10 minutes
   const throttledLogState = new Map<string, number>();
@@ -1741,10 +1743,6 @@ async function startServer() {
   app.get('/api/binance/proxy/klines', async (req, res) => {
     // Honour rate-limit ban window
     const now = Date.now();
-    const blockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
-    if (blockedUntil > now) {
-      return res.json([]); // return empty candles so scanner skips quietly
-    }
     try {
       const { symbol, interval, limit } = req.query;
       const source = String(req.query.source || '').toLowerCase();
@@ -1771,7 +1769,11 @@ async function startServer() {
         if (forceBinancePublic) {
           const nowPublic = Date.now();
           const blockedUntilPublic = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
-          if (blockedUntilPublic > nowPublic) return res.json([]);
+          if (blockedUntilPublic > nowPublic) {
+            const bybitFallback = await fetchBybitKlines(String(symbol), String(interval || '1d'), Number(limit) || 500);
+            if (bybitFallback) return res.json(bybitFallback);
+            return res.json([]);
+          }
 
           const endpoints = [
             `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
@@ -1789,6 +1791,12 @@ async function startServer() {
               console.warn(`[TradeEdge RateLimit] klines Binance public source rate limited`);
               break;
             }
+          }
+
+          const bybitFallback = await fetchBybitKlines(String(symbol), String(interval || '1d'), Number(limit) || 500);
+          if (bybitFallback) {
+            logWithThrottle('warn', `public-klines-fallback-${String(symbol).toUpperCase()}`, `[TradeEdge] klines: Binance public unavailable for ${symbol}, using Bybit public fallback`, 60000);
+            return res.json(bybitFallback);
           }
 
           return res.json([]);
@@ -1833,12 +1841,6 @@ async function startServer() {
   });
 
   app.get('/api/binance/proxy/exchangeInfo', async (req, res) => {
-    // Honour rate-limit ban window
-    const now = Date.now();
-    const blockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
-    if (blockedUntil > now) {
-      return res.status(429).json({ status: 'rate_limited', symbols: [], bannedUntil: blockedUntil });
-    }
     try {
       const source = String(req.query.source || '').toLowerCase();
       const forceBinancePublic = source !== 'bybit';
@@ -1862,6 +1864,17 @@ async function startServer() {
       } else {
         const includeSpot = String(req.query.includeSpot || '0') === '1';
         const includeFutures = String(req.query.includeFutures || '1') !== '0';
+        const cacheKey = `${includeSpot ? '1' : '0'}_${includeFutures ? '1' : '0'}`;
+        const cachedExchangeInfo = publicExchangeInfoCache.get(cacheKey);
+        const now = Date.now();
+        const blockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+        if (forceBinancePublic && blockedUntil > now) {
+          if (cachedExchangeInfo?.symbols?.length) {
+            logWithThrottle('warn', `exchangeInfo-cache-${cacheKey}`, `[TradeEdge] exchangeInfo: Binance public blocked, serving cached metadata (${cachedExchangeInfo.symbols.length} symbols)`, 60000);
+            return res.json({ symbols: cachedExchangeInfo.symbols, cached: true, source: 'binance_public_cache' });
+          }
+          return res.status(429).json({ status: 'rate_limited', symbols: [], bannedUntil: blockedUntil });
+        }
         const mergedSymbols: any[] = [];
 
         const fetchAndCollect = async (url: string, marketType: 'spot' | 'futures') => {
@@ -1879,6 +1892,11 @@ async function startServer() {
             else rateLimitState.backoffUntil = Date.now() + 60000;
             console.warn(`[TradeEdge RateLimit] exchangeInfo rate limited (${marketType}) — suppressing`);
             const newBlockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+            if (cachedExchangeInfo?.symbols?.length) {
+              logWithThrottle('warn', `exchangeInfo-cache-${cacheKey}`, `[TradeEdge] exchangeInfo: Binance public rate limited, serving cached metadata (${cachedExchangeInfo.symbols.length} symbols)`, 60000);
+              res.json({ symbols: cachedExchangeInfo.symbols, cached: true, source: 'binance_public_cache' });
+              return;
+            }
             res.status(429).json({ status: 'rate_limited', symbols: [], bannedUntil: newBlockedUntil });
             return;
           }
@@ -1909,8 +1927,11 @@ async function startServer() {
             if (!deduped.has(key)) deduped.set(key, s);
           });
         }
-
-        return res.json({ symbols: Array.from(deduped.values()) });
+        const symbols = Array.from(deduped.values());
+        if (forceBinancePublic && symbols.length > 0) {
+          publicExchangeInfoCache.set(cacheKey, { symbols, updatedAt: Date.now() });
+        }
+        return res.json({ symbols });
       }
     } catch (error: any) {
       res.status(500).json({ status: 'error', message: error.message });
@@ -1934,9 +1955,30 @@ async function startServer() {
         return res.json(mapped);
       } else {
         if (forceBinancePublic) {
+          const blockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+          if (blockedUntil > Date.now()) {
+            if (publicTicker24hCache?.rows?.length) {
+              logWithThrottle('warn', 'ticker24hr-cache', `[TradeEdge] ticker24hr: Binance public blocked, serving cached 24h stats (${publicTicker24hCache.rows.length} rows)`, 60000);
+              return res.json(publicTicker24hCache.rows);
+            }
+            const bybitTickers = await fetchBybitTickers();
+            if (bybitTickers.length > 0) return res.json(bybitTickers);
+          }
           const url = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
           const response = await fetch(url);
-          if (response.ok) return res.json(await response.json());
+          if (response.ok) {
+            const rows = await response.json();
+            if (Array.isArray(rows) && rows.length > 0) {
+              publicTicker24hCache = { rows, updatedAt: Date.now() };
+            }
+            return res.json(rows);
+          }
+          const bybitTickers = await fetchBybitTickers();
+          if (bybitTickers.length > 0) {
+            logWithThrottle('warn', 'ticker24hr-bybit-fallback', '[TradeEdge] ticker24hr: Binance public unavailable, using Bybit public fallback', 60000);
+            return res.json(bybitTickers);
+          }
+          if (publicTicker24hCache?.rows?.length) return res.json(publicTicker24hCache.rows);
           throw new Error('Binance public ticker failed');
         }
 

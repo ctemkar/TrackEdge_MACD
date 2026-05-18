@@ -15,6 +15,11 @@ export interface MarketScanResult {
   priorityRank?: number;
 }
 
+type ScanMarketOptions = {
+  shortlistLimit?: number;
+  prioritySymbols?: string[];
+};
+
 function getDirectionalSignalStrength(signal: StrategySignal): number {
   if (signal.overall === 'SELL') return 10 - signal.score;
   if (signal.overall === 'BUY') return signal.score;
@@ -49,16 +54,35 @@ export async function scanMarket(
   onProgress?: (current: number, total: number) => void,
   shouldContinue?: () => boolean,
   strategyConfig?: StrategyConfig,
+  options?: ScanMarketOptions,
 ): Promise<MarketScanResult[]> {
   const results: MarketScanResult[] = [];
   const batchSize = 3;
   const interBatchDelayMs = 550;
   const tickerStats = await fetchTicker24hStats({ forceBinancePublic: true });
+  const prioritySymbols = new Set((options?.prioritySymbols || []).map(symbol => String(symbol || '').toUpperCase()).filter(Boolean));
+  const shortlistLimit = Math.max(prioritySymbols.size, Math.min(symbols.length, options?.shortlistLimit || symbols.length));
+  const rankedSymbols = [...symbols].sort((a, b) => {
+    const aPriority = prioritySymbols.has(a.toUpperCase()) ? 1 : 0;
+    const bPriority = prioritySymbols.has(b.toUpperCase()) ? 1 : 0;
+    if (aPriority !== bPriority) return bPriority - aPriority;
+
+    const aStats = tickerStats.get(a.toUpperCase());
+    const bStats = tickerStats.get(b.toUpperCase());
+    const aVolume = Math.max(0, aStats?.quoteVolume || 0);
+    const bVolume = Math.max(0, bStats?.quoteVolume || 0);
+    if (aVolume !== bVolume) return bVolume - aVolume;
+
+    const aMove = Math.abs(aStats?.priceChangePercent || 0);
+    const bMove = Math.abs(bStats?.priceChangePercent || 0);
+    return bMove - aMove;
+  });
+  const symbolsToAnalyze = rankedSymbols.slice(0, shortlistLimit);
   
-  for (let i = 0; i < symbols.length; i += batchSize) {
+  for (let i = 0; i < symbolsToAnalyze.length; i += batchSize) {
     if (shouldContinue && !shouldContinue()) break;
-    if (onProgress) onProgress(i, symbols.length);
-    const batch = symbols.slice(i, i + batchSize);
+    if (onProgress) onProgress(i, symbolsToAnalyze.length);
+    const batch = symbolsToAnalyze.slice(i, i + batchSize);
     const batchPromises = batch.map(async (symbol): Promise<MarketScanResult | null> => {
       if (shouldContinue && !shouldContinue()) return null;
       try {

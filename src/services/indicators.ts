@@ -114,6 +114,13 @@ export interface StrategySignal {
   macdScore: number;
   exitSignal: 'EXIT_LONG' | 'EXIT_SHORT' | 'NONE';
   holdReason?: 'UNCLEAR_SETUP' | 'MOVE_ALREADY_HAPPENED' | 'WEAK_MACD' | 'INSUFFICIENT_CONFIRMATION';
+  tradePlan?: {
+    stopPrice: number;
+    tp1Price: number;
+    tp2Price: number;
+    riskPerUnit: number;
+    trailingBufferPct: number;
+  };
 }
 
 export function evaluateStrategy(
@@ -130,6 +137,7 @@ export function evaluateStrategy(
     macdScore: 0,
     exitSignal: 'NONE',
     holdReason: 'INSUFFICIENT_CONFIRMATION',
+    tradePlan: undefined,
   };
 
   const lastCandle = candles[candles.length - 1];
@@ -404,20 +412,38 @@ export function evaluateStrategy(
     || (!bullishMacdConfirmed && !bearishMacdConfirmed);
   const longEntryQualified = !unclearSetup && !longMoveAlreadyHappened && longQuality && bullishMacdConfirmed && finalTradeScore >= 7.2;
   const shortEntryQualified = !unclearSetup && !shortMoveAlreadyHappened && shortQuality && bearishMacdConfirmed && finalTradeScore <= 2.8;
+  const trailingBufferPct = Math.max(0.008, Math.min(0.025, (avgRangePct / 100) * 0.6 || 0.012));
+  const longTradePlan = {
+    stopPrice: Number(longStop.toFixed(8)),
+    tp1Price: Number((lastCandle.close + (longRisk * 1.25)).toFixed(8)),
+    tp2Price: Number((lastCandle.close + (longRisk * 2.4)).toFixed(8)),
+    riskPerUnit: Number(longRisk.toFixed(8)),
+    trailingBufferPct: Number(trailingBufferPct.toFixed(4)),
+  };
+  const shortTradePlan = {
+    stopPrice: Number(shortStop.toFixed(8)),
+    tp1Price: Number((lastCandle.close - (shortRisk * 1.25)).toFixed(8)),
+    tp2Price: Number((lastCandle.close - (shortRisk * 2.4)).toFixed(8)),
+    riskPerUnit: Number(shortRisk.toFixed(8)),
+    trailingBufferPct: Number(trailingBufferPct.toFixed(4)),
+  };
 
   let overall: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
   let score = 0;
   let macdScore = 0;
   let exitSignal: 'EXIT_LONG' | 'EXIT_SHORT' | 'NONE' = 'NONE';
   let holdReason: StrategySignal['holdReason'] = undefined;
+  let tradePlan: StrategySignal['tradePlan'] = undefined;
   if (longEntryQualified) {
     overall = 'BUY';
     macdScore = longMacdScore;
     score = finalTradeScore;
+    tradePlan = longTradePlan;
   } else if (shortEntryQualified) {
     overall = 'SELL';
     macdScore = shortMacdScore;
     score = finalTradeScore;
+    tradePlan = shortTradePlan;
   } else {
     score = finalTradeScore;
     macdScore = Math.max(longMacdScore, shortMacdScore);
@@ -455,5 +481,6 @@ export function evaluateStrategy(
     macdScore,
     exitSignal,
     holdReason,
+    tradePlan,
   };
 }
