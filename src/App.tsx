@@ -438,7 +438,7 @@ export default function App() {
     direction: ActivePositionSortDirection;
   }
 
-  type ExecutionStatus = 'FILLED' | 'SUBMITTED' | 'SKIPPED' | 'FAILED';
+  type ExecutionStatus = 'FILLED' | 'SUBMITTED' | 'SKIPPED' | 'FAILED' | 'UNCONFIRMED' | 'SYNC_REMOVED';
   interface TradeEvent {
     type: 'BUY' | 'SELL';
     symbol: string;
@@ -451,6 +451,22 @@ export default function App() {
     pnlPct?: number;
     status?: ExecutionStatus;
     cycleId?: number;
+  }
+
+  interface PendingCloseSyncConfirmation {
+    symbol: string;
+    closeSide: 'BUY' | 'SELL';
+    price: number;
+    amount: number;
+    entryPrice?: number;
+    cycleId?: number;
+    startedAt: number;
+  }
+
+  interface ExchangeSyncSnapshot {
+    updatedAt: number;
+    openPositions: Record<string, { side: 'LONG' | 'SHORT'; amount: number }>;
+    filteredSymbols: Record<string, string>;
   }
 
   interface SystemLogEntry {
@@ -479,6 +495,17 @@ export default function App() {
     side: 'BUY' | 'SELL';
     score: number;
     priorityRank: number;
+  };
+
+  type RejectReasonGroup = {
+    reason: string;
+    count: number;
+    symbols: Array<{
+      symbol: string;
+      score: number;
+      priorityRank: number;
+      macdScore: number;
+    }>;
   };
 
   const [holdings, setHoldings] = useState<Holding[]>(() => {
@@ -567,6 +594,7 @@ export default function App() {
   const tradeLockout = React.useRef<Set<string>>(new Set());
   const isSyncingRef = React.useRef(false);
   const syncRealBalanceRef = React.useRef<() => Promise<boolean>>(async () => false);
+  const pendingCloseSyncRef = React.useRef<Record<string, PendingCloseSyncConfirmation>>({});
   const scanningRef = React.useRef(false);
   const rateLimitedUntilRef = React.useRef(0);
   const RATE_LIMIT_UNTIL_KEY = 'te_rate_limited_until';
@@ -578,6 +606,13 @@ export default function App() {
   const currentScanCycleRef = React.useRef(0);
   const entryLockUntilRef = React.useRef(0);
   const lastScanSkipLogRef = React.useRef<Record<string, number>>({});
+  const [pendingCloseSyncSymbols, setPendingCloseSyncSymbols] = useState<Record<string, PendingCloseSyncConfirmation>>({});
+  const [recentSyncRemovedClosures, setRecentSyncRemovedClosures] = useState<Record<string, { updatedAt: number; reason: string }>>({});
+  const [lastExchangeSyncSnapshot, setLastExchangeSyncSnapshot] = useState<ExchangeSyncSnapshot>({
+    updatedAt: 0,
+    openPositions: {},
+    filteredSymbols: {},
+  });
   
   // Refs for scan logic to avoid dependency loops
   const holdingsRef = React.useRef(holdings);
@@ -719,8 +754,9 @@ export default function App() {
 
     setScanExecutionTotals(prev => {
       const next = { ...prev, attempted: prev.attempted + 1 };
-      if (normalized.status === 'FILLED' || normalized.status === 'SUBMITTED') next.filled += 1;
+      if (normalized.status === 'FILLED' || normalized.status === 'SUBMITTED' || normalized.status === 'SYNC_REMOVED') next.filled += 1;
       else if (normalized.status === 'FAILED') next.failed += 1;
+      else if (normalized.status === 'UNCONFIRMED') next.failed += 1;
       else next.skipped += 1;
       return next;
     });
@@ -729,8 +765,9 @@ export default function App() {
       setScanExecutionStats(prev => {
         if (normalized.cycleId !== prev.cycleId) return prev;
         const next = { ...prev, attempted: prev.attempted + 1 };
-        if (normalized.status === 'FILLED' || normalized.status === 'SUBMITTED') next.filled += 1;
+        if (normalized.status === 'FILLED' || normalized.status === 'SUBMITTED' || normalized.status === 'SYNC_REMOVED') next.filled += 1;
         else if (normalized.status === 'FAILED') next.failed += 1;
+        else if (normalized.status === 'UNCONFIRMED') next.failed += 1;
         else next.skipped += 1;
         return next;
       });
@@ -755,6 +792,34 @@ export default function App() {
       cycleId,
     });
   }, [pushTradeEvent]);
+
+  const markPendingCloseSync = React.useCallback((pending: PendingCloseSyncConfirmation) => {
+    const normalizedSymbol = normalizeLiveFuturesSymbol(pending.symbol);
+    if (!normalizedSymbol) return;
+    const nextPending = { ...pending, symbol: normalizedSymbol };
+    pendingCloseSyncRef.current = {
+      ...pendingCloseSyncRef.current,
+      [normalizedSymbol]: nextPending,
+    };
+    setPendingCloseSyncSymbols(prev => ({
+      ...prev,
+      [normalizedSymbol]: nextPending,
+    }));
+  }, []);
+
+  const clearPendingCloseSync = React.useCallback((rawSymbol: string) => {
+    const normalizedSymbol = normalizeLiveFuturesSymbol(rawSymbol);
+    if (!normalizedSymbol || !pendingCloseSyncRef.current[normalizedSymbol]) return;
+    const nextPending = { ...pendingCloseSyncRef.current };
+    delete nextPending[normalizedSymbol];
+    pendingCloseSyncRef.current = nextPending;
+    setPendingCloseSyncSymbols(prev => {
+      if (!prev[normalizedSymbol]) return prev;
+      const next = { ...prev };
+      delete next[normalizedSymbol];
+      return next;
+    });
+  }, []);
 
   const reportSyncError = React.useCallback((message: string | null) => {
     if (!message) {
@@ -971,6 +1036,53 @@ export default function App() {
           }
         }
 
+        const syncUpdatedAt = Date.now();
+        const openPositions = Object.fromEntries(
+          freshHoldings.map((holding) => [
+            normalizeLiveFuturesSymbol(holding.symbol),
+            {
+              side: holding.side,
+              amount: holding.amount,
+            },
+          ])
+        ) as ExchangeSyncSnapshot['openPositions'];
+        const filteredSymbols = Object.fromEntries(
+          nextFilteredSyncSymbols.map((entry: { symbol: string; reason: string }) => [
+            normalizeLiveFuturesSymbol(entry.symbol),
+            entry.reason,
+          ])
+        ) as ExchangeSyncSnapshot['filteredSymbols'];
+        setLastExchangeSyncSnapshot({
+          updatedAt: syncUpdatedAt,
+          openPositions,
+          filteredSymbols,
+        });
+
+        const removedBySync: Record<string, { updatedAt: number; reason: string }> = {};
+        for (const [trackedSymbol, pending] of Object.entries(pendingCloseSyncRef.current)) {
+          if (openPositions[trackedSymbol] || filteredSymbols[trackedSymbol]) continue;
+          removedBySync[trackedSymbol] = {
+            updatedAt: syncUpdatedAt,
+            reason: 'Removed by exchange sync after close request.',
+          };
+          pushTradeEvent({
+            type: pending.closeSide,
+            symbol: trackedSymbol,
+            price: pending.price,
+            entryPrice: pending.entryPrice,
+            amount: pending.amount,
+            time: new Date(syncUpdatedAt).toISOString(),
+            reason: 'REMOVED BY EXCHANGE SYNC: Position is no longer reported by the exchange.',
+            status: 'SYNC_REMOVED',
+            cycleId: pending.cycleId,
+          });
+          delete pendingCloseSyncRef.current[trackedSymbol];
+        }
+        if (Object.keys(removedBySync).length > 0) {
+          setRecentSyncRemovedClosures(prev => ({ ...prev, ...removedBySync }));
+          setPendingCloseSyncSymbols({ ...pendingCloseSyncRef.current });
+        }
+
         const totalPositionsValue = freshHoldings.reduce((sum, h) => {
            const price = marketPicks.find(p => p.symbol === h.symbol)?.lastPrice || holdingPrices[h.symbol] || h.entryPrice;
            return sum + (price * h.amount);
@@ -1018,7 +1130,7 @@ export default function App() {
       isSyncingRef.current = false;
       setIsSyncing(false);
     }
-  }, [addLog, reportSyncError, serverConfig?.outboundIp, benchmarkCapital, holdings.length, isRealMode, marketPicks, holdingPrices]);
+  }, [addLog, reportSyncError, serverConfig?.outboundIp, benchmarkCapital, holdings.length, isRealMode, marketPicks, holdingPrices, pushTradeEvent]);
 
   React.useEffect(() => {
     syncRealBalanceRef.current = syncRealBalance;
@@ -1403,8 +1515,17 @@ export default function App() {
               return;
             }
 
+            markPendingCloseSync({
+              symbol: tradeSymbol,
+              closeSide: type,
+              price,
+              amount,
+              entryPrice: existingHolding?.entryPrice,
+              cycleId: eventCycleId,
+              startedAt: Date.now(),
+            });
             setExecutionFeedback({ type: 'warning', message: `${type} unconfirmed for ${tradeSymbol}. Will retry on next cycle.` });
-            pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason: `UNCONFIRMED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason: `CLOSE SUBMITTED: awaiting exchange sync. ${msg}`, status: 'UNCONFIRMED', cycleId: eventCycleId });
             if (closingExisting) {
               lockEntries(closeFailureLockMinutes * 60 * 1000, `Close verification failed for ${tradeSymbol}. New entries paused for ${closeFailureLockMinutes}m.`);
             }
@@ -1416,6 +1537,7 @@ export default function App() {
 
           if (authDegradedDuringVerify) {
             const orderId = result?.order?.id || result?.order?.clientOrderId || result?.order?.info?.orderId;
+            clearPendingCloseSync(tradeSymbol);
             applyOptimisticLiveFill(type, tradeSymbol, amount, price, time);
             addLog(`REAL ${type} SUCCESS: ${tradeSymbol} [Verified by order response; position-risk endpoint unavailable]`, 'success');
             setExecutionFeedback({ type: 'success', message: `${type} confirmed on exchange for ${tradeSymbol}.` });
@@ -1523,6 +1645,7 @@ export default function App() {
           setExecutionFeedback({ type: 'success', message: `${type} verified for ${tradeSymbol} after exchange resync.` });
           if (closingExisting) {
             clearEntryLock();
+            clearPendingCloseSync(tradeSymbol);
           }
           pushTradeEvent({
             type,
@@ -1554,8 +1677,19 @@ export default function App() {
             return;
           }
 
+          if (closingExisting) {
+            markPendingCloseSync({
+              symbol: tradeSymbol,
+              closeSide: type,
+              price,
+              amount: heldAmount || 0,
+              entryPrice: existingHolding?.entryPrice,
+              cycleId: eventCycleId,
+              startedAt: Date.now(),
+            });
+          }
           setExecutionFeedback({ type: 'warning', message: `${type} unconfirmed for ${tradeSymbol}. Waiting for exchange confirmation.` });
-          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: heldAmount || 0, time, reason: `UNCONFIRMED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: heldAmount || 0, time, reason: `CLOSE UNCONFIRMED: waiting for exchange sync. ${msg}`, status: 'UNCONFIRMED', cycleId: eventCycleId });
           setTimeout(syncRealBalance, 1500);
           setTimeout(syncRealBalance, 4500);
           return;
@@ -1767,6 +1901,9 @@ export default function App() {
     const technicalInvalidation = margin > 0
       ? currentMarginPnlPct <= -Math.abs(stopLossPercent)
       : (holding.side === 'LONG' ? price <= stopPrice : price >= stopPrice);
+    const marginProfitTargetHit = margin > 0
+      ? currentMarginPnlPct >= Math.abs(takeProfitPercent)
+      : false;
     const hitTp1 = holding.side === 'LONG' ? price >= tp1Price : price <= tp1Price;
     const hitTp2 = holding.side === 'LONG' ? price >= tp2Price : price <= tp2Price;
     const trailingStopPrice = holding.trailingStopPrice || stopPrice;
@@ -1781,6 +1918,20 @@ export default function App() {
         margin > 0
           ? `AUTO_EXIT: MARGIN STOP ${currentMarginPnlPct.toFixed(2)}% <= -${Math.abs(stopLossPercent).toFixed(2)}%`
           : 'AUTO_EXIT: TECHNICAL INVALIDATION',
+        holding.id,
+        cycleId,
+        undefined,
+        holding.amount,
+      );
+      return;
+    }
+
+    if (marginProfitTargetHit) {
+      executeTrade(
+        closeSide,
+        holding.symbol,
+        price,
+        `AUTO_EXIT: MARGIN TAKE PROFIT ${currentMarginPnlPct.toFixed(2)}% >= ${Math.abs(takeProfitPercent).toFixed(2)}%`,
         holding.id,
         cycleId,
         undefined,
@@ -1811,7 +1962,7 @@ export default function App() {
     if (weaknessConfirmed) {
       executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: MOMENTUM WEAKNESS CONFIRMED', holding.id, cycleId, undefined, holding.amount);
     }
-  }, [executeTrade, stopLossPercent]);
+  }, [executeTrade, stopLossPercent, takeProfitPercent]);
 
 
 
@@ -1931,10 +2082,19 @@ export default function App() {
   }, [shouldMaintainLiveAccountSync, serverStatus]);
 
   const currentHolding = holdings.find(h => h.symbol === symbol);
-  const stopLossPrice = (currentHolding && currentPrice)
+  const currentHoldingContracts = Number(currentHolding?.contracts || currentHolding?.amount || 0);
+  const currentHoldingNotional = Number(currentHolding?.notional || (currentHoldingContracts * Number(currentHolding?.entryPrice || 0)) || 0);
+  const currentHoldingMargin = Number(currentHolding?.initialMargin || (currentHoldingNotional > 0 ? currentHoldingNotional / 5 : 0) || 0);
+  const currentHoldingUsesMarginTargets = currentHoldingMargin > 0;
+  const stopLossPrice = currentHolding
     ? (currentHolding.side === 'SHORT'
       ? currentHolding.entryPrice * (1 + stopLossPercent / 100)
       : currentHolding.entryPrice * (1 - stopLossPercent / 100))
+    : 0;
+  const takeProfitPrice = currentHolding
+    ? (currentHolding.side === 'SHORT'
+      ? currentHolding.entryPrice * (1 - takeProfitPercent / 100)
+      : currentHolding.entryPrice * (1 + takeProfitPercent / 100))
     : 0;
 
   const [scanProgress, setScanProgress] = useState({ current: 0, total: 0 });
@@ -1971,6 +2131,7 @@ export default function App() {
   });
   const [filteredSyncSymbols, setFilteredSyncSymbols] = useState<Array<{ symbol: string; reason: string }>>([]);
   const [scanDataSource, setScanDataSource] = useState('BINANCE PUBLIC');
+  const [selectedRejectReason, setSelectedRejectReason] = useState<string | null>(null);
 
   const formatPrice = (price: number) => {
     if (price === 0) return '0.00';
@@ -2918,6 +3079,75 @@ export default function App() {
   const filteredSyncNote = filteredSyncSymbols.length > 0
     ? `Exchange sync filtered ${filteredSyncSymbols.length} non-tradable raw symbol${filteredSyncSymbols.length === 1 ? '' : 's'}${filteredSyncSymbolsPreview ? `: ${filteredSyncSymbolsPreview}${filteredSyncSymbols.length > 3 ? ', ...' : ''}.` : '.'} USDT remains available as cash in Cash / Available Funds and is not shown as an active position.`
     : '';
+  const recentTradeSymbol = tradeHistory.find((trade) => trade.symbol !== 'SCAN')?.symbol || '';
+  const syncDiagnosticSymbol = (() => {
+    const currentSymbol = normalizeLiveFuturesSymbol(symbol);
+    if (
+      currentSymbol && (
+        pendingCloseSyncSymbols[currentSymbol]
+        || recentSyncRemovedClosures[currentSymbol]
+        || lastExchangeSyncSnapshot.openPositions[currentSymbol]
+        || lastExchangeSyncSnapshot.filteredSymbols[currentSymbol]
+      )
+    ) {
+      return currentSymbol;
+    }
+    return normalizeLiveFuturesSymbol(recentTradeSymbol) || currentSymbol;
+  })();
+  const exchangeSyncDiagnostic = syncDiagnosticSymbol
+    ? (() => {
+        const openPosition = lastExchangeSyncSnapshot.openPositions[syncDiagnosticSymbol];
+        if (openPosition) {
+          return {
+            symbol: syncDiagnosticSymbol,
+            label: 'OPEN ON EXCHANGE',
+            tone: 'emerald' as const,
+            detail: `${openPosition.side} position still reported in the last exchange sync.` ,
+            updatedAt: lastExchangeSyncSnapshot.updatedAt,
+          };
+        }
+        const pendingClose = pendingCloseSyncSymbols[syncDiagnosticSymbol];
+        if (pendingClose) {
+          return {
+            symbol: syncDiagnosticSymbol,
+            label: 'CLOSE SUBMITTED / AWAITING SYNC',
+            tone: 'sky' as const,
+            detail: 'A close request was sent, but the exchange has not yet removed this symbol in the last sync.',
+            updatedAt: pendingClose.startedAt,
+          };
+        }
+        const removedBySync = recentSyncRemovedClosures[syncDiagnosticSymbol];
+        if (removedBySync) {
+          return {
+            symbol: syncDiagnosticSymbol,
+            label: 'REMOVED BY EXCHANGE SYNC',
+            tone: 'emerald' as const,
+            detail: removedBySync.reason,
+            updatedAt: removedBySync.updatedAt,
+          };
+        }
+        const filteredReason = lastExchangeSyncSnapshot.filteredSymbols[syncDiagnosticSymbol];
+        if (filteredReason) {
+          return {
+            symbol: syncDiagnosticSymbol,
+            label: 'FILTERED FROM ACTIVE POSITIONS',
+            tone: 'amber' as const,
+            detail: filteredReason,
+            updatedAt: lastExchangeSyncSnapshot.updatedAt,
+          };
+        }
+        if (lastExchangeSyncSnapshot.updatedAt > 0) {
+          return {
+            symbol: syncDiagnosticSymbol,
+            label: 'NOT REPORTED BY LAST EXCHANGE SYNC',
+            tone: 'gray' as const,
+            detail: 'The exchange did not include this symbol in the most recent live positions payload.',
+            updatedAt: lastExchangeSyncSnapshot.updatedAt,
+          };
+        }
+        return null;
+      })()
+    : null;
   
   // Anti-Glitich: If equity is non-finite or impossible, it's a data core issue
   // We cap at $100,000,000 to allow "Whale" mode while still blocking glitches
@@ -3196,24 +3426,113 @@ export default function App() {
       })
       .slice(0, 6);
   }, [marketPicks]);
-  const rejectReasonSummary = React.useMemo(() => {
-    const counts = new Map<string, number>();
+  const rejectReasonGroups = React.useMemo<RejectReasonGroup[]>(() => {
+    const groups = new Map<string, RejectReasonGroup>();
 
     for (const pick of marketPicks) {
       if (pick.signal.overall !== 'HOLD') continue;
-      const reasons = pick.signal.rejectReasons || [];
+      const reasons = Array.from(new Set(pick.signal.rejectReasons || []));
       for (const reason of reasons) {
-        counts.set(reason, (counts.get(reason) || 0) + 1);
+        const existing = groups.get(reason) || {
+          reason,
+          count: 0,
+          symbols: [],
+        };
+        existing.count += 1;
+        existing.symbols.push({
+          symbol: pick.symbol,
+          score: pick.signal.score || 0,
+          priorityRank: pick.priorityRank || 0,
+          macdScore: pick.signal.macdScore || 0,
+        });
+        groups.set(reason, existing);
       }
     }
 
-    return Array.from(counts.entries())
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 6)
-      .map(([reason, count]) => ({ reason, count }));
+    return Array.from(groups.values())
+      .map((group) => ({
+        ...group,
+        symbols: [...group.symbols].sort((a, b) => {
+          if (b.priorityRank !== a.priorityRank) return b.priorityRank - a.priorityRank;
+          if (b.score !== a.score) return b.score - a.score;
+          return b.macdScore - a.macdScore;
+        }),
+      }))
+      .sort((a, b) => {
+        if (b.count !== a.count) return b.count - a.count;
+        return a.reason.localeCompare(b.reason);
+      });
   }, [marketPicks]);
+  const selectedRejectReasonGroup = rejectReasonGroups.find((group) => group.reason === selectedRejectReason) || null;
+
+  useEffect(() => {
+    if (!selectedRejectReason) return;
+    if (!rejectReasonGroups.some((group) => group.reason === selectedRejectReason)) {
+      setSelectedRejectReason(null);
+    }
+  }, [rejectReasonGroups, selectedRejectReason]);
+
   const visibleSignalTablePicks = marketPicks
     .slice(0, visibleSignalTableLimit);
+  const rankedSignalStatuses = React.useMemo(() => {
+    const normalizedLiveExchange = String(serverConfig?.exchange || '').toLowerCase();
+    const isLiveBinance = isRealMode && normalizedLiveExchange === 'binance';
+    const scanNow = Date.now();
+    const hasAllowedQuote = (value: string) => {
+      const up = String(value || '').toUpperCase();
+      return liveQuoteAllowlist.some((quote: string) => up.endsWith(quote));
+    };
+    const isLikelyBinanceFuturesSymbol = (value: string) => {
+      const up = String(value || '').toUpperCase();
+      return /^[A-Z0-9]+?(USDT|USDC|FDUSD|BTC|ETH|BNB)$/.test(up) && up.length < 20 && !/[^A-Z0-9]/.test(up);
+    };
+    const isLiveTradableFuturesSymbol = (value: string) => liveTradableSymbolsRef.current.has(normalizeLiveFuturesSymbol(value));
+
+    return Object.fromEntries(visibleSignalTablePicks.map((pick) => {
+      if (pick.signal.overall === 'HOLD') {
+        return [pick.symbol, {
+          label: 'HOLD',
+          detail: describeHoldReason(pick.signal.holdReason),
+          className: 'bg-gray-100 text-gray-600',
+        }];
+      }
+
+      let reason: string | null = null;
+      if (isLiveBinance && !isLikelyBinanceFuturesSymbol(pick.symbol)) {
+        reason = 'invalid futures symbol format';
+      } else if (isLiveBinance && !fullUniverseMode && !hasAllowedQuote(pick.symbol)) {
+        reason = `outside focused quotes`;
+      } else if (isLiveBinance && !isLiveTradableFuturesSymbol(pick.symbol)) {
+        reason = 'not in Binance futures set';
+      } else if (holdings.some((holding) => holding.symbol === pick.symbol)) {
+        reason = 'already held';
+      } else {
+        const cooldownUntil = cooldowns[pick.symbol] || 0;
+        if (cooldownUntil > scanNow) {
+          const minutesRemaining = Math.max(1, Math.ceil((cooldownUntil - scanNow) / 60000));
+          reason = `cooldown ${minutesRemaining}m`;
+        } else if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
+          reason = 'quote asset treated as cash';
+        } else if (isLiveBinance && isUnsupportedLiveScanSymbol(pick.symbol)) {
+          reason = 'unsupported market';
+        }
+      }
+
+      if (reason) {
+        return [pick.symbol, {
+          label: 'BLOCKED',
+          detail: reason,
+          className: 'bg-rose-100 text-rose-700',
+        }];
+      }
+
+      return [pick.symbol, {
+        label: 'ELIGIBLE',
+        detail: `${pick.signal.overall} ready`,
+        className: 'bg-emerald-100 text-emerald-700',
+      }];
+    }));
+  }, [visibleSignalTablePicks, serverConfig?.exchange, isRealMode, liveQuoteAllowlist, fullUniverseMode, holdings, cooldowns, isUnsupportedLiveScanSymbol]);
 
   return (
     <div className="min-h-screen bg-[#E4E3E0] text-[#141414] p-4 md:p-8 font-sans selection:bg-[#F27D26] selection:text-white overflow-x-hidden">
@@ -3536,22 +3855,77 @@ export default function App() {
             <div className="mt-3 border border-gray-300 bg-gray-50/80 px-3 py-2 text-[10px] font-mono uppercase">
               <div className="flex items-center justify-between text-gray-800/80">
                 <span>Why Coins Were Rejected</span>
-                <span>{rejectReasonSummary.length > 0 ? `${rejectReasonSummary.length} dominant causes` : 'No rejection data yet'}</span>
+                <span>{rejectReasonGroups.length > 0 ? `${rejectReasonGroups.length} rejection reasons` : 'No rejection data yet'}</span>
               </div>
-              {rejectReasonSummary.length === 0 ? (
+              {rejectReasonGroups.length === 0 ? (
                 <p className="mt-2 text-[10px] normal-case tracking-normal text-gray-700/70">
                   No aggregated HOLD rejection reasons are available yet for this session.
                 </p>
               ) : (
-                <div className="mt-2 space-y-2">
-                  {rejectReasonSummary.map(({ reason, count }) => (
-                    <div key={`reject-reason-${reason}`} className="border border-gray-200 bg-white/70 px-2 py-2">
+                <div className="mt-2 space-y-3">
+                  <div className="overflow-x-auto border border-gray-200 bg-white/70">
+                    <table className="min-w-full border-collapse text-left text-[9px] uppercase">
+                      <thead className="bg-gray-100/80 text-gray-700">
+                        <tr>
+                          <th className="border-b border-gray-200 px-2 py-2">Reject Reason</th>
+                          <th className="border-b border-gray-200 px-2 py-2 text-right">Coins</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {rejectReasonGroups.map((group) => {
+                          const isSelected = group.reason === selectedRejectReason;
+                          return (
+                            <tr key={`reject-reason-row-${group.reason}`} className={isSelected ? 'bg-amber-50/80' : 'bg-white/40'}>
+                              <td className="border-b border-gray-200 px-2 py-2 text-[9px] normal-case tracking-normal text-gray-900">{group.reason}</td>
+                              <td className="border-b border-gray-200 px-2 py-2 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => setSelectedRejectReason(group.reason)}
+                                  className={`font-black ${isSelected ? 'text-[#C85E13]' : 'text-gray-700 hover:text-[#C85E13]'}`}
+                                >
+                                  {group.count}
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {selectedRejectReasonGroup ? (
+                    <div className="border border-amber-200 bg-amber-50/60 px-2 py-2">
                       <div className="flex items-center justify-between gap-2">
-                        <span className="text-[9px] normal-case tracking-normal text-gray-900">{reason}</span>
-                        <span className="font-black text-[11px] text-gray-700">{count}</span>
+                        <span className="text-[9px] text-amber-950">{selectedRejectReasonGroup.reason}</span>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedRejectReason(null)}
+                          className="text-[9px] font-black text-amber-800 hover:text-amber-950"
+                        >
+                          Close
+                        </button>
+                      </div>
+                      <p className="mt-1 text-[9px] normal-case tracking-normal text-amber-900/75">
+                        {selectedRejectReasonGroup.count} coins were rejected for this reason. Click another count in the table to switch groups.
+                      </p>
+                      <div className="mt-2 max-h-52 overflow-y-auto space-y-2">
+                        {selectedRejectReasonGroup.symbols.map((entry) => (
+                          <div key={`reject-symbol-${selectedRejectReasonGroup.reason}-${entry.symbol}`} className="border border-amber-200 bg-white/70 px-2 py-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-black text-[11px] text-amber-950">{entry.symbol}</span>
+                              <span className="text-[9px] text-amber-900/70">
+                                score {entry.score.toFixed(1)} | rank {entry.priorityRank.toFixed(2)} | MACD {entry.macdScore.toFixed(1)}
+                              </span>
+                            </div>
+                          </div>
+                        ))}
                       </div>
                     </div>
-                  ))}
+                  ) : (
+                    <p className="text-[10px] normal-case tracking-normal text-gray-700/70">
+                      Click a count in the table to see every coin rejected for that reason.
+                    </p>
+                  )}
                 </div>
               )}
             </div>
@@ -3661,18 +4035,24 @@ export default function App() {
               <p className="text-[9px] font-mono uppercase tracking-wide opacity-45 px-2">
                 Displaying strategy score and profitability rank side by side.
               </p>
-              <div className="grid grid-cols-5 items-center border-b pb-2 text-[10px] font-mono opacity-50 uppercase tracking-wide px-2">
+              <div className="grid grid-cols-6 items-center border-b pb-2 text-[10px] font-mono opacity-50 uppercase tracking-wide px-2">
                 <span>Asset</span>
                 <span className="text-center">Trend/RSI</span>
                 <span className="text-center">Score / Rank</span>
                 <span className="text-center">Signal</span>
+                <span className="text-center">Eligibility</span>
                 <span className="text-right">Action</span>
               </div>
               <div className="space-y-2 max-h-[520px] overflow-y-auto custom-scrollbar pr-2">
                 {visibleSignalTablePicks.map((pick) => {
                   const lifecycle = getMarketPickLifecycle(pick);
+                  const eligibility = rankedSignalStatuses[pick.symbol] || {
+                    label: 'UNKNOWN',
+                    detail: 'status unavailable',
+                    className: 'bg-gray-100 text-gray-600',
+                  };
                   return (
-                  <div key={pick.symbol} className="grid grid-cols-5 items-center group py-1.5 hover:bg-gray-50/50 px-2 border-b border-gray-50 transition-colors">
+                  <div key={pick.symbol} className="grid grid-cols-6 items-center group py-1.5 hover:bg-gray-50/50 px-2 border-b border-gray-50 transition-colors">
                     <button 
                       onClick={() => setSymbol(pick.symbol)}
                       className="flex flex-col items-start text-left text-[13px] font-black hover:text-[#F27D26] transition-colors"
@@ -3727,6 +4107,17 @@ export default function App() {
                             )}
                           </div>
                         )}
+                      </div>
+                    </div>
+
+                    <div className="flex justify-center px-2">
+                      <div className="flex max-w-[150px] flex-col items-center gap-1 text-center leading-tight">
+                        <span className={`rounded-sm px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wide ${eligibility.className}`}>
+                          {eligibility.label}
+                        </span>
+                        <span className="text-[8px] font-mono normal-case opacity-60">
+                          {eligibility.detail}
+                        </span>
                       </div>
                     </div>
 
@@ -4221,15 +4612,15 @@ export default function App() {
                 {currentHolding && (
                   <div className="grid grid-cols-2 gap-4">
                     <div className="bg-white/5 p-3 border border-white/10">
-                      <p className="text-[8px] uppercase font-bold opacity-40 mb-1">Stop Loss At</p>
+                      <p className="text-[8px] uppercase font-bold opacity-40 mb-1">Stop Loss Target</p>
                       <p className="text-sm font-black text-rose-400 tabular-nums">
-                        ${formatPrice(currentHolding.entryPrice * (1 - stopLossPercent / 100))}
+                        {currentHoldingUsesMarginTargets ? `${Math.abs(stopLossPercent).toFixed(2)}% margin P&L` : `$${formatPrice(stopLossPrice)}`}
                       </p>
                     </div>
                     <div className="bg-white/5 p-3 border border-white/10">
-                      <p className="text-[8px] uppercase font-bold opacity-40 mb-1">Take Profit At</p>
+                      <p className="text-[8px] uppercase font-bold opacity-40 mb-1">Take Profit Target</p>
                       <p className="text-sm font-black text-emerald-400 tabular-nums">
-                        ${formatPrice(currentHolding.entryPrice * (1 + takeProfitPercent / 100))}
+                        {currentHoldingUsesMarginTargets ? `${Math.abs(takeProfitPercent).toFixed(2)}% margin P&L` : `$${formatPrice(takeProfitPrice)}`}
                       </p>
                     </div>
                   </div>
@@ -4419,6 +4810,26 @@ export default function App() {
                 </button>
                </div>
               </div>
+            {exchangeSyncDiagnostic && (
+              <div className={`border-b px-3 py-2 text-[10px] font-mono uppercase ${
+                exchangeSyncDiagnostic.tone === 'emerald'
+                  ? 'bg-emerald-50/70 border-emerald-200 text-emerald-900'
+                  : exchangeSyncDiagnostic.tone === 'amber'
+                    ? 'bg-amber-50/70 border-amber-200 text-amber-900'
+                    : exchangeSyncDiagnostic.tone === 'sky'
+                      ? 'bg-sky-50/70 border-sky-200 text-sky-900'
+                      : 'bg-gray-50/80 border-gray-200 text-gray-800'
+              }`}>
+                <div className="flex items-center justify-between gap-3">
+                  <span>Last Exchange Sync For {exchangeSyncDiagnostic.symbol}</span>
+                  <span>{new Date(exchangeSyncDiagnostic.updatedAt).toLocaleTimeString()}</span>
+                </div>
+                <div className="mt-1 flex items-center justify-between gap-3 text-[9px] normal-case tracking-normal">
+                  <span>{exchangeSyncDiagnostic.detail}</span>
+                  <span className="font-black uppercase tracking-wide">{exchangeSyncDiagnostic.label}</span>
+                </div>
+              </div>
+            )}
             
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
@@ -4561,8 +4972,12 @@ export default function App() {
                                     <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-sm ${
                                       (trade.status || 'FILLED') === 'FILLED'
                                         ? 'bg-emerald-100 text-emerald-700'
+                                        : (trade.status || 'FILLED') === 'SYNC_REMOVED'
+                                          ? 'bg-emerald-200 text-emerald-800'
                                         : (trade.status || 'FILLED') === 'SUBMITTED'
                                           ? 'bg-sky-100 text-sky-700'
+                                          : (trade.status || 'FILLED') === 'UNCONFIRMED'
+                                            ? 'bg-amber-100 text-amber-800'
                                           : (trade.status || 'FILLED') === 'SKIPPED'
                                             ? 'bg-amber-100 text-amber-700'
                                             : 'bg-rose-100 text-rose-700'
