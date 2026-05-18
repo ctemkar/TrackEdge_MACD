@@ -29,7 +29,7 @@ const CRITERIA_HELP: Record<string, string> = {
   paperLossCooldownMinutes: 'Cooldown after a paper-trading loss. Reduces repeated losses from rapid re-entry in bad conditions.',
   duplicateOrderLockoutSec: 'Minimum seconds before allowing a repeated order on the same side/symbol. Prevents accidental duplicate submissions.',
   liveEntryDelayMs: 'Delay between sequential live entry submissions. Reduces burst orders and margin/permission race failures.',
-  liveEntriesPerCycle: 'Maximum number of new live entries allowed per scan cycle. Higher values trade faster but can increase margin/race-condition risk.',
+  liveEntriesPerCycle: 'Legacy setting retained for compatibility. Live scans now execute all eligible entries sequentially up to available slots, so signals are not deferred by a per-cycle cap.',
   minPaperAllocation: 'Minimum paper capital allocated per trade. Prevents unrealistically tiny paper positions in simulation mode.',
   lowMarginLockMinutes: 'Lock duration when free margin is too low. Temporarily pauses entries to avoid repeated margin rejects.',
   closeFailureLockMinutes: 'Lock duration after close-order failures. Prevents repeated close retries from spiraling into API churn.',
@@ -1723,6 +1723,13 @@ export default function App() {
     const runnerAmount = Math.max(initialAmount * 0.2, 0);
     const tp1Completed = holding.amount <= (initialAmount * 0.55);
     const runnerStage = holding.amount <= (runnerAmount * 1.05);
+    const contracts = Number(holding.contracts || holding.amount || 0);
+    const notional = Number(holding.notional || (contracts * holding.entryPrice) || 0);
+    const margin = Number(holding.initialMargin || (notional > 0 ? notional / 5 : 0) || 0);
+    const currentUnrealizedPnl = (holding.side === 'SHORT'
+      ? (holding.entryPrice - price)
+      : (price - holding.entryPrice)) * contracts;
+    const currentMarginPnlPct = margin > 0 ? (currentUnrealizedPnl / margin) * 100 : 0;
     const histogramExpanding = holding.side === 'LONG'
       ? signal?.confluence.macdHistogram === 'BULLISH_ACCELERATION'
       : signal?.confluence.macdHistogram === 'BEARISH_ACCELERATION';
@@ -1752,7 +1759,9 @@ export default function App() {
         : existing;
     }));
 
-    const technicalInvalidation = holding.side === 'LONG' ? price <= stopPrice : price >= stopPrice;
+    const technicalInvalidation = margin > 0
+      ? currentMarginPnlPct <= -Math.abs(stopLossPercent)
+      : (holding.side === 'LONG' ? price <= stopPrice : price >= stopPrice);
     const hitTp1 = holding.side === 'LONG' ? price >= tp1Price : price <= tp1Price;
     const hitTp2 = holding.side === 'LONG' ? price >= tp2Price : price <= tp2Price;
     const trailingStopPrice = holding.trailingStopPrice || stopPrice;
@@ -1760,7 +1769,18 @@ export default function App() {
     const weaknessConfirmed = runnerStage && momentumWeakening && (holding.side === 'LONG' ? price < trailingStopPrice : price > trailingStopPrice);
 
     if (technicalInvalidation) {
-      executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: TECHNICAL INVALIDATION', holding.id, cycleId, undefined, holding.amount);
+      executeTrade(
+        closeSide,
+        holding.symbol,
+        price,
+        margin > 0
+          ? `AUTO_EXIT: MARGIN STOP ${currentMarginPnlPct.toFixed(2)}% <= -${Math.abs(stopLossPercent).toFixed(2)}%`
+          : 'AUTO_EXIT: TECHNICAL INVALIDATION',
+        holding.id,
+        cycleId,
+        undefined,
+        holding.amount,
+      );
       return;
     }
 
@@ -1915,10 +1935,13 @@ export default function App() {
   const [scanProgress, setScanProgress] = useState({ current: 0, total: 0 });
   const [scanSignalSummary, setScanSignalSummary] = useState({
     analyzed: 0,
+    shortlisted: 0,
     total: 0,
     buy: 0,
     sell: 0,
     hold: 0,
+    notShortlisted: 0,
+    unavailable: 0,
     updatedAt: 0,
   });
   const [scanBlockedSummary, setScanBlockedSummary] = useState<{
@@ -2398,9 +2421,8 @@ export default function App() {
       const baseSymbol = isRealMode ? liveNormalized(symbol) : symbol;
       const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
       const isLiveTradableFuturesSymbol = (value: string) => liveTradableSymbols.has(normalizeLiveFuturesSymbol(value));
-      const scanQuoteFilterAllows = (value: string) => fullUniverseMode || hasAllowedQuote(value);
       let symbolsToScan = isLiveBinance
-        ? Array.from(new Set(candidateValues)).filter(value => isLikelyBinanceSymbol(value) && scanQuoteFilterAllows(value) && hasTradableBase(value))
+        ? Array.from(new Set(candidateValues)).filter(value => isLikelyBinanceSymbol(value) && hasTradableBase(value))
         : Array.from(new Set([baseSymbol, ...candidateValues]));
 
       if (symbolsToScan.length === 0) {
@@ -2415,10 +2437,7 @@ export default function App() {
         baseSymbol,
         ...holdingsRef.current.map(h => h.symbol),
       ].filter(Boolean)));
-      const shortlistLimit = Math.min(
-        totalToScan,
-        Math.max(prioritySymbols.length, Math.max(40, Math.min(SCAN_SHORTLIST_SAFE_CAP, maxSymbolsPerScan))),
-      );
+      const shortlistLimit = totalToScan;
       
       let lastLoggedCount = 0;
       const results = await scanMarket(
@@ -2459,10 +2478,13 @@ export default function App() {
       }, { BUY: 0, SELL: 0, HOLD: 0 } as Record<'BUY' | 'SELL' | 'HOLD', number>);
       setScanSignalSummary({
         analyzed: results.length,
+        shortlisted: shortlistLimit,
         total: symbolsToScan.length,
         buy: signalCounts.BUY,
         sell: signalCounts.SELL,
         hold: signalCounts.HOLD,
+        notShortlisted: Math.max(0, symbolsToScan.length - shortlistLimit),
+        unavailable: Math.max(0, shortlistLimit - results.length),
         updatedAt: Date.now(),
       });
       const scanSummary = `SCAN SUMMARY: ${results.length}/${symbolsToScan.length} analyzed | BUY=${signalCounts.BUY} SELL=${signalCounts.SELL} HOLD=${signalCounts.HOLD}`;
@@ -2487,6 +2509,9 @@ export default function App() {
       const getEntryBlockReason = ({ pick }: { side: 'BUY' | 'SELL'; pick: MarketScanResult }) => {
         if (isLiveBinance && !isLikelyBinanceFuturesSymbol(pick.symbol)) {
           return 'invalid futures symbol format';
+        }
+        if (isLiveBinance && !fullUniverseMode && !hasAllowedQuote(pick.symbol)) {
+          return `outside focused quote universe [${liveQuoteAllowlist.join(', ')}]`;
         }
         if (isLiveBinance && !isLiveTradableFuturesSymbol(pick.symbol)) {
           return 'not in Binance futures tradable set';
@@ -2580,32 +2605,22 @@ export default function App() {
             return;
           }
           const toTrade = entries.slice(0, availableSlots);
+          const selectedCount = toTrade.length;
+          const deferredCount = 0;
+          const coverageSummary = `coverage=${results.length}/${shortlistLimit}/${symbolsToScan.length}`;
+          addLog(
+            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} ${coverageSummary}`,
+            selectedCount > 0 ? 'success' : 'info',
+          );
           
           if (toTrade.length > 0) {
             // Live mode safety: execute entries sequentially to avoid burst margin failures.
-            const maxEntriesThisCycle = isRealMode ? Math.max(1, liveEntriesPerCycle) : availableSlots;
-            const selectedTrades = toTrade.slice(0, maxEntriesThisCycle);
-            const deferredTrades = toTrade.slice(selectedTrades.length);
+            const selectedTrades = toTrade;
             setScanDeferredSummary({
               updatedAt: scanNow,
-              deferredSignals: deferredTrades.length,
-              topDeferred: deferredTrades.slice(0, 6).map(({ side, pick }) => ({
-                symbol: pick.symbol,
-                side,
-                score: pick.signal.score,
-                priorityRank: pick.priorityRank || 0,
-              })),
+              deferredSignals: 0,
+              topDeferred: [],
             });
-            if (isRealMode && toTrade.length > selectedTrades.length) {
-              const deferred = toTrade
-                .slice(selectedTrades.length, selectedTrades.length + 6)
-                .map(t => `${t.pick.symbol}(${t.pick.signal.score}/10)`)
-                .join(', ');
-              pushScanSkipEvent(
-                `SKIP: ${toTrade.length - selectedTrades.length} additional entries deferred this cycle (live throttle ${selectedTrades.length}/${toTrade.length}). Deferred: ${deferred}`,
-                cycleId,
-              );
-            }
             for (const { side, pick } of selectedTrades) {
               if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
                 pushScanSkipEvent(`SKIP: ${pick.symbol} blocked because quote assets are treated as cash, not tradable base positions`, cycleId);
@@ -2886,7 +2901,14 @@ export default function App() {
   const scanSourceHint = `Scan Source: ${scanDataSource}`;
   const scanUniverseHint = fullUniverseMode
     ? `Full Universe Mode: scanning all Binance futures quotes; live entries remain restricted to ${liveQuoteAllowlist.join(', ')}.`
-    : `Focused quote universe: ${liveQuoteAllowlist.join(', ')}.`;
+    : `Focused quote universe: scanning all discovered symbols, but live entries remain restricted to ${liveQuoteAllowlist.join(', ')}.`;
+  const scanCoverageHint = scanSignalSummary.updatedAt === 0
+    ? 'Coverage: no completed scan yet.'
+    : scanSignalSummary.notShortlisted > 0
+      ? `Coverage: analyzed ${scanSignalSummary.analyzed}/${scanSignalSummary.shortlisted} shortlisted assets from ${scanSignalSummary.total} in universe; ${scanSignalSummary.notShortlisted} were not analyzed this cycle.`
+      : scanSignalSummary.unavailable > 0
+        ? `Coverage: analyzed ${scanSignalSummary.analyzed}/${scanSignalSummary.shortlisted} shortlisted assets; ${scanSignalSummary.unavailable} returned no usable scan result.`
+        : `Coverage: analyzed ${scanSignalSummary.analyzed}/${scanSignalSummary.total} assets this cycle.`;
   const filteredSyncSymbolsPreview = filteredSyncSymbols.slice(0, 3).map((entry: { symbol: string; reason: string }) => entry.symbol).join(', ');
   const filteredSyncNote = filteredSyncSymbols.length > 0
     ? `Exchange sync filtered ${filteredSyncSymbols.length} non-tradable raw symbol${filteredSyncSymbols.length === 1 ? '' : 's'}${filteredSyncSymbolsPreview ? `: ${filteredSyncSymbolsPreview}${filteredSyncSymbols.length > 3 ? ', ...' : ''}.` : '.'} USDT remains available as cash in Cash / Available Funds and is not shown as an active position.`
@@ -3439,6 +3461,7 @@ export default function App() {
             <p className="mt-2 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanStatusHint}</p>
             <p className="mt-1 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanSourceHint}</p>
             <p className="mt-1 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanUniverseHint}</p>
+            <p className="mt-1 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanCoverageHint}</p>
             {filteredSyncNote && (
               <div className="mt-2 border border-amber-200 bg-amber-50/80 px-3 py-2 text-[10px] font-mono text-amber-900">
                 {filteredSyncNote}

@@ -1,4 +1,5 @@
 import { fetchBinanceData, fetchTicker24hStats } from './binance';
+import { Candle } from './indicators';
 import { calculateIndicators, evaluateStrategy, StrategyConfig, StrategySignal } from './indicators';
 
 export interface MarketScanResult {
@@ -20,6 +21,10 @@ type ScanMarketOptions = {
   prioritySymbols?: string[];
   onRateLimit?: (retryAt: number) => void;
 };
+
+const MIN_SCAN_CANDLE_COUNT = 51;
+const MAX_SCAN_FETCH_ATTEMPTS = 3;
+const SCAN_FETCH_RETRY_DELAY_MS = 180;
 
 function getDirectionalSignalStrength(signal: StrategySignal): number {
   if (signal.overall === 'SELL') return 10 - signal.score;
@@ -48,6 +53,36 @@ function computeProfitabilityRank(result: MarketScanResult): number {
   const spikePenalty = moveMagnitude > 18 ? Math.min(6, (moveMagnitude - 18) / 2) : 0;
 
   return macdComponent + histogramComponent + volumeComponent + trendComponent + momentumComponent - spikePenalty;
+}
+
+async function fetchScanCandlesWithRetry(symbol: string): Promise<Candle[]> {
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= MAX_SCAN_FETCH_ATTEMPTS; attempt++) {
+    try {
+      const candles = await fetchBinanceData(symbol, '1d', 500, { forceBinancePublic: true });
+      if (candles.length >= MIN_SCAN_CANDLE_COUNT) {
+        return candles;
+      }
+
+      lastError = new Error(`INSUFFICIENT_CANDLES:${candles.length}`);
+    } catch (error) {
+      if ((error as any)?.message === 'RATE_LIMITED') {
+        throw error;
+      }
+      lastError = error;
+    }
+
+    if (attempt < MAX_SCAN_FETCH_ATTEMPTS) {
+      await new Promise(resolve => setTimeout(resolve, SCAN_FETCH_RETRY_DELAY_MS * attempt));
+    }
+  }
+
+  if (lastError) {
+    console.warn(`[TradeEdge] Scanner exhausted fetch retries for ${symbol}:`, lastError);
+  }
+
+  return [];
 }
 
 export async function scanMarket(
@@ -89,8 +124,8 @@ export async function scanMarket(
     const batchPromises = batch.map(async (symbol): Promise<MarketScanResult | null> => {
       if (!canContinue()) return null;
       try {
-        const candles = await fetchBinanceData(symbol, '1d', 500, { forceBinancePublic: true });
-        if (candles.length > 50) {
+        const candles = await fetchScanCandlesWithRetry(symbol);
+        if (candles.length >= MIN_SCAN_CANDLE_COUNT) {
           // Use closed daily candles for stable crossover signals.
           const signalCandles = candles.length > 2 ? candles.slice(0, -1) : candles;
           const indicators = calculateIndicators(signalCandles, strategyConfig);
