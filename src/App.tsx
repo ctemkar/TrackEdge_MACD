@@ -2,7 +2,7 @@ import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { TrendingUp, Activity, ShieldAlert, ShieldCheck, Info, Wallet, DollarSign, ArrowUpRight, ArrowDownRight, Search, Zap, Loader2, History, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { fetchBinanceData, subscribeToTicker, fetchAllSymbols, fetchTopSymbolsByVolume } from './services/binance';
+import { fetchBinanceData, subscribeToTicker, fetchAllSymbols, fetchTopSymbolsByVolume, getPublicDataSourceSnapshot } from './services/binance';
 import { calculateIndicators, evaluateStrategy, Candle, DEFAULT_STRATEGY_CONFIG, IndicatorResult, StrategyConfig, StrategySignal } from './services/indicators';
 import { scanMarket, MarketScanResult } from './services/scanner';
 import { BacktestModule } from './components/BacktestModule';
@@ -1868,6 +1868,7 @@ export default function App() {
     updatedAt: 0,
   });
   const [filteredSyncSymbols, setFilteredSyncSymbols] = useState<Array<{ symbol: string; reason: string }>>([]);
+  const [scanDataSource, setScanDataSource] = useState('BINANCE PUBLIC');
 
   const formatPrice = (price: number) => {
     if (price === 0) return '0.00';
@@ -1875,6 +1876,21 @@ export default function App() {
     if (price < 1) return price.toFixed(6);
     return price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 });
   };
+
+  const formatScanSourceLabel = React.useCallback(() => {
+    const snapshot = getPublicDataSourceSnapshot();
+    const uniqueSources = Array.from(new Set([
+      snapshot.exchangeInfo,
+      snapshot.ticker24hr,
+      snapshot.klines,
+    ].filter(Boolean)));
+
+    if (uniqueSources.length === 0) return 'BINANCE PUBLIC';
+
+    return uniqueSources
+      .map(source => source.replace(/_/g, ' '))
+      .join(' | ');
+  }, []);
 
   const updateStrategyConfig = React.useCallback((partial: Partial<StrategyConfig>) => {
     setStrategyConfig(prev => ({ ...prev, ...partial }));
@@ -2265,6 +2281,7 @@ export default function App() {
         ]);
         allSymbols = universeSymbols;
         liveTradableSymbols = new Set(futuresOnlySymbols.map(s => normalizeLiveFuturesSymbol(s.value)));
+        setScanDataSource(formatScanSourceLabel());
         if (liveTradableSymbols.size > 0) {
           liveTradableSymbolsRef.current = liveTradableSymbols;
           liveTradableSymbolsFetchedAtRef.current = Date.now();
@@ -2344,6 +2361,7 @@ export default function App() {
         strategyConfig,
         { shortlistLimit, prioritySymbols },
       );
+      setScanDataSource(formatScanSourceLabel());
 
       if ((!manual && !autoTradeRef.current) || rateLimitedUntilRef.current > Date.now()) {
         setScanProgress({ current: 0, total: 0 });
@@ -2510,6 +2528,7 @@ export default function App() {
           allowedQuotes: liveQuoteAllowlist,
           forceBinancePublic: true,
         });
+        setScanDataSource(formatScanSourceLabel());
         setAvailableSymbols(all);
         addLog(`Market Metadata: ${all.length} exchange vectors mapped.`, 'info');
       } catch (err: any) {
@@ -2715,6 +2734,7 @@ export default function App() {
     if (scanSignalSummary.updatedAt === 0) return 'No completed scan cycle yet in this session.';
     return `Last completed scan at ${new Date(scanSignalSummary.updatedAt).toLocaleTimeString()}.`;
   })();
+  const scanSourceHint = `Scan Source: ${scanDataSource}`;
   const filteredSyncSymbolsPreview = filteredSyncSymbols.slice(0, 3).map((entry: { symbol: string; reason: string }) => entry.symbol).join(', ');
   const filteredSyncNote = filteredSyncSymbols.length > 0
     ? `Exchange sync filtered ${filteredSyncSymbols.length} non-tradable raw symbol${filteredSyncSymbols.length === 1 ? '' : 's'}${filteredSyncSymbolsPreview ? `: ${filteredSyncSymbolsPreview}${filteredSyncSymbols.length > 3 ? ', ...' : ''}.` : '.'} USDT remains available as cash in Cash / Available Funds and is not shown as an active position.`
@@ -3245,6 +3265,7 @@ export default function App() {
             </div>
 
             <p className="mt-2 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanStatusHint}</p>
+            <p className="mt-1 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanSourceHint}</p>
             {filteredSyncNote && (
               <div className="mt-2 border border-amber-200 bg-amber-50/80 px-3 py-2 text-[10px] font-mono text-amber-900">
                 {filteredSyncNote}
@@ -4000,7 +4021,7 @@ export default function App() {
               label="Network Status"
               value={isSyncing ? "SYNCING..." : (isRealMode ? "LIVE" : "PAPER")}
               subValue={serverConfig?.exchange
-                ? `${serverConfig.exchange.toUpperCase()} | ${holdings.length}/${maxConcurrentTrades} SLOTS${entryLockActive ? ' | ENTRY LOCK' : ''}`
+                ? `${serverConfig.exchange.toUpperCase()} | ${holdings.length}/${maxConcurrentTrades} SLOTS${entryLockActive ? ' | ENTRY LOCK' : ''} | ${scanDataSource}`
                 : "SIMULATION"}
             />
             <MetricBox 

@@ -71,6 +71,11 @@ async function startServer() {
     else console.log(message);
   };
 
+  const setPublicSourceHeaders = (res: express.Response, source: string, cached = false) => {
+    res.setHeader('X-TradeEdge-Source', source);
+    res.setHeader('X-TradeEdge-Cached', cached ? '1' : '0');
+  };
+
   const getCompactUsdSymbolParts = (raw: string): { compact: string; base: string; quote: string } | null => {
     const compact = String(raw || '').toUpperCase().split(':')[0].replace('/', '');
     const match = compact.match(/^([A-Z0-9]+?)(USDT|USDC|USD)$/);
@@ -1771,7 +1776,11 @@ async function startServer() {
           const blockedUntilPublic = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
           if (blockedUntilPublic > nowPublic) {
             const bybitFallback = await fetchBybitKlines(String(symbol), String(interval || '1d'), Number(limit) || 500);
-            if (bybitFallback) return res.json(bybitFallback);
+            if (bybitFallback) {
+              setPublicSourceHeaders(res, 'BYBIT_PUBLIC_FALLBACK');
+              return res.json(bybitFallback);
+            }
+            setPublicSourceHeaders(res, 'BINANCE_PUBLIC_BLOCKED');
             return res.json([]);
           }
 
@@ -1782,7 +1791,10 @@ async function startServer() {
 
           for (const binanceUrl of endpoints) {
             const response = await fetch(binanceUrl);
-            if (response.ok) return res.json(await response.json());
+            if (response.ok) {
+              setPublicSourceHeaders(res, 'BINANCE_PUBLIC');
+              return res.json(await response.json());
+            }
             if (response.status === 418 || response.status === 429) {
               const body: any = await response.json().catch(() => ({}));
               const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
@@ -1796,9 +1808,11 @@ async function startServer() {
           const bybitFallback = await fetchBybitKlines(String(symbol), String(interval || '1d'), Number(limit) || 500);
           if (bybitFallback) {
             logWithThrottle('warn', `public-klines-fallback-${String(symbol).toUpperCase()}`, `[TradeEdge] klines: Binance public unavailable for ${symbol}, using Bybit public fallback`, 60000);
+            setPublicSourceHeaders(res, 'BYBIT_PUBLIC_FALLBACK');
             return res.json(bybitFallback);
           }
 
+          setPublicSourceHeaders(res, 'BINANCE_PUBLIC_FAILED');
           return res.json([]);
         }
 
@@ -1871,6 +1885,7 @@ async function startServer() {
         if (forceBinancePublic && blockedUntil > now) {
           if (cachedExchangeInfo?.symbols?.length) {
             logWithThrottle('warn', `exchangeInfo-cache-${cacheKey}`, `[TradeEdge] exchangeInfo: Binance public blocked, serving cached metadata (${cachedExchangeInfo.symbols.length} symbols)`, 60000);
+            setPublicSourceHeaders(res, 'BINANCE_PUBLIC', true);
             return res.json({ symbols: cachedExchangeInfo.symbols, cached: true, source: 'binance_public_cache' });
           }
           return res.status(429).json({ status: 'rate_limited', symbols: [], bannedUntil: blockedUntil });
@@ -1894,6 +1909,7 @@ async function startServer() {
             const newBlockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
             if (cachedExchangeInfo?.symbols?.length) {
               logWithThrottle('warn', `exchangeInfo-cache-${cacheKey}`, `[TradeEdge] exchangeInfo: Binance public rate limited, serving cached metadata (${cachedExchangeInfo.symbols.length} symbols)`, 60000);
+              setPublicSourceHeaders(res, 'BINANCE_PUBLIC', true);
               res.json({ symbols: cachedExchangeInfo.symbols, cached: true, source: 'binance_public_cache' });
               return;
             }
@@ -1930,6 +1946,9 @@ async function startServer() {
         const symbols = Array.from(deduped.values());
         if (forceBinancePublic && symbols.length > 0) {
           publicExchangeInfoCache.set(cacheKey, { symbols, updatedAt: Date.now() });
+          setPublicSourceHeaders(res, 'BINANCE_PUBLIC');
+        } else if (bybitSymbolsPrimary.length > 0) {
+          setPublicSourceHeaders(res, 'BYBIT_PUBLIC_FALLBACK');
         }
         return res.json({ symbols });
       }
@@ -1959,10 +1978,14 @@ async function startServer() {
           if (blockedUntil > Date.now()) {
             if (publicTicker24hCache?.rows?.length) {
               logWithThrottle('warn', 'ticker24hr-cache', `[TradeEdge] ticker24hr: Binance public blocked, serving cached 24h stats (${publicTicker24hCache.rows.length} rows)`, 60000);
+              setPublicSourceHeaders(res, 'BINANCE_PUBLIC', true);
               return res.json(publicTicker24hCache.rows);
             }
             const bybitTickers = await fetchBybitTickers();
-            if (bybitTickers.length > 0) return res.json(bybitTickers);
+            if (bybitTickers.length > 0) {
+              setPublicSourceHeaders(res, 'BYBIT_PUBLIC_FALLBACK');
+              return res.json(bybitTickers);
+            }
           }
           const url = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
           const response = await fetch(url);
@@ -1971,25 +1994,36 @@ async function startServer() {
             if (Array.isArray(rows) && rows.length > 0) {
               publicTicker24hCache = { rows, updatedAt: Date.now() };
             }
+            setPublicSourceHeaders(res, 'BINANCE_PUBLIC');
             return res.json(rows);
           }
           const bybitTickers = await fetchBybitTickers();
           if (bybitTickers.length > 0) {
             logWithThrottle('warn', 'ticker24hr-bybit-fallback', '[TradeEdge] ticker24hr: Binance public unavailable, using Bybit public fallback', 60000);
+            setPublicSourceHeaders(res, 'BYBIT_PUBLIC_FALLBACK');
             return res.json(bybitTickers);
           }
-          if (publicTicker24hCache?.rows?.length) return res.json(publicTicker24hCache.rows);
+          if (publicTicker24hCache?.rows?.length) {
+            setPublicSourceHeaders(res, 'BINANCE_PUBLIC', true);
+            return res.json(publicTicker24hCache.rows);
+          }
           throw new Error('Binance public ticker failed');
         }
 
         // Try Bybit first (primary ticker source)
         const bybitTickers = await fetchBybitTickers();
-        if (bybitTickers.length > 0) return res.json(bybitTickers);
+        if (bybitTickers.length > 0) {
+          setPublicSourceHeaders(res, 'BYBIT_PUBLIC_FALLBACK');
+          return res.json(bybitTickers);
+        }
         // Bybit failed — fall back to Binance
         console.log('[TradeEdge] ticker24hr: Bybit returned no data, falling back to Binance');
         const url = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
         const response = await fetch(url);
-        if (response.ok) return res.json(await response.json());
+        if (response.ok) {
+          setPublicSourceHeaders(res, 'BINANCE_PUBLIC');
+          return res.json(await response.json());
+        }
         throw new Error('Both Bybit and Binance ticker failed');
       }
     } catch (error: any) {

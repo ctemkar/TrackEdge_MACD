@@ -1,5 +1,26 @@
 import { Candle } from './indicators';
 
+type PublicDataSourceKind = 'exchangeInfo' | 'ticker24hr' | 'klines';
+
+type PublicDataSourceSnapshot = Record<PublicDataSourceKind, string>;
+
+const publicDataSourceSnapshot: PublicDataSourceSnapshot = {
+  exchangeInfo: 'BINANCE_PUBLIC',
+  ticker24hr: 'BINANCE_PUBLIC',
+  klines: 'BINANCE_PUBLIC',
+};
+
+const rememberPublicDataSource = (kind: PublicDataSourceKind, response: Response) => {
+  const source = response.headers.get('x-tradeedge-source');
+  const cached = response.headers.get('x-tradeedge-cached') === '1';
+  if (!source) return;
+  publicDataSourceSnapshot[kind] = cached ? `${source}_CACHE` : source;
+};
+
+export function getPublicDataSourceSnapshot(): PublicDataSourceSnapshot {
+  return { ...publicDataSourceSnapshot };
+}
+
 type FetchKlinesOptions = {
   forceBinancePublic?: boolean;
 };
@@ -19,6 +40,7 @@ export async function fetchBinanceData(
     const forceBinancePublic = options?.forceBinancePublic !== false;
     const sourceQuery = forceBinancePublic ? '&source=binance_public' : '';
     const response = await fetch(`/api/binance/proxy/klines?symbol=${targetSymbol}&interval=${interval}&limit=${limit}${sourceQuery}`);
+    rememberPublicDataSource('klines', response);
     const data = await response.json();
     if (!Array.isArray(data)) {
       return [];
@@ -59,6 +81,7 @@ export async function fetchAllSymbols(options?: FetchAllSymbolsOptions): Promise
     const forceBinancePublic = options?.forceBinancePublic !== false;
     const sourceQuery = forceBinancePublic ? '&source=binance_public' : '';
     const response = await fetch(`/api/binance/proxy/exchangeInfo?includeSpot=${includeSpot ? '1' : '0'}&includeFutures=${includeFutures ? '1' : '0'}${sourceQuery}`);
+    rememberPublicDataSource('exchangeInfo', response);
     const data = await response.json();
 
     // Rate limited — attach retry time so callers can surface it
@@ -109,6 +132,7 @@ export async function fetchTopSymbolsByVolume(limit: number = 20, options?: { fo
     const forceBinancePublic = options?.forceBinancePublic !== false;
     const sourceQuery = forceBinancePublic ? '?source=binance_public' : '';
     const response = await fetch(`/api/binance/proxy/ticker24hr${sourceQuery}`);
+    rememberPublicDataSource('ticker24hr', response);
     const data = await response.json();
     return data
       .filter((s: any) => ['USDT', 'USDC'].some(q => String(s?.symbol || '').toUpperCase().endsWith(q)))
@@ -126,6 +150,7 @@ export async function fetchTicker24hStats(options?: { forceBinancePublic?: boole
     const forceBinancePublic = options?.forceBinancePublic !== false;
     const sourceQuery = forceBinancePublic ? '?source=binance_public' : '';
     const response = await fetch(`/api/binance/proxy/ticker24hr${sourceQuery}`);
+    rememberPublicDataSource('ticker24hr', response);
     const data = await response.json();
     if (!Array.isArray(data)) return new Map();
 
