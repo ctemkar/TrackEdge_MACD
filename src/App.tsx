@@ -90,6 +90,12 @@ const isNonTradableQuoteBaseSymbol = (raw: string) => {
   return /(?:USDT|USDC|USD){2,}$/.test(parts.compact) || NON_TRADABLE_QUOTE_BASES.has(parts.base);
 };
 
+const normalizeLiveFuturesSymbol = (raw: string) => {
+  const normalized = String(raw || '').toUpperCase().replace(/[/:]/g, '');
+  if (!normalized) return normalized;
+  return normalized.endsWith('USD') && !normalized.endsWith('USDT') ? `${normalized}T` : normalized;
+};
+
 const describeMacdHistogram = (state?: string) => {
   switch (state) {
     case 'BULLISH_ACCELERATION':
@@ -485,6 +491,8 @@ export default function App() {
   const knownUnsupportedLiveSymbols = React.useMemo(() => new Set(['NMRUSDC', 'KGSTUSDT']), []);
   const unsupportedScanSymbolsRef = React.useRef<Record<string, number>>({});
   const UNSUPPORTED_SCAN_SYMBOLS_KEY = 'te_unsupported_scan_symbols';
+  const liveTradableSymbolsRef = React.useRef<Set<string>>(new Set());
+  const liveTradableSymbolsFetchedAtRef = React.useRef(0);
   const currentScanCycleRef = React.useRef(0);
   const entryLockUntilRef = React.useRef(0);
   const lastScanSkipLogRef = React.useRef<Record<string, number>>({});
@@ -965,10 +973,49 @@ export default function App() {
       ? holdings.some(h => h.id === targetId)
       : holdings.some(h => h.symbol === tradeSymbol);
     const isRealShortEntry = isRealMode && type === 'SELL' && !targetId && !isHeld;
+    const requiresLiveFuturesValidation = isRealMode;
     if (type === 'SELL' && !isHeld && !isRealShortEntry) {
       setExecutionFeedback({ type: 'warning', message: `SELL skipped for ${tradeSymbol}: no open position to close.` });
       pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: No open position to close', status: 'SKIPPED', cycleId: eventCycleId });
       return;
+    }
+
+    if (requiresLiveFuturesValidation && (type === 'BUY' || isRealShortEntry)) {
+      let tradableSymbols = liveTradableSymbolsRef.current;
+      const normalizedTradeSymbolKey = normalizeLiveFuturesSymbol(tradeSymbol);
+      const shouldRefreshTradableSymbols = tradableSymbols.size === 0 || !tradableSymbols.has(normalizedTradeSymbolKey);
+      if (shouldRefreshTradableSymbols) {
+        try {
+          const refreshedSymbols = await fetchAllSymbols({
+            includeSpot: false,
+            includeFutures: true,
+            fullUniverse: true,
+            allowedQuotes: liveQuoteAllowlist,
+            forceBinancePublic: true,
+          });
+          const refreshedTradableSymbols = new Set(refreshedSymbols.map(s => normalizeLiveFuturesSymbol(s.value)));
+          if (refreshedTradableSymbols.size > 0) {
+            liveTradableSymbolsRef.current = refreshedTradableSymbols;
+            liveTradableSymbolsFetchedAtRef.current = Date.now();
+            tradableSymbols = refreshedTradableSymbols;
+          }
+        } catch (refreshError) {
+          console.warn('[TradeEdge] Failed to refresh Binance futures tradable symbol cache before order submit', refreshError);
+        }
+      }
+      if (tradableSymbols.size === 0) {
+        addLog('TRADE SKIPPED: Binance futures tradable symbol cache unavailable. Blocking new live entry for safety.', 'warning');
+        setExecutionFeedback({ type: 'warning', message: `${type} blocked: futures tradable symbol cache unavailable.` });
+        pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: 'SKIP: Futures tradable symbol cache unavailable', status: 'SKIPPED', cycleId: eventCycleId });
+        return;
+      }
+      if (!tradableSymbols.has(normalizedTradeSymbolKey)) {
+        addLog(`TRADE SKIPPED: ${tradeSymbol} is not present in Binance futures tradable symbols.`, 'warning');
+        setExecutionFeedback({ type: 'warning', message: `${type} blocked: ${tradeSymbol} is not tradable on Binance futures.` });
+        pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: 'SKIP: Not in Binance futures tradable symbols', status: 'SKIPPED', cycleId: eventCycleId });
+        blockUnsupportedScanSymbol(tradeSymbol);
+        return;
+      }
     }
 
     // Reject malformed symbols and quote-asset crosses like USDCUSDT.
@@ -2044,7 +2091,7 @@ export default function App() {
     try {
       setScanProgress({ current: 0, total: 0 });
       let allSymbols: { label: string; value: string }[];
-      let liveTradableSymbols = new Set<string>();
+      let liveTradableSymbols = new Set<string>(liveTradableSymbolsRef.current);
       try {
         const [universeSymbols, futuresOnlySymbols] = await Promise.all([
           fetchAllSymbols({
@@ -2063,12 +2110,11 @@ export default function App() {
           }),
         ]);
         allSymbols = universeSymbols;
-        liveTradableSymbols = new Set(
-          futuresOnlySymbols.map(s => {
-            const normalized = String(s.value || '').toUpperCase();
-            return normalized.endsWith('USD') && !normalized.endsWith('USDT') ? `${normalized}T` : normalized;
-          })
-        );
+        liveTradableSymbols = new Set(futuresOnlySymbols.map(s => normalizeLiveFuturesSymbol(s.value)));
+        if (liveTradableSymbols.size > 0) {
+          liveTradableSymbolsRef.current = liveTradableSymbols;
+          liveTradableSymbolsFetchedAtRef.current = Date.now();
+        }
       } catch (err: any) {
         const retryAt: number = err?.retryAt || 0;
         if (retryAt > Date.now()) {
@@ -2083,7 +2129,7 @@ export default function App() {
         return;
       }
       const allValues = allSymbols.map(s => s.value);
-      const liveNormalized = (v: string) => (v.toUpperCase().endsWith('USD') && !v.toUpperCase().endsWith('USDT') ? `${v}T` : v);
+      const liveNormalized = (v: string) => normalizeLiveFuturesSymbol(v);
       const nonTradableStableBases = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
       const hasAllowedQuote = (v: string) => {
         const up = v.toUpperCase();
@@ -2106,7 +2152,7 @@ export default function App() {
       const isLiveBinance = isRealMode && normalizedLiveExchange === 'binance';
       const baseSymbol = isRealMode ? liveNormalized(symbol) : symbol;
       const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
-      const isLiveTradableFuturesSymbol = (value: string) => liveTradableSymbols.size === 0 || liveTradableSymbols.has(value.toUpperCase());
+      const isLiveTradableFuturesSymbol = (value: string) => liveTradableSymbols.has(normalizeLiveFuturesSymbol(value));
       let symbolsToScan = isLiveBinance
         ? Array.from(new Set(candidateValues)).filter(value => isLikelyBinanceSymbol(value) && hasAllowedQuote(value) && hasTradableBase(value))
         : Array.from(new Set([baseSymbol, ...candidateValues]));
@@ -2180,6 +2226,8 @@ export default function App() {
           const scanResult = results.find(r => r.symbol === holding.symbol);
           if (scanResult) {
             const price = scanResult.lastPrice;
+            const macdExitTriggered = (holding.side === 'LONG' && scanResult.signal.exitSignal === 'EXIT_LONG')
+              || (holding.side === 'SHORT' && scanResult.signal.exitSignal === 'EXIT_SHORT');
             const slTrigger = holding.side === 'SHORT'
               ? price >= holding.entryPrice * (1 + stopLossPercent / 100)
               : price <= holding.entryPrice * (1 - stopLossPercent / 100);
@@ -2192,49 +2240,35 @@ export default function App() {
               executeTrade(exitSide, holding.symbol, price, 'AUTO_EXIT: PORTFOLIO STOP LOSS', holding.id, cycleId);
             } else if (tpTrigger) {
               executeTrade(exitSide, holding.symbol, price, 'AUTO_EXIT: PORTFOLIO TAKE PROFIT', holding.id, cycleId);
+            } else if (macdExitTriggered) {
+              executeTrade(exitSide, holding.symbol, price, `AUTO_EXIT: PORTFOLIO MACD OVERRIDE (${scanResult.signal.macdScore}/10)`, holding.id, cycleId);
             }
           }
         });
       }
 
       if (currentAutoTrade) {
-        const potentialLongs = results
-          .filter(r => r.signal.overall === 'BUY')
+        if (isLiveBinance && liveTradableSymbols.size === 0) {
+          pushScanSkipEvent('SKIP: Binance futures tradable symbol set unavailable; blocking new live entries until metadata refresh succeeds.', cycleId);
+          return;
+        }
+
+        const entries = results
+          .filter(r => r.signal.overall === 'BUY' || (isRealMode && r.signal.overall === 'SELL'))
           .filter(r => !isLiveBinance || isLikelyBinanceFuturesSymbol(r.symbol))
           .filter(r => !isLiveBinance || isLiveTradableFuturesSymbol(r.symbol))
           .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
-          .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now());
-
-        const potentialShorts = isRealMode
-          ? results
-              .filter(r => r.signal.overall === 'SELL')
-              .filter(r => !isLiveBinance || isLikelyBinanceFuturesSymbol(r.symbol))
-              .filter(r => !isLiveBinance || isLiveTradableFuturesSymbol(r.symbol))
-              .filter(r => !currentHoldings.some(h => h.symbol === r.symbol))
-              .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now())
-          : [];
-
-        const sortedLongs = potentialLongs
-          .map(pick => ({ side: 'BUY' as const, pick }))
+          .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now())
+          .map(pick => ({ side: pick.signal.overall === 'SELL' ? 'SELL' as const : 'BUY' as const, pick }))
           .sort((a, b) => {
             const priorityDelta = (b.pick.priorityRank || 0) - (a.pick.priorityRank || 0);
             if (priorityDelta !== 0) return priorityDelta;
-            return b.pick.signal.score - a.pick.signal.score;
+            const aDirectionalScore = a.side === 'SELL' ? 10 - a.pick.signal.score : a.pick.signal.score;
+            const bDirectionalScore = b.side === 'SELL' ? 10 - b.pick.signal.score : b.pick.signal.score;
+            return bDirectionalScore - aDirectionalScore;
           });
-        const sortedShorts = potentialShorts
-          .map(pick => ({ side: 'SELL' as const, pick }))
-          .sort((a, b) => {
-            const priorityDelta = (b.pick.priorityRank || 0) - (a.pick.priorityRank || 0);
-            if (priorityDelta !== 0) return priorityDelta;
-            return b.pick.signal.score - a.pick.signal.score;
-          });
-
-        const entries: Array<{ side: 'BUY' | 'SELL'; pick: typeof results[number] }> = [];
-        const maxEntryCandidates = Math.max(sortedLongs.length, sortedShorts.length);
-        for (let index = 0; index < maxEntryCandidates; index += 1) {
-          if (sortedLongs[index]) entries.push(sortedLongs[index]);
-          if (sortedShorts[index]) entries.push(sortedShorts[index]);
-        }
+        const eligibleBuyCount = entries.filter(entry => entry.side === 'BUY').length;
+        const eligibleSellCount = entries.filter(entry => entry.side === 'SELL').length;
 
         if (currentHoldings.length < currentMaxTrades) {
           const availableSlots = currentMaxTrades - currentHoldings.length;
@@ -2283,7 +2317,7 @@ export default function App() {
               }
             }
           } else {
-            pushScanSkipEvent(`SKIP: No eligible entries (BUY=${potentialLongs.length}, SELL=${potentialShorts.length}, slots=${availableSlots})`, cycleId);
+            pushScanSkipEvent(`SKIP: No eligible entries (BUY=${eligibleBuyCount}, SELL=${eligibleSellCount}, slots=${availableSlots})`, cycleId);
           }
         } else {
           pushScanSkipEvent(`SKIP: No free slots (${currentHoldings.length}/${currentMaxTrades})`, cycleId);
@@ -2458,6 +2492,8 @@ export default function App() {
         
         if (price) {
           const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
+          const macdExitTriggered = (holding.side === 'LONG' && strategy?.exitSignal === 'EXIT_LONG')
+            || (holding.side === 'SHORT' && strategy?.exitSignal === 'EXIT_SHORT');
           const slTrigger = holding.side === 'SHORT'
             ? price >= holding.entryPrice * (1 + stopLossPercent / 100)
             : price <= holding.entryPrice * (1 - stopLossPercent / 100);
@@ -2472,14 +2508,19 @@ export default function App() {
           // 2. Take Profit Check (15%)
           else if (tpTrigger) {
             executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: TAKE PROFIT (15%)', holding.id);
+          } else if (macdExitTriggered) {
+            executeTrade(closeSide, holding.symbol, price, `AUTO_EXIT: MACD OVERRIDE (${strategy?.macdScore || 0}/10)`, holding.id);
           }
-          // Strategy-based Exit removed to respect user's strict 15%/5% TP/SL bounds
         }
       });
     }
     
     // 4. Current Symbol Auto-Entry (paper mode only)
-    if (!isRealMode && holdings.length < maxConcurrentTrades && strategy && (strategy.overall === 'BUY' || strategy.overall === 'SELL') && autoTrade && currentPrice && strategy.score >= autoEntryMinScore) {
+    const paperEntryQualified = strategy && (
+      (strategy.overall === 'BUY' && strategy.score >= Math.max(autoEntryMinScore, 7.2))
+      || (strategy.overall === 'SELL' && strategy.score <= Math.min(10 - autoEntryMinScore, 2.8))
+    );
+    if (!isRealMode && holdings.length < maxConcurrentTrades && strategy && (strategy.overall === 'BUY' || strategy.overall === 'SELL') && autoTrade && currentPrice && paperEntryQualified) {
       const isAlreadyHeld = holdings.some(h => h.symbol === symbol);
       const isOnCooldown = cooldowns[symbol] && cooldowns[symbol] > Date.now();
       if (!isAlreadyHeld && !isOnCooldown) {
@@ -3816,7 +3857,7 @@ export default function App() {
             <MetricBox 
               icon={<DollarSign className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Total P&L"
-              value={`${totalPnl >= 0 ? '+' : ''}$${Math.abs(totalPnl).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+              value={`${totalPnl >= 0 ? '+' : '-'}$${Math.abs(totalPnl).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
               trend={totalPnl >= 0 ? 'up' : 'down'}
               subValue={`Realized: ${realizedPnl >= 0 ? '+' : '-'}$${Math.abs(realizedPnl).toFixed(2)} | Open: ${openPnl >= 0 ? '+' : '-'}$${Math.abs(openPnl).toFixed(2)}`}
             />
@@ -3862,13 +3903,13 @@ export default function App() {
             
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
-                <thead className="bg-gray-50 border-b-2 border-gray-100 uppercase font-mono text-[9px] opacity-40">
+                <thead className="bg-gray-50 border-b-2 border-gray-100 uppercase font-mono text-[8px] opacity-40">
                   <tr>
                     {activePositionHeaders.map(header => {
                       const direction = activePositionSortDirection(header.key);
                       const priority = activePositionSortPriority(header.key);
                       return (
-                        <th key={header.key} className={`px-2 py-2.5 tracking-widest ${header.rightAlign ? 'text-right' : ''}`}>
+                        <th key={header.key} className={`px-1.5 py-2 tracking-widest ${header.rightAlign ? 'text-right' : ''}`}>
                           <button
                             type="button"
                             onClick={(event) => updateActivePositionSort(header.key, event.shiftKey)}
@@ -3908,43 +3949,43 @@ export default function App() {
                       const { mark, contracts, margin, notional, unrealizedPnl: pnlVal, pnlPct: pnlPctVal, closeSide, displaySymbol } = row;
                       return (
                         <tr key={h.id} className="hover:bg-gray-50/50 transition-colors group cursor-pointer" onClick={() => setSymbol(h.symbol)}>
-                        <td className="px-2 py-3.5 font-mono text-xs opacity-70">
+                        <td className="px-1.5 py-2.5 font-mono text-[11px] opacity-70">
                          {row.exchange}
                           </td>
-                          <td className="px-2 py-3.5">
-                              <span className={`text-[10px] font-black px-2 py-0.5 rounded-sm ${h.side === 'SHORT' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{h.side}</span>
+                          <td className="px-1.5 py-2.5">
+                              <span className={`text-[9px] font-black px-1.5 py-0.5 rounded-sm ${h.side === 'SHORT' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{h.side}</span>
                           </td>
-                        <td className="px-2 py-3.5 font-mono text-xs font-black uppercase tracking-tight">
+                        <td className="px-1.5 py-2.5 font-mono text-[11px] font-black uppercase tracking-tight">
                           {displaySymbol}
                         </td>
-                          <td className="px-2 py-3.5 font-mono text-xs opacity-60">
+                          <td className="px-1.5 py-2.5 font-mono text-[11px] opacity-60">
                           {contracts < 1 ? contracts.toFixed(8) : contracts.toFixed(4)}
                           </td>
-                          <td className="px-2 py-3.5 font-mono text-xs opacity-60">
+                          <td className="px-1.5 py-2.5 font-mono text-[11px] opacity-60">
                              ${formatPrice(h.entryPrice)}
                           </td>
-                          <td className="px-2 py-3.5 font-mono text-xs font-bold">
+                          <td className={`px-1.5 py-2.5 font-mono text-[11px] font-bold ${pnlVal > 0 ? 'text-emerald-600' : pnlVal < 0 ? 'text-rose-600' : 'text-[#141414]'}`}>
                           ${formatPrice(mark)}
                           </td>
-                          <td className="px-2 py-3.5 font-mono text-xs font-bold">
+                          <td className="px-1.5 py-2.5 font-mono text-[11px] font-bold">
                           ${margin.toFixed(2)}
                         </td>
-                        <td className="px-2 py-3.5 font-mono text-xs font-bold">
+                        <td className="px-1.5 py-2.5 font-mono text-[11px] font-bold">
                           ${notional.toFixed(2)}
                         </td>
-                          <td className={`px-2 py-3.5 font-black text-sm ${pnlVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                          <td className={`px-1.5 py-2.5 font-black text-[13px] ${pnlVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                              {pnlVal >= 0 ? '+' : ''}${pnlVal.toFixed(2)}
                         </td>
-                        <td className={`px-2 py-3.5 font-black text-sm ${pnlPctVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                        <td className={`px-1.5 py-2.5 font-black text-[13px] ${pnlPctVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                           {pnlPctVal >= 0 ? '+' : ''}{pnlPctVal.toFixed(2)}%
                           </td>
-                          <td className="px-2 py-3.5 text-right">
+                          <td className="px-1.5 py-2.5 text-right">
                              <button 
                                onClick={(e) => {
                                  e.stopPropagation();
                             executeTrade(closeSide, h.symbol, mark, 'MANUAL_DOCK_CONTROL', h.id);
                                }}
-                               className="bg-[#141414] text-white hover:bg-[#F27D26] px-4 py-1.5 text-[10px] font-black uppercase tracking-tighter transition-all"
+                               className="bg-[#141414] text-white hover:bg-[#F27D26] px-3 py-1 text-[9px] font-black uppercase tracking-tighter transition-all"
                              >
                                Close Pos
                              </button>
@@ -4092,12 +4133,12 @@ const MetricBox = ({ icon, label, value, trend, subValue }: { icon: React.ReactN
         <div className="p-2.5 bg-[#141414] text-white group-hover:bg-[#F27D26] transition-colors">
           {icon}
         </div>
-        <div>
+        <div className="min-w-0">
           <p className="text-[11px] uppercase font-bold opacity-40 tracking-tighter group-hover:opacity-60">{label}</p>
           <div className="flex flex-col">
-            <p className="text-3xl font-black tabular-nums tracking-tighter leading-none">{value}</p>
+            <p className="whitespace-nowrap text-[28px] font-black tabular-nums tracking-tighter leading-none">{value}</p>
             {subValue && (
-              <div className="mt-1 font-mono uppercase text-[9px] font-bold opacity-60">
+              <div className="mt-1 font-mono uppercase text-[9px] font-bold opacity-60 break-words">
                 {subValue}
               </div>
             )}

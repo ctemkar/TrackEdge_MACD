@@ -88,7 +88,7 @@ export function runBacktest(
       const pnlPercent = ((currentCandle.close - currentPosition.entryPrice) / currentPosition.entryPrice) * 100;
       
       // Exit conditions: Sell Signal, Stop Loss, or Take Profit
-      const shouldExit = signal.overall === 'SELL' || pnlPercent <= -stopLossPercent || pnlPercent >= takeProfitPercent;
+      const shouldExit = signal.exitSignal === 'EXIT_LONG' || pnlPercent <= -stopLossPercent || pnlPercent >= takeProfitPercent;
 
       if (shouldExit) {
         const profit = (currentCandle.close - currentPosition.entryPrice) * currentPosition.amount;
@@ -102,7 +102,7 @@ export function runBacktest(
           exitPrice: currentCandle.close,
           profit: profit,
           profitPercent: pnlPercent,
-          reason: signal.overall === 'SELL' ? 'Trend Reversal' : (pnlPercent <= -stopLossPercent ? 'Stop Loss' : 'Take Profit')
+          reason: signal.exitSignal === 'EXIT_LONG' ? 'MACD Exit Override' : (pnlPercent <= -stopLossPercent ? 'Stop Loss' : 'Take Profit')
         });
         
         currentPosition = null;

@@ -111,6 +111,8 @@ export interface StrategySignal {
   };
   overall: 'BUY' | 'SELL' | 'HOLD';
   score: number;
+  macdScore: number;
+  exitSignal: 'EXIT_LONG' | 'EXIT_SHORT' | 'NONE';
 }
 
 export function evaluateStrategy(
@@ -123,7 +125,9 @@ export function evaluateStrategy(
     volume: false, 
     confluence: { rsi: 'NEUTRAL', macd: 'NEUTRAL', macdHistogram: 'NEUTRAL', emaCrossover: 'NEUTRAL', support: false }, 
     overall: 'HOLD', 
-    score: 0 
+    score: 0,
+    macdScore: 0,
+    exitSignal: 'NONE',
   };
 
   const lastCandle = candles[candles.length - 1];
@@ -232,6 +236,44 @@ export function evaluateStrategy(
   const trendBullish = trend === 'UP' && emaCrossover === 'BULLISH';
   const trendBearish = trend === 'DOWN' && emaCrossover === 'BEARISH';
 
+  const computeDirectionalMacdScore = (direction: 'LONG' | 'SHORT') => {
+    let directionalScore = 0;
+    const favorsDirection = direction === 'LONG'
+      ? macdMode === 'BULLISH'
+      : macdMode === 'BEARISH';
+    const crossoverSupports = direction === 'LONG'
+      ? macdCrossover === 'BULLISH'
+      : macdCrossover === 'BEARISH';
+    const momentumSupports = direction === 'LONG'
+      ? bullishMomentum
+      : bearishMomentum;
+    const histogramSupports = direction === 'LONG'
+      ? macdHistogramMode === 'BULLISH_ACCELERATION' || macdHistogramMode === 'BULLISH_FADE'
+      : macdHistogramMode === 'BEARISH_ACCELERATION' || macdHistogramMode === 'BEARISH_FADE';
+    const accelerating = direction === 'LONG'
+      ? macdHistogramMode === 'BULLISH_ACCELERATION'
+      : macdHistogramMode === 'BEARISH_ACCELERATION';
+    const trendSupports = direction === 'LONG' ? trendBullish : trendBearish;
+
+    if (favorsDirection) directionalScore += 3;
+    if (crossoverSupports) directionalScore += 3;
+    if (momentumSupports) directionalScore += 2;
+    if (histogramSupports) directionalScore += 1;
+    if (accelerating) directionalScore += 1;
+    if (trendSupports) directionalScore += 1;
+
+    return Math.min(10, directionalScore);
+  };
+
+  const longMacdScore = computeDirectionalMacdScore('LONG');
+  const shortMacdScore = computeDirectionalMacdScore('SHORT');
+  const weakMacdLong = longMacdScore <= 4;
+  const weakMacdShort = shortMacdScore <= 4;
+  const conditionalMacdLong = longMacdScore >= 5 && longMacdScore <= 6;
+  const conditionalMacdShort = shortMacdScore >= 5 && shortMacdScore <= 6;
+  const strongMacdLong = longMacdScore >= 7;
+  const strongMacdShort = shortMacdScore >= 7;
+
   // Keep EMA + trend alignment as mandatory regime filter; score the rest.
   const longBase = (macdCrossover === 'BULLISH' || bullishMomentum) && trendBullish;
   const shortBase = (macdCrossover === 'BEARISH' || bearishMomentum) && trendBearish;
@@ -252,30 +294,125 @@ export function evaluateStrategy(
   if (!extremeVolatility) shortChecks += 1;
   if (shortRiskReward >= 1.5) shortChecks += 1;
 
-  const longQuality = longBase && longChecks >= 5;
-  const shortQuality = shortBase && shortChecks >= 5;
+  const longOtherSignalsVeryStrong = longChecks >= 6 && longRiskReward >= 2 && volumeConfirmed && !lateEntryRisk && !choppyMarket && !extremeVolatility;
+  const shortOtherSignalsVeryStrong = shortChecks >= 6 && shortRiskReward >= 2 && volumeConfirmed && !lateEntryRisk && !choppyMarket && !extremeVolatility;
+
+  const longQuality = longBase && !weakMacdLong && (strongMacdLong ? longChecks >= 5 : conditionalMacdLong && longOtherSignalsVeryStrong);
+  const shortQuality = shortBase && !weakMacdShort && (strongMacdShort ? shortChecks >= 5 : conditionalMacdShort && shortOtherSignalsVeryStrong);
+
+  const computeTrendScore = (direction: 'LONG' | 'SHORT') => {
+    let directionalScore = 0;
+    const trendSupports = direction === 'LONG' ? trend === 'UP' : trend === 'DOWN';
+    const emaSupports = direction === 'LONG' ? emaCrossover === 'BULLISH' : emaCrossover === 'BEARISH';
+    const structureSupports = direction === 'LONG'
+      ? (nearSupport || !nearResistance)
+      : (nearResistance || !nearSupport);
+
+    if (trendSupports) directionalScore += 5;
+    if (emaSupports) directionalScore += 3;
+    if (structureSupports) directionalScore += 2;
+
+    return Math.min(10, directionalScore);
+  };
+
+  const computeVolumeMomentumScore = (direction: 'LONG' | 'SHORT') => {
+    let directionalScore = 0;
+    const momentumSupports = direction === 'LONG' ? bullishMomentum : bearishMomentum;
+    const histogramSupports = direction === 'LONG'
+      ? macdHistogramMode === 'BULLISH_ACCELERATION' || macdHistogramMode === 'BULLISH_FADE'
+      : macdHistogramMode === 'BEARISH_ACCELERATION' || macdHistogramMode === 'BEARISH_FADE';
+
+    if (volumeConfirmed) directionalScore += 4;
+    if (momentumSupports) directionalScore += 3;
+    if (histogramSupports) directionalScore += 1;
+    if (!choppyMarket) directionalScore += 1;
+    if (!lateEntryRisk && !extremeVolatility) directionalScore += 1;
+
+    return Math.min(10, directionalScore);
+  };
+
+  const computeRiskRewardScore = (riskReward: number, checks: number) => {
+    let directionalScore = 0;
+    if (riskReward >= 3) directionalScore += 6;
+    else if (riskReward >= 2) directionalScore += 5;
+    else if (riskReward >= 1.5) directionalScore += 4;
+    else if (riskReward >= 1.2) directionalScore += 2;
+
+    if (!lateEntryRisk) directionalScore += 2;
+    if (!extremeVolatility) directionalScore += 1;
+    if (checks >= 5) directionalScore += 1;
+
+    return Math.min(10, directionalScore);
+  };
+
+  const computeWeightedTradeScore = (
+    directionalMacdScore: number,
+    directionalTrendScore: number,
+    directionalVolumeMomentumScore: number,
+    directionalRiskRewardScore: number,
+  ) => {
+    const weighted = (directionalMacdScore * 0.30)
+      + (directionalTrendScore * 0.30)
+      + (directionalVolumeMomentumScore * 0.20)
+      + (directionalRiskRewardScore * 0.20);
+
+    return Math.min(config.maxScore, Number(weighted.toFixed(1)));
+  };
+
+  const longTrendScore = computeTrendScore('LONG');
+  const shortTrendScore = computeTrendScore('SHORT');
+  const longVolumeMomentumScore = computeVolumeMomentumScore('LONG');
+  const shortVolumeMomentumScore = computeVolumeMomentumScore('SHORT');
+  const longRiskRewardScore = computeRiskRewardScore(longRiskReward, longChecks);
+  const shortRiskRewardScore = computeRiskRewardScore(shortRiskReward, shortChecks);
+  const bullishMacdConfirmed = macdMode === 'BULLISH' || macdCrossover === 'BULLISH' || bullishMomentum;
+  const bearishMacdConfirmed = macdMode === 'BEARISH' || macdCrossover === 'BEARISH' || bearishMomentum;
+  const bearishMacdReversal = (macdMode === 'BEARISH' || macdCrossover === 'BEARISH' || macdHistogramMode === 'BEARISH_ACCELERATION') && shortMacdScore >= 7;
+  const bullishMacdReversal = (macdMode === 'BULLISH' || macdCrossover === 'BULLISH' || macdHistogramMode === 'BULLISH_ACCELERATION') && longMacdScore >= 7;
+  const longTradeDeteriorating = longRiskReward < 1.2 || nearResistance || choppyMarket || extremeVolatility || (weakeningMomentum && !trendBullish);
+  const shortTradeDeteriorating = shortRiskReward < 1.2 || nearSupport || choppyMarket || extremeVolatility || (weakeningMomentum && !trendBearish);
+  const longWeightedScore = computeWeightedTradeScore(
+    longMacdScore,
+    longTrendScore,
+    longVolumeMomentumScore,
+    longRiskRewardScore,
+  );
+  const shortWeightedScore = computeWeightedTradeScore(
+    shortMacdScore,
+    shortTrendScore,
+    shortVolumeMomentumScore,
+    shortRiskRewardScore,
+  );
+  const finalTradeScore = Math.min(
+    config.maxScore,
+    Math.max(0, Number((5 + ((longWeightedScore - shortWeightedScore) / 2)).toFixed(1))),
+  );
+  const longEntryQualified = longQuality && bullishMacdConfirmed && finalTradeScore >= 7.2;
+  const shortEntryQualified = shortQuality && bearishMacdConfirmed && finalTradeScore <= 2.8;
 
   let overall: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
   let score = 0;
-  if (longQuality) {
+  let macdScore = 0;
+  let exitSignal: 'EXIT_LONG' | 'EXIT_SHORT' | 'NONE' = 'NONE';
+  if (longEntryQualified) {
     overall = 'BUY';
-    score = 5;
-    if (macdCrossover === 'BULLISH') score += 1;
-    if (bullishMomentum) score += 1;
-    if (longRiskReward >= 2) score += 1;
-    if (!weakeningMomentum) score += 1;
-    if (longChecks >= 5) score += 1;
-  } else if (shortQuality) {
+    macdScore = longMacdScore;
+    score = finalTradeScore;
+  } else if (shortEntryQualified) {
     overall = 'SELL';
-    score = 5;
-    if (macdCrossover === 'BEARISH') score += 1;
-    if (bearishMomentum) score += 1;
-    if (shortRiskReward >= 2) score += 1;
-    if (!weakeningMomentum) score += 1;
-    if (shortChecks >= 5) score += 1;
+    macdScore = shortMacdScore;
+    score = finalTradeScore;
   } else {
-    // Conservative default: if confirmation is incomplete, hold.
-    score = 0;
+    score = finalTradeScore;
+    macdScore = Math.max(longMacdScore, shortMacdScore);
+  }
+
+  if (bearishMacdReversal && longTradeDeteriorating) {
+    exitSignal = 'EXIT_LONG';
+    macdScore = Math.max(macdScore, shortMacdScore);
+  } else if (bullishMacdReversal && shortTradeDeteriorating) {
+    exitSignal = 'EXIT_SHORT';
+    macdScore = Math.max(macdScore, longMacdScore);
   }
 
   return {
@@ -289,6 +426,8 @@ export function evaluateStrategy(
       support: nearSupport
     },
     overall,
-    score: Math.min(config.maxScore, score)
+    score: Math.min(config.maxScore, score),
+    macdScore,
+    exitSignal,
   };
 }

@@ -15,6 +15,12 @@ export interface MarketScanResult {
   priorityRank?: number;
 }
 
+function getDirectionalSignalStrength(signal: StrategySignal): number {
+  if (signal.overall === 'SELL') return 10 - signal.score;
+  if (signal.overall === 'BUY') return signal.score;
+  return Math.abs(signal.score - 5);
+}
+
 function computeProfitabilityRank(result: MarketScanResult): number {
   const signalActive = result.signal.overall === 'BUY' || result.signal.overall === 'SELL';
   if (!signalActive) return -Infinity;
@@ -111,7 +117,7 @@ export async function scanMarket(
     const profitabilityDelta = (b.priorityRank || 0) - (a.priorityRank || 0);
     if (profitabilityDelta !== 0) return profitabilityDelta;
 
-    const scoreDelta = b.signal.score - a.signal.score;
+    const scoreDelta = getDirectionalSignalStrength(b.signal) - getDirectionalSignalStrength(a.signal);
     if (scoreDelta !== 0) return scoreDelta;
 
     const macdSpreadDelta = (b.macdSpread || 0) - (a.macdSpread || 0);
