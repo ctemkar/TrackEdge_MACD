@@ -8,7 +8,9 @@ import { scanMarket, MarketScanResult } from './services/scanner';
 import { BacktestModule } from './components/BacktestModule';
 
 const STRATEGY_SIGNAL_INTERVAL = '1d';
-const SCAN_SHORTLIST_SAFE_CAP = 120;
+const SCAN_SHORTLIST_SAFE_CAP = 2000;
+const DEFAULT_BROAD_SCAN_LIMIT = 1500;
+const DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT = 'USDT,USDC,FDUSD,BUSD,TUSD';
 
 const CRITERIA_HELP: Record<string, string> = {
   autoEntryMinScore: 'Minimum strategy confidence required before opening a new position. Higher values reduce trade frequency and prioritize stronger setups.',
@@ -59,10 +61,10 @@ const PARAMETER_DEFAULTS = {
   isDefensiveMode: false,
   autoEntryMinScore: 6,
   liveMinOrderNotional: 10,
-  liveQuoteAllowlistInput: 'USDT,USDC',
+  liveQuoteAllowlistInput: DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT,
   scanIntervalSec: 40,
   holdingPollIntervalSec: 10,
-  maxSymbolsPerScan: SCAN_SHORTLIST_SAFE_CAP,
+  maxSymbolsPerScan: DEFAULT_BROAD_SCAN_LIMIT,
   duplicateOrderLockoutSec: 45,
   liveEntryDelayMs: 900,
   liveEntriesPerCycle: 1,
@@ -95,6 +97,10 @@ const normalizeLiveFuturesSymbol = (raw: string) => {
   const normalized = String(raw || '').toUpperCase().replace(/[/:]/g, '');
   if (!normalized) return normalized;
   return normalized.endsWith('USD') && !normalized.endsWith('USDT') ? `${normalized}T` : normalized;
+};
+
+const getDirectionalEntryScore = (side: 'BUY' | 'SELL', score: number) => {
+  return side === 'SELL' ? 10 - score : score;
 };
 
 const describeMacdHistogram = (state?: string) => {
@@ -243,7 +249,28 @@ export default function App() {
     return saved ? (parseFloat(saved) || 10) : 10;
   });
   const [liveQuoteAllowlistInput, setLiveQuoteAllowlistInput] = useState(() => {
-    return localStorage.getItem('te_live_quote_allowlist') || 'USDT,USDC';
+    const saved = localStorage.getItem('te_live_quote_allowlist');
+    const migrated = localStorage.getItem('te_live_quote_allowlist_migrated_v2') === '1';
+    if (!saved) {
+      localStorage.setItem('te_live_quote_allowlist_migrated_v2', '1');
+      localStorage.setItem('te_live_quote_allowlist', DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT);
+      return DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT;
+    }
+
+    const normalized = saved
+      .split(',')
+      .map(value => value.trim().toUpperCase())
+      .filter(Boolean)
+      .join(',');
+
+    if (!migrated && normalized === 'USDT,USDC') {
+      localStorage.setItem('te_live_quote_allowlist_migrated_v2', '1');
+      localStorage.setItem('te_live_quote_allowlist', DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT);
+      return DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT;
+    }
+
+    localStorage.setItem('te_live_quote_allowlist_migrated_v2', '1');
+    return normalized || DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT;
   });
   const [scanIntervalSec, setScanIntervalSec] = useState(() => {
     const saved = localStorage.getItem('te_scan_interval_sec');
@@ -257,29 +284,30 @@ export default function App() {
     const saved = localStorage.getItem('te_max_symbols_per_scan');
     const migrated = localStorage.getItem('te_max_symbols_scan_migrated_v2') === '1';
     const migratedSafeCap = localStorage.getItem('te_max_symbols_scan_migrated_v3') === '1';
+    const revertedBroadScans = localStorage.getItem('te_max_symbols_scan_reverted_v4') === '1';
     if (!saved) {
       localStorage.setItem('te_max_symbols_scan_migrated_v2', '1');
-      localStorage.setItem('te_max_symbols_scan_migrated_v3', '1');
-      return SCAN_SHORTLIST_SAFE_CAP;
+      localStorage.setItem('te_max_symbols_scan_reverted_v4', '1');
+      return DEFAULT_BROAD_SCAN_LIMIT;
     }
 
-    const parsed = parseInt(saved, 10) || SCAN_SHORTLIST_SAFE_CAP;
+    const parsed = parseInt(saved, 10) || DEFAULT_BROAD_SCAN_LIMIT;
     // One-time migration: old default 60 was too restrictive for full-universe scans.
     if (!migrated && parsed === 60) {
       localStorage.setItem('te_max_symbols_scan_migrated_v2', '1');
-      localStorage.setItem('te_max_symbols_scan_migrated_v3', '1');
-      localStorage.setItem('te_max_symbols_per_scan', String(SCAN_SHORTLIST_SAFE_CAP));
-      return SCAN_SHORTLIST_SAFE_CAP;
+      localStorage.setItem('te_max_symbols_scan_reverted_v4', '1');
+      localStorage.setItem('te_max_symbols_per_scan', String(DEFAULT_BROAD_SCAN_LIMIT));
+      return DEFAULT_BROAD_SCAN_LIMIT;
     }
 
-    if (!migratedSafeCap && parsed === 1500) {
-      localStorage.setItem('te_max_symbols_scan_migrated_v3', '1');
-      localStorage.setItem('te_max_symbols_per_scan', String(SCAN_SHORTLIST_SAFE_CAP));
-      return SCAN_SHORTLIST_SAFE_CAP;
+    if (!revertedBroadScans && migratedSafeCap && parsed === 120) {
+      localStorage.setItem('te_max_symbols_scan_reverted_v4', '1');
+      localStorage.setItem('te_max_symbols_per_scan', String(DEFAULT_BROAD_SCAN_LIMIT));
+      return DEFAULT_BROAD_SCAN_LIMIT;
     }
 
     localStorage.setItem('te_max_symbols_scan_migrated_v2', '1');
-    localStorage.setItem('te_max_symbols_scan_migrated_v3', '1');
+    localStorage.setItem('te_max_symbols_scan_reverted_v4', '1');
     return Math.max(20, Math.min(SCAN_SHORTLIST_SAFE_CAP, parsed));
   });
   const [duplicateOrderLockoutSec, setDuplicateOrderLockoutSec] = useState(() => {
@@ -431,6 +459,14 @@ export default function App() {
   type MarketPickLifecycle = {
     label: 'Signal Found' | 'Order Submitted' | 'Exchange Confirmed' | 'Watching';
     className: string;
+  };
+
+  type ScanBlockedSignal = {
+    symbol: string;
+    side: 'BUY' | 'SELL';
+    score: number;
+    priorityRank: number;
+    reason: string;
   };
 
   const [holdings, setHoldings] = useState<Holding[]>(() => {
@@ -1878,6 +1914,17 @@ export default function App() {
     hold: 0,
     updatedAt: 0,
   });
+  const [scanBlockedSummary, setScanBlockedSummary] = useState<{
+    updatedAt: number;
+    filteredSignals: number;
+    reasonCounts: Record<string, number>;
+    topBlocked: ScanBlockedSignal[];
+  }>({
+    updatedAt: 0,
+    filteredSignals: 0,
+    reasonCounts: {},
+    topBlocked: [],
+  });
   const [filteredSyncSymbols, setFilteredSyncSymbols] = useState<Array<{ symbol: string; reason: string }>>([]);
   const [scanDataSource, setScanDataSource] = useState('BINANCE PUBLIC');
 
@@ -2335,8 +2382,9 @@ export default function App() {
       const baseSymbol = isRealMode ? liveNormalized(symbol) : symbol;
       const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
       const isLiveTradableFuturesSymbol = (value: string) => liveTradableSymbols.has(normalizeLiveFuturesSymbol(value));
+      const scanQuoteFilterAllows = (value: string) => fullUniverseMode || hasAllowedQuote(value);
       let symbolsToScan = isLiveBinance
-        ? Array.from(new Set(candidateValues)).filter(value => isLikelyBinanceSymbol(value) && hasAllowedQuote(value) && hasTradableBase(value))
+        ? Array.from(new Set(candidateValues)).filter(value => isLikelyBinanceSymbol(value) && scanQuoteFilterAllows(value) && hasTradableBase(value))
         : Array.from(new Set([baseSymbol, ...candidateValues]));
 
       if (symbolsToScan.length === 0) {
@@ -2444,11 +2492,11 @@ export default function App() {
           .filter(r => !cooldowns[r.symbol] || cooldowns[r.symbol] < Date.now())
           .map(pick => ({ side: pick.signal.overall === 'SELL' ? 'SELL' as const : 'BUY' as const, pick }))
           .sort((a, b) => {
-            const priorityDelta = (b.pick.priorityRank || 0) - (a.pick.priorityRank || 0);
-            if (priorityDelta !== 0) return priorityDelta;
             const aDirectionalScore = a.side === 'SELL' ? 10 - a.pick.signal.score : a.pick.signal.score;
             const bDirectionalScore = b.side === 'SELL' ? 10 - b.pick.signal.score : b.pick.signal.score;
-            return bDirectionalScore - aDirectionalScore;
+            const directionalScoreDelta = bDirectionalScore - aDirectionalScore;
+            if (directionalScoreDelta !== 0) return directionalScoreDelta;
+            return (b.pick.priorityRank || 0) - (a.pick.priorityRank || 0);
           });
         const eligibleBuyCount = entries.filter(entry => entry.side === 'BUY').length;
         const eligibleSellCount = entries.filter(entry => entry.side === 'SELL').length;
@@ -2757,6 +2805,9 @@ export default function App() {
     return `Last completed scan at ${new Date(scanSignalSummary.updatedAt).toLocaleTimeString()}.`;
   })();
   const scanSourceHint = `Scan Source: ${scanDataSource}`;
+  const scanUniverseHint = fullUniverseMode
+    ? `Full Universe Mode: scanning all Binance futures quotes; live entries remain restricted to ${liveQuoteAllowlist.join(', ')}.`
+    : `Focused quote universe: ${liveQuoteAllowlist.join(', ')}.`;
   const filteredSyncSymbolsPreview = filteredSyncSymbols.slice(0, 3).map((entry: { symbol: string; reason: string }) => entry.symbol).join(', ');
   const filteredSyncNote = filteredSyncSymbols.length > 0
     ? `Exchange sync filtered ${filteredSyncSymbols.length} non-tradable raw symbol${filteredSyncSymbols.length === 1 ? '' : 's'}${filteredSyncSymbolsPreview ? `: ${filteredSyncSymbolsPreview}${filteredSyncSymbols.length > 3 ? ', ...' : ''}.` : '.'} USDT remains available as cash in Cash / Available Funds and is not shown as an active position.`
@@ -3018,6 +3069,27 @@ export default function App() {
 
   const showInitialLoading = loading && data.length === 0;
   const visibleSignalTableLimit = 30;
+  const nearMissSignalThreshold = 1.15;
+  const nearMissPicks = React.useMemo(() => {
+    return marketPicks
+      .filter((pick) => pick.signal.overall === 'HOLD')
+      .map((pick) => ({
+        pick,
+        signalDistance: Math.min(
+          Math.abs((pick.signal.score || 0) - 7.2),
+          Math.abs((pick.signal.score || 0) - 2.8),
+        ),
+      }))
+      .filter(({ signalDistance }) => signalDistance <= nearMissSignalThreshold)
+      .sort((a, b) => {
+        if (a.signalDistance !== b.signalDistance) return a.signalDistance - b.signalDistance;
+        if ((b.pick.signal.macdScore || 0) !== (a.pick.signal.macdScore || 0)) {
+          return (b.pick.signal.macdScore || 0) - (a.pick.signal.macdScore || 0);
+        }
+        return (b.pick.priorityRank || 0) - (a.pick.priorityRank || 0);
+      })
+      .slice(0, 6);
+  }, [marketPicks]);
   const visibleSignalTablePicks = marketPicks
     .slice(0, visibleSignalTableLimit);
 
@@ -3287,6 +3359,7 @@ export default function App() {
 
             <p className="mt-2 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanStatusHint}</p>
             <p className="mt-1 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanSourceHint}</p>
+            <p className="mt-1 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanUniverseHint}</p>
             {filteredSyncNote && (
               <div className="mt-2 border border-amber-200 bg-amber-50/80 px-3 py-2 text-[10px] font-mono text-amber-900">
                 {filteredSyncNote}
@@ -3336,6 +3409,33 @@ export default function App() {
                 </div>
               </div>
             </div>
+
+            <div className="mt-3 border border-amber-200 bg-amber-50/60 px-3 py-2 text-[10px] font-mono uppercase">
+              <div className="flex items-center justify-between text-amber-900/80">
+                <span>Top Near Misses</span>
+                <span>{nearMissPicks.length > 0 ? `${nearMissPicks.length} close HOLDs` : 'No near misses'}</span>
+              </div>
+              {nearMissPicks.length === 0 ? (
+                <p className="mt-2 text-[10px] normal-case tracking-normal text-amber-900/70">
+                  No HOLD setups are currently close enough to the BUY/SELL thresholds to qualify as near misses.
+                </p>
+              ) : (
+                <div className="mt-2 space-y-2">
+                  {nearMissPicks.map(({ pick, signalDistance }) => (
+                    <div key={`near-miss-${pick.symbol}`} className="border border-amber-200 bg-white/60 px-2 py-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-black text-[11px] text-amber-950">{pick.symbol}</span>
+                        <span className="text-[9px] text-amber-900/70">score {pick.signal.score.toFixed(1)} | rank {(pick.priorityRank || 0).toFixed(2)} | MACD {pick.signal.macdScore.toFixed(1)}</span>
+                      </div>
+                      <div className="mt-1 flex items-center justify-between gap-2 text-[9px] text-amber-900/75">
+                        <span>{describeHoldReason(pick.signal.holdReason)}</span>
+                        <span>{signalDistance.toFixed(2)} from trigger</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </section>
 
           <section className="bg-white border-2 border-[#141414] p-4 shadow-[8px_8px_0px_0px_#141414]">
@@ -3344,10 +3444,13 @@ export default function App() {
                 <h3 className="font-mono text-[12px] uppercase tracking-[0.2em] opacity-75">Top Ranked Signals</h3>
                 <span className="text-[10px] font-mono uppercase opacity-50">{visibleSignalTablePicks.length} shown</span>
               </div>
+              <p className="text-[9px] font-mono uppercase tracking-wide opacity-45 px-2">
+                Displaying strategy score and profitability rank side by side.
+              </p>
               <div className="grid grid-cols-5 items-center border-b pb-2 text-[10px] font-mono opacity-50 uppercase tracking-wide px-2">
                 <span>Asset</span>
                 <span className="text-center">Trend/RSI</span>
-                <span className="text-center">Score</span>
+                <span className="text-center">Score / Rank</span>
                 <span className="text-center">Signal</span>
                 <span className="text-right">Action</span>
               </div>
@@ -3376,13 +3479,18 @@ export default function App() {
                     </div>
 
                     <div className="text-center">
-                      <span className={`text-[11px] font-mono font-bold ${
-                        pick.signal.score >= 8 ? 'text-emerald-500' :
-                        pick.signal.score >= 5 ? 'text-[#F27D26]' :
-                        'opacity-30'
-                      }`}>
-                        {pick.signal.score}/10
-                      </span>
+                      <div className="flex flex-col items-center leading-tight">
+                        <span className={`text-[11px] font-mono font-bold ${
+                          pick.signal.score >= 8 ? 'text-emerald-500' :
+                          pick.signal.score >= 5 ? 'text-[#F27D26]' :
+                          'opacity-30'
+                        }`}>
+                          {pick.signal.score}/10
+                        </span>
+                        <span className="text-[8px] font-mono uppercase opacity-45">
+                          rank {(pick.priorityRank || 0).toFixed(2)}
+                        </span>
+                      </div>
                     </div>
 
                     <div className="flex justify-center">

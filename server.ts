@@ -39,8 +39,13 @@ async function startServer() {
   };
   const publicExchangeInfoCache = new Map<string, { symbols: any[]; updatedAt: number }>();
   let publicTicker24hCache: { rows: any[]; updatedAt: number } | null = null;
+  type PublicKlineCacheEntry = { payload: any[]; updatedAt: number; source: string };
+  const publicKlineCache = new Map<string, PublicKlineCacheEntry>();
+  const inflightPublicKlineRequests = new Map<string, Promise<PublicKlineCacheEntry | null>>();
   const MAX_BACKOFF_MS = 5 * 60 * 1000; // cap backoff at 5 minutes
   const MAX_AUTH_BLOCK_MS = 10 * 60 * 1000; // cap auth block at 10 minutes
+  const MAX_PUBLIC_KLINE_CACHE_ENTRIES = 2200;
+  const PUBLIC_KLINE_STALE_WHILE_BLOCKED_MS = 20 * 60 * 1000;
   const throttledLogState = new Map<string, number>();
   const logOnceState = new Set<string>();
 
@@ -77,6 +82,39 @@ async function startServer() {
     if (blockedUntil > 0) {
       res.setHeader('X-TradeEdge-Blocked-Until', String(blockedUntil));
     }
+  };
+
+  const getPublicKlineCacheKey = (symbol: string, interval: string, limit: number, mode: string) => {
+    return `${mode}:${String(symbol || '').toUpperCase()}:${String(interval || '1d').toLowerCase()}:${Math.max(1, Number(limit) || 500)}`;
+  };
+
+  const getPublicKlineCacheTtlMs = (interval: string) => {
+    const normalized = String(interval || '1d').toLowerCase();
+    if (normalized === '1m') return 15_000;
+    if (normalized === '3m' || normalized === '5m') return 30_000;
+    if (normalized === '15m' || normalized === '30m') return 60_000;
+    if (normalized === '1h' || normalized === '2h' || normalized === '4h') return 90_000;
+    return 120_000;
+  };
+
+  const getCachedPublicKlines = (cacheKey: string, maxAgeMs: number) => {
+    const cached = publicKlineCache.get(cacheKey);
+    if (!cached) return null;
+    if (Date.now() - cached.updatedAt > maxAgeMs) return null;
+    return cached;
+  };
+
+  const setCachedPublicKlines = (cacheKey: string, payload: any[], source: string) => {
+    if (!Array.isArray(payload) || payload.length === 0) return null;
+    const entry: PublicKlineCacheEntry = { payload, updatedAt: Date.now(), source };
+    publicKlineCache.delete(cacheKey);
+    publicKlineCache.set(cacheKey, entry);
+    while (publicKlineCache.size > MAX_PUBLIC_KLINE_CACHE_ENTRIES) {
+      const oldestKey = publicKlineCache.keys().next().value;
+      if (!oldestKey) break;
+      publicKlineCache.delete(oldestKey);
+    }
+    return entry;
   };
 
   const getCompactUsdSymbolParts = (raw: string): { compact: string; base: string; quote: string } | null => {
@@ -1795,6 +1833,12 @@ async function startServer() {
       const source = String(req.query.source || '').toLowerCase();
       const forceBinancePublic = source !== 'bybit';
       const usePrivateGemini = preferGemini() && hasConfiguredKeys();
+      const targetSymbol = String(symbol || '').toUpperCase();
+      const targetInterval = String(interval || '1d');
+      const targetLimit = Math.max(1, Number(limit) || 500);
+      const cacheMode = forceBinancePublic ? 'binance_public' : 'hybrid';
+      const cacheKey = getPublicKlineCacheKey(targetSymbol, targetInterval, targetLimit, cacheMode);
+      const cacheTtlMs = getPublicKlineCacheTtlMs(targetInterval);
 
       if (usePrivateGemini) {
         const client = getExchange();
@@ -1813,12 +1857,37 @@ async function startServer() {
         const mapped = ohlcv.map(c => [c[0], c[1].toString(), c[2].toString(), c[3].toString(), c[4].toString(), c[5].toString(), c[0], "0", 1, "0", "0", "0"]);
         return res.json(mapped);
       } else {
+        const freshCached = getCachedPublicKlines(cacheKey, cacheTtlMs);
+        if (freshCached) {
+          setPublicSourceHeaders(res, freshCached.source, true);
+          return res.json(freshCached.payload);
+        }
+
+        const inflight = inflightPublicKlineRequests.get(cacheKey);
+        if (inflight) {
+          const shared = await inflight;
+          if (shared) {
+            setPublicSourceHeaders(res, shared.source, true);
+            return res.json(shared.payload);
+          }
+        }
+
         if (forceBinancePublic) {
           const nowPublic = Date.now();
           const blockedUntilPublic = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
           if (blockedUntilPublic > nowPublic) {
-            const bybitFallback = await fetchBybitKlines(String(symbol), String(interval || '1d'), Number(limit) || 500);
+            const staleCached = getCachedPublicKlines(cacheKey, PUBLIC_KLINE_STALE_WHILE_BLOCKED_MS);
+            if (staleCached) {
+              setPublicSourceHeaders(res, staleCached.source, true, blockedUntilPublic);
+              return res.json(staleCached.payload);
+            }
+            const bybitFallback = await fetchBybitKlines(targetSymbol, targetInterval, targetLimit);
             if (bybitFallback) {
+              const cachedFallback = setCachedPublicKlines(cacheKey, bybitFallback, 'BYBIT_PUBLIC_FALLBACK');
+              if (cachedFallback) {
+                setPublicSourceHeaders(res, cachedFallback.source, true, blockedUntilPublic);
+                return res.json(cachedFallback.payload);
+              }
               setPublicSourceHeaders(res, 'BYBIT_PUBLIC_FALLBACK');
               return res.json(bybitFallback);
             }
@@ -1826,32 +1895,44 @@ async function startServer() {
             return res.json([]);
           }
 
-          const endpoints = [
-            `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
-            `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
-          ];
+          const fetchPromise = (async (): Promise<PublicKlineCacheEntry | null> => {
+            const endpoints = [
+              `https://fapi.binance.com/fapi/v1/klines?symbol=${targetSymbol}&interval=${targetInterval}&limit=${targetLimit}`,
+              `https://api.binance.com/api/v3/klines?symbol=${targetSymbol}&interval=${targetInterval}&limit=${targetLimit}`,
+            ];
 
-          for (const binanceUrl of endpoints) {
-            const response = await fetch(binanceUrl);
-            if (response.ok) {
-              setPublicSourceHeaders(res, 'BINANCE_PUBLIC');
-              return res.json(await response.json());
+            for (const binanceUrl of endpoints) {
+              const response = await fetch(binanceUrl);
+              if (response.ok) {
+                const payload = await response.json();
+                const cachedPayload = setCachedPublicKlines(cacheKey, payload, 'BINANCE_PUBLIC');
+                if (cachedPayload) return cachedPayload;
+                return Array.isArray(payload) ? { payload, updatedAt: Date.now(), source: 'BINANCE_PUBLIC' } : null;
+              }
+              if (response.status === 418 || response.status === 429) {
+                const body: any = await response.json().catch(() => ({}));
+                const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
+                if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
+                else rateLimitState.backoffUntil = Date.now() + 60000;
+                console.warn(`[TradeEdge RateLimit] klines Binance public source rate limited`);
+                break;
+              }
             }
-            if (response.status === 418 || response.status === 429) {
-              const body: any = await response.json().catch(() => ({}));
-              const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
-              if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
-              else rateLimitState.backoffUntil = Date.now() + 60000;
-              console.warn(`[TradeEdge RateLimit] klines Binance public source rate limited`);
-              break;
-            }
-          }
 
-          const bybitFallback = await fetchBybitKlines(String(symbol), String(interval || '1d'), Number(limit) || 500);
-          if (bybitFallback) {
-            logWithThrottle('warn', `public-klines-fallback-${String(symbol).toUpperCase()}`, `[TradeEdge] klines: Binance public unavailable for ${symbol}, using Bybit public fallback`, 60000);
-            setPublicSourceHeaders(res, 'BYBIT_PUBLIC_FALLBACK');
-            return res.json(bybitFallback);
+            const bybitFallback = await fetchBybitKlines(targetSymbol, targetInterval, targetLimit);
+            if (bybitFallback) {
+              logWithThrottle('warn', `public-klines-fallback-${targetSymbol}`, `[TradeEdge] klines: Binance public unavailable for ${targetSymbol}, using Bybit public fallback`, 60000);
+              return setCachedPublicKlines(cacheKey, bybitFallback, 'BYBIT_PUBLIC_FALLBACK') || { payload: bybitFallback, updatedAt: Date.now(), source: 'BYBIT_PUBLIC_FALLBACK' };
+            }
+
+            return null;
+          })();
+
+          inflightPublicKlineRequests.set(cacheKey, fetchPromise);
+          const fetched = await fetchPromise.finally(() => inflightPublicKlineRequests.delete(cacheKey));
+          if (fetched) {
+            setPublicSourceHeaders(res, fetched.source);
+            return res.json(fetched.payload);
           }
 
           setPublicSourceHeaders(res, 'BINANCE_PUBLIC_FAILED', false, Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil));
@@ -1859,25 +1940,38 @@ async function startServer() {
         }
 
         // Try Bybit first (primary price source)
-        const bybitCandles = await fetchBybitKlines(String(symbol), String(interval || '1d'), Number(limit) || 500);
+        const bybitCandles = await fetchBybitKlines(targetSymbol, targetInterval, targetLimit);
         if (bybitCandles) {
+          const cachedPayload = setCachedPublicKlines(cacheKey, bybitCandles, 'BYBIT_PUBLIC_FALLBACK');
+          if (cachedPayload) {
+            setPublicSourceHeaders(res, cachedPayload.source, true);
+            return res.json(cachedPayload.payload);
+          }
           return res.json(bybitCandles);
         }
 
         // Bybit failed — fall back to Binance
-        console.log(`[TradeEdge] klines: Bybit returned no data for ${symbol}, falling back to Binance`);
+        console.log(`[TradeEdge] klines: Bybit returned no data for ${targetSymbol}, falling back to Binance`);
         const now2 = Date.now();
         const blockedUntil2 = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
         if (blockedUntil2 > now2) return res.json([]);
 
         const endpoints = [
-          `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
-          `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
+          `https://fapi.binance.com/fapi/v1/klines?symbol=${targetSymbol}&interval=${targetInterval}&limit=${targetLimit}`,
+          `https://api.binance.com/api/v3/klines?symbol=${targetSymbol}&interval=${targetInterval}&limit=${targetLimit}`,
         ];
 
         for (const binanceUrl of endpoints) {
           const response = await fetch(binanceUrl);
-          if (response.ok) return res.json(await response.json());
+          if (response.ok) {
+            const payload = await response.json();
+            const cachedPayload = setCachedPublicKlines(cacheKey, payload, 'BINANCE_PUBLIC');
+            if (cachedPayload) {
+              setPublicSourceHeaders(res, cachedPayload.source, true);
+              return res.json(cachedPayload.payload);
+            }
+            return res.json(payload);
+          }
           if (response.status === 418 || response.status === 429) {
             const body: any = await response.json().catch(() => ({}));
             const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
