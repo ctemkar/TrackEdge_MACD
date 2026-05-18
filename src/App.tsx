@@ -469,6 +469,13 @@ export default function App() {
     reason: string;
   };
 
+  type ScanDeferredSignal = {
+    symbol: string;
+    side: 'BUY' | 'SELL';
+    score: number;
+    priorityRank: number;
+  };
+
   const [holdings, setHoldings] = useState<Holding[]>(() => {
     const saved = localStorage.getItem('te_holdings');
     if (!saved) return [];
@@ -1925,6 +1932,15 @@ export default function App() {
     reasonCounts: {},
     topBlocked: [],
   });
+  const [scanDeferredSummary, setScanDeferredSummary] = useState<{
+    updatedAt: number;
+    deferredSignals: number;
+    topDeferred: ScanDeferredSignal[];
+  }>({
+    updatedAt: 0,
+    deferredSignals: 0,
+    topDeferred: [],
+  });
   const [filteredSyncSymbols, setFilteredSyncSymbols] = useState<Array<{ symbol: string; reason: string }>>([]);
   const [scanDataSource, setScanDataSource] = useState('BINANCE PUBLIC');
 
@@ -2516,6 +2532,11 @@ export default function App() {
         }, {}),
         topBlocked: blockedSignals.slice(0, 6),
       });
+      setScanDeferredSummary({
+        updatedAt: scanNow,
+        deferredSignals: 0,
+        topDeferred: [],
+      });
 
       if (currentAutoTrade && isRealMode && entryLockActive) {
         const remainingSec = Math.max(1, Math.ceil((entryLockUntilRef.current - Date.now()) / 1000));
@@ -2564,6 +2585,17 @@ export default function App() {
             // Live mode safety: execute entries sequentially to avoid burst margin failures.
             const maxEntriesThisCycle = isRealMode ? Math.max(1, liveEntriesPerCycle) : availableSlots;
             const selectedTrades = toTrade.slice(0, maxEntriesThisCycle);
+            const deferredTrades = toTrade.slice(selectedTrades.length);
+            setScanDeferredSummary({
+              updatedAt: scanNow,
+              deferredSignals: deferredTrades.length,
+              topDeferred: deferredTrades.slice(0, 6).map(({ side, pick }) => ({
+                symbol: pick.symbol,
+                side,
+                score: pick.signal.score,
+                priorityRank: pick.priorityRank || 0,
+              })),
+            });
             if (isRealMode && toTrade.length > selectedTrades.length) {
               const deferred = toTrade
                 .slice(selectedTrades.length, selectedTrades.length + 6)
@@ -3486,6 +3518,33 @@ export default function App() {
                       <div className="mt-1 flex items-center justify-between gap-2 text-[9px] text-rose-900/75">
                         <span>{entry.reason}</span>
                         <span>excluded pre-entry</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="mt-3 border border-sky-200 bg-sky-50/60 px-3 py-2 text-[10px] font-mono uppercase">
+              <div className="flex items-center justify-between text-sky-900/80">
+                <span>Deferred By Throttle</span>
+                <span>{scanDeferredSummary.deferredSignals > 0 ? `${scanDeferredSummary.deferredSignals} postponed` : 'No deferred entries'}</span>
+              </div>
+              {scanDeferredSummary.topDeferred.length === 0 ? (
+                <p className="mt-2 text-[10px] normal-case tracking-normal text-sky-900/70">
+                  No eligible signals were postponed by the live per-cycle entry throttle in the last scan.
+                </p>
+              ) : (
+                <div className="mt-2 space-y-2">
+                  {scanDeferredSummary.topDeferred.map((entry) => (
+                    <div key={`deferred-${entry.symbol}-${entry.side}`} className="border border-sky-200 bg-white/60 px-2 py-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-black text-[11px] text-sky-950">{entry.symbol}</span>
+                        <span className="text-[9px] text-sky-900/70">{entry.side} | score {entry.score.toFixed(1)} | rank {entry.priorityRank.toFixed(2)}</span>
+                      </div>
+                      <div className="mt-1 flex items-center justify-between gap-2 text-[9px] text-sky-900/75">
+                        <span>eligible but postponed by live cycle throttle</span>
+                        <span>next cycle candidate</span>
                       </div>
                     </div>
                   ))}
