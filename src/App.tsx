@@ -3457,6 +3457,42 @@ export default function App() {
               </div>
             </div>
 
+            <div className="mt-3 border border-rose-200 bg-rose-50/60 px-3 py-2 text-[10px] font-mono uppercase">
+              <div className="flex items-center justify-between text-rose-900/80">
+                <span>Top Blocked Signals</span>
+                <span>{scanBlockedSummary.filteredSignals > 0 ? `${scanBlockedSummary.filteredSignals} filtered` : 'No blocked signals'}</span>
+              </div>
+              {scanBlockedSummary.filteredSignals > 0 && (
+                <p className="mt-1 text-[9px] normal-case tracking-normal text-rose-900/70">
+                  {Object.entries(scanBlockedSummary.reasonCounts)
+                    .sort((a, b) => b[1] - a[1])
+                    .slice(0, 3)
+                    .map(([reason, count]) => `${count} ${reason}`)
+                    .join(' | ')}
+                </p>
+              )}
+              {scanBlockedSummary.topBlocked.length === 0 ? (
+                <p className="mt-2 text-[10px] normal-case tracking-normal text-rose-900/70">
+                  No strong signals were excluded by holdings, cooldowns, or live-market safety filters in the last scan.
+                </p>
+              ) : (
+                <div className="mt-2 space-y-2">
+                  {scanBlockedSummary.topBlocked.map((entry) => (
+                    <div key={`blocked-${entry.symbol}-${entry.reason}`} className="border border-rose-200 bg-white/60 px-2 py-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-black text-[11px] text-rose-950">{entry.symbol}</span>
+                        <span className="text-[9px] text-rose-900/70">{entry.side} | score {entry.score.toFixed(1)} | rank {entry.priorityRank.toFixed(2)}</span>
+                      </div>
+                      <div className="mt-1 flex items-center justify-between gap-2 text-[9px] text-rose-900/75">
+                        <span>{entry.reason}</span>
+                        <span>excluded pre-entry</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
             <div className="mt-3 border border-amber-200 bg-amber-50/60 px-3 py-2 text-[10px] font-mono uppercase">
               <div className="flex items-center justify-between text-amber-900/80">
                 <span>Top Near Misses</span>
