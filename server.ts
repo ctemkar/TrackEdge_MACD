@@ -1,5 +1,6 @@
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import * as ccxt from 'ccxt';
 import dotenv from 'dotenv';
@@ -29,25 +30,30 @@ async function startServer() {
   };
   const nonTradableQuoteBases = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
 
-  // Rate-limit state: tracks when Binance bans expire + consecutive failure count for backoff
-  const rateLimitState = {
-    bannedUntil: 0,       // epoch ms when Binance IP ban expires
-    failCount: 0,         // consecutive sync failures
-    backoffUntil: 0,      // epoch ms to suppress retries during backoff
-    authFailCount: 0,     // consecutive Binance auth/permission failures
-    authBlockedUntil: 0,  // epoch ms to suppress retries for invalid keys/permissions
+  const publicRateLimitState = {
+    bannedUntil: 0,
+    backoffUntil: 0,
+  };
+  const privateSyncState = {
+    failCount: 0,
+    backoffUntil: 0,
+    authFailCount: 0,
+    authBlockedUntil: 0,
   };
   const publicExchangeInfoCache = new Map<string, { symbols: any[]; updatedAt: number }>();
   let publicTicker24hCache: { rows: any[]; updatedAt: number } | null = null;
+  let privateBalanceCache: { payload: any; updatedAt: number } | null = null;
   type PublicKlineCacheEntry = { payload: any[]; updatedAt: number; source: string };
   const publicKlineCache = new Map<string, PublicKlineCacheEntry>();
   const inflightPublicKlineRequests = new Map<string, Promise<PublicKlineCacheEntry | null>>();
   const MAX_BACKOFF_MS = 5 * 60 * 1000; // cap backoff at 5 minutes
   const MAX_AUTH_BLOCK_MS = 10 * 60 * 1000; // cap auth block at 10 minutes
+  const PRIVATE_BALANCE_CACHE_MS = 4000;
   const MAX_PUBLIC_KLINE_CACHE_ENTRIES = 2200;
   const PUBLIC_KLINE_STALE_WHILE_BLOCKED_MS = 20 * 60 * 1000;
   const throttledLogState = new Map<string, number>();
   const logOnceState = new Set<string>();
+  const routeHitState = new Map<string, { count: number; lastLoggedAt: number; latestSample: string }>();
 
   const logWithThrottle = (
     level: 'log' | 'warn' | 'error',
@@ -74,6 +80,40 @@ async function startServer() {
     if (level === 'warn') console.warn(message);
     else if (level === 'error') console.error(message);
     else console.log(message);
+  };
+
+  const loadFallbackFuturesExchangeInfo = () => {
+    const fallbackPath = path.resolve(process.cwd(), 'binance_futures.json');
+    if (!fs.existsSync(fallbackPath)) return [] as any[];
+    try {
+      const parsed = JSON.parse(fs.readFileSync(fallbackPath, 'utf8'));
+      const symbols = Array.isArray(parsed?.symbols) ? parsed.symbols : [];
+      return symbols.map((symbol: any) => ({ ...symbol, marketType: 'futures' }));
+    } catch (error: any) {
+      logWithThrottle('warn', 'exchangeInfo-fallback-read', `[TradeEdge] exchangeInfo: failed to read local futures fallback (${error?.message || 'unknown error'})`, 60000);
+      return [] as any[];
+    }
+  };
+
+  const getPublicBlockedUntil = () => Math.max(publicRateLimitState.bannedUntil, publicRateLimitState.backoffUntil);
+  const getPrivateBlockedUntil = () => Math.max(privateSyncState.authBlockedUntil, privateSyncState.backoffUntil);
+
+  const recordBinanceRouteHit = (route: string, sample: string, intervalMs = 15000) => {
+    if (!(process.env.NODE_ENV === 'development' || process.env.TRADEEDGE_TRACE_BINANCE_ROUTES === 'true')) {
+      return;
+    }
+
+    const key = `route-hit:${route}`;
+    const now = Date.now();
+    const current = routeHitState.get(key) || { count: 0, lastLoggedAt: now, latestSample: sample };
+    current.count += 1;
+    current.latestSample = sample;
+    if (now - current.lastLoggedAt >= intervalMs) {
+      console.log(`[TradeEdge Trace] ${route} count=${current.count} windowMs=${intervalMs} latest=${current.latestSample}`);
+      current.count = 0;
+      current.lastLoggedAt = now;
+    }
+    routeHitState.set(key, current);
   };
 
   const setPublicSourceHeaders = (res: express.Response, source: string, cached = false, blockedUntil = 0) => {
@@ -476,7 +516,8 @@ async function startServer() {
   app.get('/api/health', async (req, res) => {
     let outboundIp = 'unknown';
     const now = Date.now();
-    const blockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+    const publicBlockedUntil = getPublicBlockedUntil();
+    const privateBlockedUntil = getPrivateBlockedUntil();
     try {
       const providers = [
         'https://api.ipify.org?format=json',
@@ -522,7 +563,9 @@ async function startServer() {
       type: currentExchange === 'binance' ? 'FUTURES' : 'SPOT',
       outboundIp,
       binanceRouteHealth,
-      blockedUntil: blockedUntil > now ? blockedUntil : 0,
+      blockedUntil: publicBlockedUntil > now ? publicBlockedUntil : 0,
+      publicBlockedUntil: publicBlockedUntil > now ? publicBlockedUntil : 0,
+      privateBlockedUntil: privateBlockedUntil > now ? privateBlockedUntil : 0,
       config: {
         realTradingEnabled: process.env.ENABLE_REAL_TRADING === 'true',
         hasKeys: !!(
@@ -647,21 +690,44 @@ async function startServer() {
   app.get('/api/binance/balance', async (req, res) => {
     // Refuse the call while we're still in a ban or backoff window
     const now = Date.now();
-    if (rateLimitState.authBlockedUntil > now) {
-      const waitSec = Math.ceil((rateLimitState.authBlockedUntil - now) / 1000);
+    const forceFresh = String(req.query.fresh || '0') === '1';
+    recordBinanceRouteHit('private.balance', `fresh=${forceFresh ? 1 : 0}`);
+    if (privateSyncState.authBlockedUntil > now) {
+      const waitSec = Math.ceil((privateSyncState.authBlockedUntil - now) / 1000);
       return res.status(401).json({
         status: 'auth_failed',
-        retryAfterMs: rateLimitState.authBlockedUntil - now,
-        blockedUntil: rateLimitState.authBlockedUntil,
+        retryAfterMs: privateSyncState.authBlockedUntil - now,
+        blockedUntil: privateSyncState.authBlockedUntil,
         message: `Binance Futures API auth/permissions failed. Retry in ${waitSec}s after fixing API key permissions.`,
       });
     }
 
-    const blockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
-    if (blockedUntil > now) {
-      const waitSec = Math.ceil((blockedUntil - now) / 1000);
-      console.warn(`[TradeEdge RateLimit] Sync suppressed — ${waitSec}s remaining (bannedUntil=${new Date(rateLimitState.bannedUntil).toISOString()})`);
-      return res.status(429).json({ status: 'rate_limited', retryAfterMs: blockedUntil - now, message: `Rate limited. Retry in ${waitSec}s.` });
+    const publicBlockedUntil = getPublicBlockedUntil();
+    if (publicBlockedUntil > now) {
+      const waitSec = Math.ceil((publicBlockedUntil - now) / 1000);
+      console.warn(`[TradeEdge RateLimit] Private sync suppressed by public Binance cooldown — ${waitSec}s remaining`);
+      return res.status(429).json({
+        status: 'public_rate_limited',
+        blockedUntil: publicBlockedUntil,
+        retryAfterMs: publicBlockedUntil - now,
+        message: `Public Binance market-data cooldown active. Retry in ${waitSec}s.`,
+      });
+    }
+
+    if (privateSyncState.backoffUntil > now) {
+      const waitSec = Math.ceil((privateSyncState.backoffUntil - now) / 1000);
+      console.warn(`[TradeEdge RateLimit] Private sync backoff active — ${waitSec}s remaining`);
+      return res.status(429).json({
+        status: 'private_rate_limited',
+        blockedUntil: privateSyncState.backoffUntil,
+        retryAfterMs: privateSyncState.backoffUntil - now,
+        message: `Private Binance account sync cooling down. Retry in ${waitSec}s.`,
+      });
+    }
+
+    if (!forceFresh && privateBalanceCache && (now - privateBalanceCache.updatedAt) <= PRIVATE_BALANCE_CACHE_MS) {
+      recordBinanceRouteHit('private.balance.cache', `ageMs=${now - privateBalanceCache.updatedAt}`);
+      return res.json(privateBalanceCache.payload);
     }
 
     try {
@@ -710,9 +776,57 @@ async function startServer() {
       } else {
         try {
           balanceData = await client.fetchBalance(params);
-        } catch (e) {
-          console.warn(`[TradeEdge Sync] ${client.id} targeting ${params.account || 'default'} failed, fallback to default account.`);
-          balanceData = await client.fetchBalance({});
+        } catch (error: any) {
+          console.warn(`[TradeEdge Sync] ${client.id} futures balance fetch failed: ${error?.message || 'unknown error'}`);
+
+          if (client.id === 'binance') {
+            const preferredBinance = getPreferredBinanceCredentials();
+            const binanceKey = preferredBinance.key;
+            const binanceSecret = preferredBinance.secret;
+
+            if (binanceKey && binanceSecret) {
+              const accountFallback = await fetchBinancePositionsFromAccountViaHttp(binanceKey, binanceSecret);
+              const accountInfo = accountFallback.accountData;
+              const walletBalance = Number(
+                accountInfo?.totalWalletBalance ??
+                accountInfo?.totalMarginBalance ??
+                accountInfo?.totalCrossWalletBalance ??
+                0,
+              );
+              const availableBalance = Number(
+                accountInfo?.availableBalance ??
+                accountInfo?.totalAvailableBalance ??
+                accountInfo?.maxWithdrawAmount ??
+                0,
+              );
+
+              if (accountInfo && Number.isFinite(walletBalance) && walletBalance >= 0) {
+                logWithThrottle(
+                  'warn',
+                  'sync-binance-balance-http-fallback',
+                  `[TradeEdge Sync] Binance balance fallback recovered via signed account endpoint after CCXT failure.`,
+                  60 * 1000,
+                );
+                balanceData = {
+                  total: walletBalance > 0 ? { USDT: walletBalance } : {},
+                  info: accountInfo,
+                };
+                if (walletBalance > 0) {
+                  papiActualEquity = walletBalance;
+                }
+                if (Number.isFinite(availableBalance) && availableBalance >= 0) {
+                  papiAvailableBalance = availableBalance;
+                }
+              } else {
+                throw error;
+              }
+            } else {
+              throw error;
+            }
+          } else {
+            console.warn(`[TradeEdge Sync] ${client.id} targeting ${params.account || 'default'} failed, fallback to default account.`);
+            balanceData = await client.fetchBalance({});
+          }
         }
 
         try {
@@ -1206,7 +1320,7 @@ async function startServer() {
         );
       }
       
-      res.json({ 
+      const responsePayload = { 
         status: 'success', 
         exchange: client.id, 
         account: client.id === 'gemini' ? (params.account || 'Primary') : 'Standard',
@@ -1225,24 +1339,29 @@ async function startServer() {
           totalUnrealizedPnl,
           info: balanceData.info 
         } : undefined
-      });
-      // Successful sync — reset failure counter
-      rateLimitState.failCount = 0;
-      rateLimitState.backoffUntil = 0;
-      rateLimitState.authFailCount = 0;
-      rateLimitState.authBlockedUntil = 0;
+      };
+      privateBalanceCache = {
+        payload: responsePayload,
+        updatedAt: Date.now(),
+      };
+      res.json(responsePayload);
+      // Successful sync — reset private failure state
+      privateSyncState.failCount = 0;
+      privateSyncState.backoffUntil = 0;
+      privateSyncState.authFailCount = 0;
+      privateSyncState.authBlockedUntil = 0;
     } catch (error: any) {
       const msg = String(error?.message || '');
       const statusCode = Number(error?.status || error?.httpCode || 0);
 
       if (isBinanceAuthErrorMessage(msg)) {
-        rateLimitState.authFailCount += 1;
-        const blockMs = Math.min(rateLimitState.authFailCount * 2 * 60 * 1000, MAX_AUTH_BLOCK_MS);
-        rateLimitState.authBlockedUntil = Date.now() + blockMs;
+        privateSyncState.authFailCount += 1;
+        const blockMs = Math.min(privateSyncState.authFailCount * 2 * 60 * 1000, MAX_AUTH_BLOCK_MS);
+        privateSyncState.authBlockedUntil = Date.now() + blockMs;
         return res.status(401).json({
           status: 'auth_failed',
           message: msg,
-          blockedUntil: rateLimitState.authBlockedUntil,
+          blockedUntil: privateSyncState.authBlockedUntil,
           retryAfterMs: blockMs,
         });
       }
@@ -1252,23 +1371,28 @@ async function startServer() {
         // Parse the 'banned until' timestamp from the error message if present
         const banMatch = msg.match(/banned until (\d+)/);
         if (banMatch) {
-          rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
-          console.error(`[TradeEdge RateLimit] IP ban detected — suppressing sync until ${new Date(rateLimitState.bannedUntil).toISOString()}`);
+          privateSyncState.backoffUntil = parseInt(banMatch[1], 10);
+          console.error(`[TradeEdge RateLimit] Private sync rate limited until ${new Date(privateSyncState.backoffUntil).toISOString()}`);
         } else {
           // No explicit ban time — apply exponential backoff
-          rateLimitState.failCount++;
-          const backoffMs = Math.min(Math.pow(2, rateLimitState.failCount) * 5000, MAX_BACKOFF_MS);
-          rateLimitState.backoffUntil = Date.now() + backoffMs;
-          console.error(`[TradeEdge RateLimit] Rate limited (attempt ${rateLimitState.failCount}) — backing off ${backoffMs / 1000}s`);
+          privateSyncState.failCount++;
+          const backoffMs = Math.min(Math.pow(2, privateSyncState.failCount) * 5000, MAX_BACKOFF_MS);
+          privateSyncState.backoffUntil = Date.now() + backoffMs;
+          console.error(`[TradeEdge RateLimit] Private sync rate limited (attempt ${privateSyncState.failCount}) — backing off ${backoffMs / 1000}s`);
         }
-        res.status(429).json({ status: 'rate_limited', message: msg, bannedUntil: rateLimitState.bannedUntil || rateLimitState.backoffUntil });
+        res.status(429).json({
+          status: 'private_rate_limited',
+          message: msg,
+          blockedUntil: privateSyncState.backoffUntil,
+          bannedUntil: privateSyncState.backoffUntil,
+        });
       } else {
         // Generic error — apply small backoff on repeated failures
-        rateLimitState.failCount++;
-        if (rateLimitState.failCount > 3) {
-          const backoffMs = Math.min(rateLimitState.failCount * 10000, MAX_BACKOFF_MS);
-          rateLimitState.backoffUntil = Date.now() + backoffMs;
-          console.warn(`[TradeEdge Sync] ${rateLimitState.failCount} consecutive failures — backing off ${backoffMs / 1000}s`);
+        privateSyncState.failCount++;
+        if (privateSyncState.failCount > 3) {
+          const backoffMs = Math.min(privateSyncState.failCount * 10000, MAX_BACKOFF_MS);
+          privateSyncState.backoffUntil = Date.now() + backoffMs;
+          console.warn(`[TradeEdge Sync] ${privateSyncState.failCount} consecutive failures — backing off ${backoffMs / 1000}s`);
         }
         console.error(`[TradeEdge Sync Error] ${msg}`);
         res.status(500).json({ status: 'error', message: msg });
@@ -1704,7 +1828,11 @@ async function startServer() {
       const forceBinancePublic = source === 'binance_public';
 
       if (forceBinancePublic) {
-        const blockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+        recordBinanceRouteHit('public.price', `symbol=${target}`);
+      }
+
+      if (forceBinancePublic) {
+        const blockedUntil = getPublicBlockedUntil();
         if (blockedUntil <= Date.now()) {
           const endpoints = [
             `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${target}`,
@@ -1721,8 +1849,8 @@ async function startServer() {
             if (response.status === 418 || response.status === 429) {
               const body: any = await response.json().catch(() => ({}));
               const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
-              if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
-              else rateLimitState.backoffUntil = Date.now() + 60000;
+              if (banMatch) publicRateLimitState.bannedUntil = parseInt(banMatch[1], 10);
+              else publicRateLimitState.backoffUntil = Date.now() + 60000;
               break;
             }
           }
@@ -1836,6 +1964,9 @@ async function startServer() {
       const targetSymbol = String(symbol || '').toUpperCase();
       const targetInterval = String(interval || '1d');
       const targetLimit = Math.max(1, Number(limit) || 500);
+      if (forceBinancePublic) {
+        recordBinanceRouteHit('public.klines', `symbol=${targetSymbol} interval=${targetInterval} limit=${targetLimit}`);
+      }
       const cacheMode = forceBinancePublic ? 'binance_public' : 'hybrid';
       const cacheKey = getPublicKlineCacheKey(targetSymbol, targetInterval, targetLimit, cacheMode);
       const cacheTtlMs = getPublicKlineCacheTtlMs(targetInterval);
@@ -1874,7 +2005,7 @@ async function startServer() {
 
         if (forceBinancePublic) {
           const nowPublic = Date.now();
-          const blockedUntilPublic = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+          const blockedUntilPublic = getPublicBlockedUntil();
           if (blockedUntilPublic > nowPublic) {
             const staleCached = getCachedPublicKlines(cacheKey, PUBLIC_KLINE_STALE_WHILE_BLOCKED_MS);
             if (staleCached) {
@@ -1912,8 +2043,8 @@ async function startServer() {
               if (response.status === 418 || response.status === 429) {
                 const body: any = await response.json().catch(() => ({}));
                 const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
-                if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
-                else rateLimitState.backoffUntil = Date.now() + 60000;
+                if (banMatch) publicRateLimitState.bannedUntil = parseInt(banMatch[1], 10);
+                else publicRateLimitState.backoffUntil = Date.now() + 60000;
                 console.warn(`[TradeEdge RateLimit] klines Binance public source rate limited`);
                 break;
               }
@@ -1935,7 +2066,7 @@ async function startServer() {
             return res.json(fetched.payload);
           }
 
-          setPublicSourceHeaders(res, 'BINANCE_PUBLIC_FAILED', false, Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil));
+          setPublicSourceHeaders(res, 'BINANCE_PUBLIC_FAILED', false, getPublicBlockedUntil());
           return res.json([]);
         }
 
@@ -1953,7 +2084,7 @@ async function startServer() {
         // Bybit failed — fall back to Binance
         console.log(`[TradeEdge] klines: Bybit returned no data for ${targetSymbol}, falling back to Binance`);
         const now2 = Date.now();
-        const blockedUntil2 = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+        const blockedUntil2 = getPublicBlockedUntil();
         if (blockedUntil2 > now2) return res.json([]);
 
         const endpoints = [
@@ -1975,8 +2106,8 @@ async function startServer() {
           if (response.status === 418 || response.status === 429) {
             const body: any = await response.json().catch(() => ({}));
             const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
-            if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
-            else rateLimitState.backoffUntil = Date.now() + 60000;
+            if (banMatch) publicRateLimitState.bannedUntil = parseInt(banMatch[1], 10);
+            else publicRateLimitState.backoffUntil = Date.now() + 60000;
             console.warn(`[TradeEdge RateLimit] klines Binance fallback also rate limited`);
             break;
           }
@@ -1994,6 +2125,9 @@ async function startServer() {
     try {
       const source = String(req.query.source || '').toLowerCase();
       const forceBinancePublic = source !== 'bybit';
+      if (forceBinancePublic) {
+        recordBinanceRouteHit('public.exchangeInfo', `spot=${String(req.query.includeSpot || '0')} futures=${String(req.query.includeFutures || '1')}`);
+      }
       const usePrivateGemini = preferGemini() && hasConfiguredKeys();
       if (usePrivateGemini) {
         const client = getExchange();
@@ -2017,7 +2151,7 @@ async function startServer() {
         const cacheKey = `${includeSpot ? '1' : '0'}_${includeFutures ? '1' : '0'}`;
         const cachedExchangeInfo = publicExchangeInfoCache.get(cacheKey);
         const now = Date.now();
-        const blockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+        const blockedUntil = getPublicBlockedUntil();
         if (forceBinancePublic && blockedUntil > now) {
           if (cachedExchangeInfo?.symbols?.length) {
             logWithThrottle('warn', `exchangeInfo-cache-${cacheKey}`, `[TradeEdge] exchangeInfo: Binance public blocked, serving cached metadata (${cachedExchangeInfo.symbols.length} symbols)`, 60000);
@@ -2039,10 +2173,10 @@ async function startServer() {
           if (response.status === 418 || response.status === 429) {
             const body: any = await response.json().catch(() => ({}));
             const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
-            if (banMatch) rateLimitState.bannedUntil = parseInt(banMatch[1], 10);
-            else rateLimitState.backoffUntil = Date.now() + 60000;
+            if (banMatch) publicRateLimitState.bannedUntil = parseInt(banMatch[1], 10);
+            else publicRateLimitState.backoffUntil = Date.now() + 60000;
             console.warn(`[TradeEdge RateLimit] exchangeInfo rate limited (${marketType}) — suppressing`);
-            const newBlockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+            const newBlockedUntil = getPublicBlockedUntil();
             if (cachedExchangeInfo?.symbols?.length) {
               logWithThrottle('warn', `exchangeInfo-cache-${cacheKey}`, `[TradeEdge] exchangeInfo: Binance public rate limited, serving cached metadata (${cachedExchangeInfo.symbols.length} symbols)`, 60000);
               setPublicSourceHeaders(res, 'BINANCE_PUBLIC', true);
@@ -2051,6 +2185,22 @@ async function startServer() {
             }
             res.status(429).json({ status: 'rate_limited', symbols: [], bannedUntil: newBlockedUntil });
             return;
+          }
+          if (response.status === 451) {
+            if (marketType === 'futures') {
+              const fallbackSymbols = cachedExchangeInfo?.symbols?.length
+                ? cachedExchangeInfo.symbols.map((symbol: any) => ({ ...symbol, marketType: symbol.marketType || 'futures' }))
+                : loadFallbackFuturesExchangeInfo();
+              if (fallbackSymbols.length > 0) {
+                logWithThrottle('warn', 'exchangeInfo-futures-451-fallback', `[TradeEdge] exchangeInfo: Binance futures blocked by location, serving fallback futures metadata (${fallbackSymbols.length} symbols)`, 60000);
+                fallbackSymbols.forEach((s: any) => mergedSymbols.push({ ...s, marketType: 'futures' }));
+                return;
+              }
+            }
+            if (marketType === 'spot') {
+              logWithThrottle('warn', 'exchangeInfo-spot-451-skip', '[TradeEdge] exchangeInfo: Binance spot blocked by location, skipping spot metadata for this response', 60000);
+              return;
+            }
           }
           throw new Error(`Binance exchangeInfo failed (${marketType})`);
         };
@@ -2097,6 +2247,9 @@ async function startServer() {
     try {
       const source = String(req.query.source || '').toLowerCase();
       const forceBinancePublic = source !== 'bybit';
+      if (forceBinancePublic) {
+        recordBinanceRouteHit('public.ticker24hr', 'source=binance_public');
+      }
       const usePrivateGemini = preferGemini() && hasConfiguredKeys();
       if (usePrivateGemini) {
         const client = getExchange();
@@ -2110,7 +2263,7 @@ async function startServer() {
         return res.json(mapped);
       } else {
         if (forceBinancePublic) {
-          const blockedUntil = Math.max(rateLimitState.bannedUntil, rateLimitState.backoffUntil);
+          const blockedUntil = getPublicBlockedUntil();
           if (blockedUntil > Date.now()) {
             if (publicTicker24hCache?.rows?.length) {
               logWithThrottle('warn', 'ticker24hr-cache', `[TradeEdge] ticker24hr: Binance public blocked, serving cached 24h stats (${publicTicker24hCache.rows.length} rows)`, 60000);
@@ -2132,6 +2285,13 @@ async function startServer() {
             }
             setPublicSourceHeaders(res, 'BINANCE_PUBLIC');
             return res.json(rows);
+          }
+          if (response.status === 418 || response.status === 429) {
+            const body: any = await response.json().catch(() => ({}));
+            const banMatch = String(body?.msg || '').match(/banned until (\d+)/);
+            if (banMatch) publicRateLimitState.bannedUntil = parseInt(banMatch[1], 10);
+            else publicRateLimitState.backoffUntil = Date.now() + 60000;
+            console.warn('[TradeEdge RateLimit] ticker24hr Binance public rate limited');
           }
           const bybitTickers = await fetchBybitTickers();
           if (bybitTickers.length > 0) {

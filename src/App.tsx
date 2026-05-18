@@ -99,6 +99,10 @@ const normalizeLiveFuturesSymbol = (raw: string) => {
   return normalized.endsWith('USD') && !normalized.endsWith('USDT') ? `${normalized}T` : normalized;
 };
 
+const countNormalizedLiveSymbols = (symbols: Array<{ value: string }>) => {
+  return new Set(symbols.map((symbol) => normalizeLiveFuturesSymbol(symbol.value))).size;
+};
+
 const getDirectionalEntryScore = (side: 'BUY' | 'SELL', score: number) => {
   return side === 'SELL' ? 10 - score : score;
 };
@@ -497,6 +501,11 @@ export default function App() {
     priorityRank: number;
   };
 
+  type ScanPreFilterEntry = {
+    symbol: string;
+    reason: string;
+  };
+
   type RejectReasonGroup = {
     reason: string;
     count: number;
@@ -643,6 +652,11 @@ export default function App() {
     } else {
       localStorage.removeItem(RATE_LIMIT_UNTIL_KEY);
     }
+  }, []);
+
+  const privateSyncBlockedUntilRef = React.useRef(0);
+  const setPrivateSyncBlockedUntil = React.useCallback((until: number) => {
+    privateSyncBlockedUntilRef.current = until > Date.now() ? until : 0;
   }, []);
 
   React.useEffect(() => {
@@ -847,7 +861,7 @@ export default function App() {
     if (isSyncingRef.current) return false;
     if (rateLimitedUntilRef.current > Date.now()) {
       const retryTime = new Date(rateLimitedUntilRef.current).toLocaleTimeString();
-      const message = `BINANCE RATE LIMITED: IP temporarily banned by Binance. Retry at ${retryTime}. (Too many API requests were made recently.)`;
+      const message = `PUBLIC BINANCE RATE LIMITED: market-data requests are cooling down until ${retryTime}. Private account sync is paused until the public cooldown clears.`;
       const now = Date.now();
       const shouldNotify = now - lastRateLimitWarnAtRef.current > 30000;
       reportSyncError(message);
@@ -856,6 +870,12 @@ export default function App() {
         setExecutionFeedback({ type: 'warning', message });
         addLog(message, 'warning');
       }
+      return false;
+    }
+    if (privateSyncBlockedUntilRef.current > Date.now()) {
+      const retryTime = new Date(privateSyncBlockedUntilRef.current).toLocaleTimeString();
+      const message = `PRIVATE BINANCE SYNC COOLING DOWN: account sync retries are paused until ${retryTime}.`;
+      reportSyncError(message);
       return false;
     }
     if (entryLockUntilRef.current > Date.now()) {
@@ -891,14 +911,23 @@ export default function App() {
           normalizedMessage.includes('whitelist') ||
           normalizedMessage.includes('enable futures');
 
-        if (resp.status === 429 || errorData.status === 'rate_limited') {
+        if (errorData.status === 'public_rate_limited') {
+          const blockedUntil: number = errorData.blockedUntil || (Date.now() + (errorData.retryAfterMs || 60000));
+          setRateLimitUntil(blockedUntil);
+          const retryTime = new Date(blockedUntil).toLocaleTimeString();
+          message = `PUBLIC BINANCE RATE LIMITED: market-data requests are cooling down until ${retryTime}. Private account sync is paused because the same outbound IP is still blocked.`;
+        } else if (errorData.status === 'private_rate_limited') {
+          const blockedUntil: number = errorData.blockedUntil || (Date.now() + (errorData.retryAfterMs || 60000));
+          setPrivateSyncBlockedUntil(blockedUntil);
+          const retryTime = new Date(blockedUntil).toLocaleTimeString();
+          message = `PRIVATE BINANCE SYNC RATE LIMITED: account-state polling is cooling down until ${retryTime}.`;
+        } else if (resp.status === 429 || errorData.status === 'rate_limited') {
           const bannedUntil: number = errorData.bannedUntil || (Date.now() + (errorData.retryAfterMs || 60000));
           setRateLimitUntil(bannedUntil);
           const retryTime = new Date(bannedUntil).toLocaleTimeString();
           message = `BINANCE RATE LIMITED: IP temporarily banned by Binance. Retry at ${retryTime}. (Too many API requests were made recently.)`;
         } else if (isAuthFailedStatus || isAuthError) {
-          const currentIp = serverConfig?.outboundIp || 'Unknown';
-          const retrySuffix = authRetryAt ? ` Retry at ${authRetryAt}.` : '';
+          setPrivateSyncBlockedUntil(0);
           message = authRetryAt
             ? `Live trading disabled until ${authRetryAt}`
             : `Live trading disabled until ${(new Date(authBlockedUntil || Date.now() + 60000)).toLocaleTimeString()}`;
@@ -906,7 +935,6 @@ export default function App() {
           setAutoTrade(false);
           if (hasAuthBlock) {
             setEntryLockUntil(authBlockedUntil);
-            setRateLimitUntil(authBlockedUntil);
           }
         } else if (message.includes('-1021')) {
           message = 'TIMESTAMP REJECTED. Your local clock may be out of sync with exchange servers.';
@@ -919,6 +947,7 @@ export default function App() {
       
       const data = await resp.json();
       if (data.status === 'success') {
+        setPrivateSyncBlockedUntil(0);
         const liveEquity = Number(data.equity);
         const usdt = Number(data?.balance?.USDT || 0);
         const liveAvailable = Number(data?.availableBalance);
@@ -1141,9 +1170,8 @@ export default function App() {
       const resp = await fetch('/api/health');
       if (resp.ok) {
         const data = await resp.json();
-        if (Number(data?.blockedUntil) > Date.now()) {
-          setRateLimitUntil(Number(data.blockedUntil));
-        }
+        setRateLimitUntil(Number(data?.publicBlockedUntil || data?.blockedUntil || 0));
+        setPrivateSyncBlockedUntil(Number(data?.privateBlockedUntil || 0));
         setServerStatus('OK');
         setServerConfig({
           ...data.config,
@@ -1157,7 +1185,7 @@ export default function App() {
     } catch {
       setServerStatus('ERROR');
     }
-  }, []);
+  }, [setPrivateSyncBlockedUntil, setRateLimitUntil]);
 
   const executeTrade = React.useCallback(async (type: 'BUY' | 'SELL', tradeSymbol: string, price: number, reason: string = 'Strategy Match', targetId?: string, cycleId?: number, tradePlan?: StrategySignal['tradePlan'], requestedAmount?: number) => {
     if (loading || !price) return;
@@ -1473,7 +1501,7 @@ export default function App() {
           try {
             while (verifyAttempts < 4 && !verified) {
               await new Promise(r => setTimeout(r, 600 + verifyAttempts * 400));
-              const verifyResp = await fetch('/api/binance/balance');
+              const verifyResp = await fetch('/api/binance/balance?fresh=1');
               if (verifyResp.ok) {
                 const verify = await verifyResp.json();
                 // If position-risk endpoint is degraded (-2015), skip verification and mark as filled immediately.
@@ -1625,7 +1653,7 @@ export default function App() {
         // Re-sync once and verify position state before marking FAILED.
         let verified = false;
         try {
-          const verifyResp = await fetch('/api/binance/balance');
+          const verifyResp = await fetch('/api/binance/balance?fresh=1');
           if (verifyResp.ok) {
             const verify = await verifyResp.json();
             const positions = verify?.positions || {};
@@ -2129,8 +2157,22 @@ export default function App() {
     deferredSignals: 0,
     topDeferred: [],
   });
+  const [scanPreFilterSummary, setScanPreFilterSummary] = useState<{
+    updatedAt: number;
+    excludedSymbols: number;
+    analyzedSymbols: number;
+    reasonCounts: Record<string, number>;
+    topExcluded: ScanPreFilterEntry[];
+  }>({
+    updatedAt: 0,
+    excludedSymbols: 0,
+    analyzedSymbols: 0,
+    reasonCounts: {},
+    topExcluded: [],
+  });
   const [filteredSyncSymbols, setFilteredSyncSymbols] = useState<Array<{ symbol: string; reason: string }>>([]);
   const [scanDataSource, setScanDataSource] = useState('BINANCE PUBLIC');
+  const [scanUniverseCounts, setScanUniverseCounts] = useState({ discovery: 0, liveTradableFutures: 0 });
   const [selectedRejectReason, setSelectedRejectReason] = useState<string | null>(null);
 
   const formatPrice = (price: number) => {
@@ -2542,8 +2584,12 @@ export default function App() {
             forceBinancePublic: true,
           }),
         ]);
-        allSymbols = universeSymbols;
+        const isLiveBinance = isRealMode && String(serverConfig?.exchange || '').toLowerCase() === 'binance';
+        allSymbols = isLiveBinance && !fullUniverseMode
+          ? futuresOnlySymbols
+          : universeSymbols;
         liveTradableSymbols = new Set(futuresOnlySymbols.map(s => normalizeLiveFuturesSymbol(s.value)));
+        setScanUniverseCounts({ discovery: universeSymbols.length, liveTradableFutures: liveTradableSymbols.size });
         setScanDataSource(formatScanSourceLabel());
         if (liveTradableSymbols.size > 0) {
           liveTradableSymbolsRef.current = liveTradableSymbols;
@@ -2587,11 +2633,36 @@ export default function App() {
       const baseSymbol = isRealMode ? liveNormalized(symbol) : symbol;
       const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
       const isLiveTradableFuturesSymbol = (value: string) => liveTradableSymbols.has(normalizeLiveFuturesSymbol(value));
+      const preScanExcluded: ScanPreFilterEntry[] = [];
       let symbolsToScan = isLiveBinance
-        ? Array.from(new Set(candidateValues)).filter(value => isLikelyBinanceSymbol(value) && hasTradableBase(value))
+        ? Array.from(new Set(candidateValues)).filter(value => {
+            if (!isLikelyBinanceSymbol(value)) {
+              preScanExcluded.push({ symbol: value, reason: 'invalid symbol format' });
+              return false;
+            }
+            if (!hasTradableBase(value)) {
+              preScanExcluded.push({ symbol: value, reason: 'quote asset treated as cash' });
+              return false;
+            }
+            if (!fullUniverseMode && !hasAllowedQuote(value)) {
+              preScanExcluded.push({ symbol: value, reason: `outside focused quote universe [${liveQuoteAllowlist.join(', ')}]` });
+              return false;
+            }
+            return true;
+          })
         : Array.from(new Set([baseSymbol, ...candidateValues]));
 
       if (symbolsToScan.length === 0) {
+        setScanPreFilterSummary({
+          updatedAt: Date.now(),
+          excludedSymbols: preScanExcluded.length,
+          analyzedSymbols: 0,
+          reasonCounts: preScanExcluded.reduce<Record<string, number>>((acc, entry) => {
+            acc[entry.reason] = (acc[entry.reason] || 0) + 1;
+            return acc;
+          }, {}),
+          topExcluded: preScanExcluded.slice(0, 6),
+        });
         setScanProgress({ current: 0, total: 0 });
         addLog('Scanner idle: no symbols available to scan.', 'warning');
         return;
@@ -2603,7 +2674,12 @@ export default function App() {
         baseSymbol,
         ...holdingsRef.current.map(h => h.symbol),
       ].filter(Boolean)));
-      const shortlistLimit = totalToScan;
+      const shortlistLimit = fullUniverseMode
+        ? totalToScan
+        : Math.min(totalToScan, Math.max(prioritySymbols.length, maxSymbolsPerScan));
+      let selectionExcluded: ScanPreFilterEntry[] = [];
+      let analyzedSymbols: string[] = [];
+      const selectionExclusionReason = 'not shortlisted this cycle';
       
       let lastLoggedCount = 0;
       const results = await scanMarket(
@@ -2622,6 +2698,11 @@ export default function App() {
         {
           shortlistLimit,
           prioritySymbols,
+          shortlistExclusionReason: selectionExclusionReason,
+          onSelectionComputed: (summary) => {
+            analyzedSymbols = summary.analyzedSymbols;
+            selectionExcluded = summary.excludedSymbols;
+          },
           onRateLimit: (retryAt) => {
             if (retryAt > Date.now()) {
               setRateLimitUntil(retryAt);
@@ -2629,6 +2710,17 @@ export default function App() {
           },
         },
       );
+      const combinedPreScanExcluded = [...preScanExcluded, ...selectionExcluded];
+      setScanPreFilterSummary({
+        updatedAt: Date.now(),
+        excludedSymbols: combinedPreScanExcluded.length,
+        analyzedSymbols: analyzedSymbols.length,
+        reasonCounts: combinedPreScanExcluded.reduce<Record<string, number>>((acc, entry) => {
+          acc[entry.reason] = (acc[entry.reason] || 0) + 1;
+          return acc;
+        }, {}),
+        topExcluded: combinedPreScanExcluded.slice(0, 6),
+      });
       setScanDataSource(formatScanSourceLabel());
 
       if ((!manual && !autoTradeRef.current) || rateLimitedUntilRef.current > Date.now()) {
@@ -2845,18 +2937,29 @@ export default function App() {
       if (serverStatus !== 'OK') return;
       if (!autoTradeRef.current || rateLimitedUntilRef.current > Date.now()) {
         setAvailableSymbols([]);
+        setScanUniverseCounts({ discovery: 0, liveTradableFutures: 0 });
         return;
       }
       try {
-        const all = await fetchAllSymbols({
-          includeSpot: true,
-          includeFutures: true,
-          fullUniverse: true,
-          allowedQuotes: liveQuoteAllowlist,
-          forceBinancePublic: true,
-        });
+        const [all, futuresOnly] = await Promise.all([
+          fetchAllSymbols({
+            includeSpot: true,
+            includeFutures: true,
+            fullUniverse: true,
+            allowedQuotes: liveQuoteAllowlist,
+            forceBinancePublic: true,
+          }),
+          fetchAllSymbols({
+            includeSpot: false,
+            includeFutures: true,
+            fullUniverse: true,
+            allowedQuotes: liveQuoteAllowlist,
+            forceBinancePublic: true,
+          }),
+        ]);
         setScanDataSource(formatScanSourceLabel());
         setAvailableSymbols(all);
+        setScanUniverseCounts({ discovery: all.length, liveTradableFutures: countNormalizedLiveSymbols(futuresOnly) });
         addLog(`Market Metadata: ${all.length} exchange vectors mapped.`, 'info');
       } catch (err: any) {
         const retryAt: number = err?.retryAt || 0;
@@ -3065,9 +3168,11 @@ export default function App() {
     return `Last completed scan at ${new Date(scanSignalSummary.updatedAt).toLocaleTimeString()}.`;
   })();
   const scanSourceHint = `Scan Source: ${scanDataSource}`;
+  const activeInspectionUniverseCount = fullUniverseMode ? scanUniverseCounts.discovery : scanUniverseCounts.liveTradableFutures;
   const scanUniverseHint = fullUniverseMode
-    ? `Full Universe Mode: scanning all Binance futures quotes; live entries remain restricted to ${liveQuoteAllowlist.join(', ')}.`
+    ? `Full Universe Mode: scanning the broader spot + futures metadata universe for discovery; live entries remain restricted to ${liveQuoteAllowlist.join(', ')}.`
     : `Focused quote universe: scanning all discovered symbols, but live entries remain restricted to ${liveQuoteAllowlist.join(', ')}.`;
+  const scanUniverseCountsHint = `Inspection Universe: ${activeInspectionUniverseCount} | Live Tradable Futures: ${scanUniverseCounts.liveTradableFutures}`;
   const scanCoverageHint = scanSignalSummary.updatedAt === 0
     ? 'Coverage: no completed scan yet.'
     : scanSignalSummary.notShortlisted > 0
@@ -3775,6 +3880,19 @@ export default function App() {
               </div>
             </div>
 
+            <div className="mb-4 grid grid-cols-2 gap-2 text-[10px] font-mono uppercase">
+              <div className="border border-sky-200 bg-sky-50/50 px-2 py-1">
+                <span className="opacity-50">Inspection Universe</span>
+                <p className="font-black text-[14px] text-sky-800">{activeInspectionUniverseCount}</p>
+                <p className="text-[9px] opacity-50">Current scan denominator</p>
+              </div>
+              <div className="border border-violet-200 bg-violet-50/50 px-2 py-1">
+                <span className="opacity-50">Live Tradable Futures</span>
+                <p className="font-black text-[14px] text-violet-800">{scanUniverseCounts.liveTradableFutures}</p>
+                <p className="text-[9px] opacity-50">Execution-safe entry set</p>
+              </div>
+            </div>
+
             <div className="grid grid-cols-4 gap-2 text-[10px] font-mono uppercase">
               <div className="border border-gray-200 px-2 py-1">
                 <span className="opacity-50">Attempted</span>
@@ -3801,6 +3919,7 @@ export default function App() {
             <p className="mt-2 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanStatusHint}</p>
             <p className="mt-1 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanSourceHint}</p>
             <p className="mt-1 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanUniverseHint}</p>
+            <p className="mt-1 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanUniverseCountsHint}</p>
             <p className="mt-1 text-[10px] font-mono uppercase tracking-wide text-gray-500">{scanCoverageHint}</p>
             {filteredSyncNote && (
               <div className="mt-2 border border-amber-200 bg-amber-50/80 px-3 py-2 text-[10px] font-mono text-amber-900">
@@ -3857,22 +3976,24 @@ export default function App() {
                 <span>Why Coins Were Rejected</span>
                 <span>{rejectReasonGroups.length > 0 ? `${rejectReasonGroups.length} rejection reasons` : 'No rejection data yet'}</span>
               </div>
-              {rejectReasonGroups.length === 0 ? (
-                <p className="mt-2 text-[10px] normal-case tracking-normal text-gray-700/70">
-                  No aggregated HOLD rejection reasons are available yet for this session.
-                </p>
-              ) : (
-                <div className="mt-2 space-y-3">
-                  <div className="overflow-x-auto border border-gray-200 bg-white/70">
-                    <table className="min-w-full border-collapse text-left text-[9px] uppercase">
-                      <thead className="bg-gray-100/80 text-gray-700">
+              <div className="mt-2 space-y-3">
+                <div className="overflow-x-auto border border-gray-200 bg-white/70">
+                  <table className="min-w-full border-collapse text-left text-[9px] uppercase">
+                    <thead className="bg-gray-100/80 text-gray-700">
+                      <tr>
+                        <th className="border-b border-gray-200 px-2 py-2">Reject Reason</th>
+                        <th className="border-b border-gray-200 px-2 py-2 text-right">Coins</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rejectReasonGroups.length === 0 ? (
                         <tr>
-                          <th className="border-b border-gray-200 px-2 py-2">Reject Reason</th>
-                          <th className="border-b border-gray-200 px-2 py-2 text-right">Coins</th>
+                          <td colSpan={2} className="border-b border-gray-200 px-2 py-3 text-[9px] normal-case tracking-normal text-gray-700/70">
+                            No aggregated HOLD rejection reasons are available yet for this session. HOLD count in the last scan: {scanSignalSummary.hold}.
+                          </td>
                         </tr>
-                      </thead>
-                      <tbody>
-                        {rejectReasonGroups.map((group) => {
+                      ) : (
+                        rejectReasonGroups.map((group) => {
                           const isSelected = group.reason === selectedRejectReason;
                           return (
                             <tr key={`reject-reason-row-${group.reason}`} className={isSelected ? 'bg-amber-50/80' : 'bg-white/40'}>
@@ -3888,44 +4009,79 @@ export default function App() {
                               </td>
                             </tr>
                           );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
 
-                  {selectedRejectReasonGroup ? (
-                    <div className="border border-amber-200 bg-amber-50/60 px-2 py-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-[9px] text-amber-950">{selectedRejectReasonGroup.reason}</span>
-                        <button
-                          type="button"
-                          onClick={() => setSelectedRejectReason(null)}
-                          className="text-[9px] font-black text-amber-800 hover:text-amber-950"
-                        >
-                          Close
-                        </button>
-                      </div>
-                      <p className="mt-1 text-[9px] normal-case tracking-normal text-amber-900/75">
-                        {selectedRejectReasonGroup.count} coins were rejected for this reason. Click another count in the table to switch groups.
-                      </p>
-                      <div className="mt-2 max-h-52 overflow-y-auto space-y-2">
-                        {selectedRejectReasonGroup.symbols.map((entry) => (
-                          <div key={`reject-symbol-${selectedRejectReasonGroup.reason}-${entry.symbol}`} className="border border-amber-200 bg-white/70 px-2 py-2">
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="font-black text-[11px] text-amber-950">{entry.symbol}</span>
-                              <span className="text-[9px] text-amber-900/70">
-                                score {entry.score.toFixed(1)} | rank {entry.priorityRank.toFixed(2)} | MACD {entry.macdScore.toFixed(1)}
-                              </span>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
+                {selectedRejectReasonGroup ? (
+                  <div className="border border-amber-200 bg-amber-50/60 px-2 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[9px] text-amber-950">{selectedRejectReasonGroup.reason}</span>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedRejectReason(null)}
+                        className="text-[9px] font-black text-amber-800 hover:text-amber-950"
+                      >
+                        Close
+                      </button>
                     </div>
-                  ) : (
-                    <p className="text-[10px] normal-case tracking-normal text-gray-700/70">
-                      Click a count in the table to see every coin rejected for that reason.
+                    <p className="mt-1 text-[9px] normal-case tracking-normal text-amber-900/75">
+                      {selectedRejectReasonGroup.count} coins were rejected for this reason. Click another count in the table to switch groups.
                     </p>
-                  )}
+                    <div className="mt-2 max-h-52 overflow-y-auto space-y-2">
+                      {selectedRejectReasonGroup.symbols.map((entry) => (
+                        <div key={`reject-symbol-${selectedRejectReasonGroup.reason}-${entry.symbol}`} className="border border-amber-200 bg-white/70 px-2 py-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-black text-[11px] text-amber-950">{entry.symbol}</span>
+                            <span className="text-[9px] text-amber-900/70">
+                              score {entry.score.toFixed(1)} | rank {entry.priorityRank.toFixed(2)} | MACD {entry.macdScore.toFixed(1)}
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-[10px] normal-case tracking-normal text-gray-700/70">
+                    {rejectReasonGroups.length > 0
+                      ? 'Click a count in the table to see every coin rejected for that reason.'
+                      : 'The table stays visible so you can tell the panel loaded even when no grouped reasons were captured.'}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="mt-3 border border-orange-200 bg-orange-50/60 px-3 py-2 text-[10px] font-mono uppercase">
+              <div className="flex items-center justify-between text-orange-900/80">
+                <span>Excluded Before Analysis</span>
+                <span>{scanPreFilterSummary.excludedSymbols > 0 ? `${scanPreFilterSummary.excludedSymbols} skipped` : 'No pre-scan exclusions'}</span>
+              </div>
+              {scanPreFilterSummary.excludedSymbols > 0 && (
+                <p className="mt-1 text-[9px] normal-case tracking-normal text-orange-900/70">
+                  analyzed {scanPreFilterSummary.analyzedSymbols} this cycle | {Object.entries(scanPreFilterSummary.reasonCounts)
+                    .sort((a, b) => b[1] - a[1])
+                    .slice(0, 3)
+                    .map(([reason, count]) => `${count} ${reason}`)
+                    .join(' | ')}
+                </p>
+              )}
+              {scanPreFilterSummary.topExcluded.length === 0 ? (
+                <p className="mt-2 text-[10px] normal-case tracking-normal text-orange-900/70">
+                  No symbols were filtered out before indicator analysis in the last scan cycle.
+                </p>
+              ) : (
+                <div className="mt-2 space-y-2">
+                  {scanPreFilterSummary.topExcluded.map((entry) => (
+                    <div key={`prescan-${entry.symbol}-${entry.reason}`} className="border border-orange-200 bg-white/60 px-2 py-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-black text-[11px] text-orange-950">{entry.symbol}</span>
+                        <span className="text-[9px] text-orange-900/70">excluded before signals</span>
+                      </div>
+                      <div className="mt-1 text-[9px] text-orange-900/75">{entry.reason}</div>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
@@ -4141,7 +4297,7 @@ export default function App() {
              <div className="absolute top-0 right-0 p-2 opacity-5">
               <ShieldAlert size={120} strokeWidth={1} />
             </div>
-            
+
             <h2 className="font-mono text-[12px] uppercase tracking-[0.3em] mb-6 flex items-center gap-2 border-b border-white/10 pb-2">
               Risk Guard
             </h2>
@@ -4185,7 +4341,7 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label className="text-[12px] uppercase font-bold opacity-60 mb-1 block text-emerald-400">Take Profit (Policy: 15%)</label>
+                  <label className="text-[12px] uppercase font-bold opacity-60 mb-1 block text-emerald-400">Take Profit Target</label>
                   <input 
                     type="range" 
                     min="1" 
@@ -4305,7 +4461,7 @@ export default function App() {
                   <div className="flex items-center justify-between rounded-sm border border-amber-300/40 bg-amber-500/10 px-3 py-2">
                     <div className="flex flex-col">
                       <span className="text-[12px] uppercase tracking-wide text-amber-200">Full Universe Mode</span>
-                      <span className="text-[10px] text-amber-100/70">Scans spot + futures across all quote assets and ignores Max Symbols / Scan. Slower, much higher rate-limit risk.</span>
+                      <span className="text-[10px] text-amber-100/70">Full Universe Mode inspects the broader spot + futures metadata set for discovery, but live Binance entries still remain restricted to the futures tradable universe. Slower, much higher rate-limit risk.</span>
                     </div>
                     <button
                       type="button"
@@ -4399,9 +4555,6 @@ export default function App() {
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Live Entry Delay (ms)" detail={CRITERIA_HELP.liveEntryDelayMs} />
                       <input type="number" min="0" step="50" value={liveEntryDelayMs} onChange={(e) => setLiveEntryDelayMs(Math.max(0, parseInt(e.target.value, 10) || 0))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
-                    </label>
-                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Live Entries / Cycle" detail={CRITERIA_HELP.liveEntriesPerCycle} />
-                      <input type="number" min="1" step="1" value={liveEntriesPerCycle} onChange={(e) => setLiveEntriesPerCycle(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Min Paper Allocation" detail={CRITERIA_HELP.minPaperAllocation} />
                       <input type="number" min="1" step="1" value={minPaperAllocation} onChange={(e) => setMinPaperAllocation(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />

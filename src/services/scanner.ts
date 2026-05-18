@@ -20,6 +20,13 @@ type ScanMarketOptions = {
   shortlistLimit?: number;
   prioritySymbols?: string[];
   onRateLimit?: (retryAt: number) => void;
+  batchSize?: number;
+  interBatchDelayMs?: number;
+  shortlistExclusionReason?: string;
+  onSelectionComputed?: (summary: {
+    analyzedSymbols: string[];
+    excludedSymbols: Array<{ symbol: string; reason: string }>;
+  }) => void;
 };
 
 const MIN_SCAN_CANDLE_COUNT = 51;
@@ -93,13 +100,34 @@ export async function scanMarket(
   options?: ScanMarketOptions,
 ): Promise<MarketScanResult[]> {
   const results: MarketScanResult[] = [];
-  const batchSize = 3;
-  const interBatchDelayMs = 550;
+  const preShortlistExcluded: Array<{ symbol: string; reason: string }> = [];
+  const batchSize = Math.max(1, Math.min(5, options?.batchSize || 3));
+  const interBatchDelayMs = Math.max(250, options?.interBatchDelayMs || 550);
   let rateLimitedUntil = 0;
   const tickerStats = await fetchTicker24hStats({ forceBinancePublic: true });
   const prioritySymbols = new Set((options?.prioritySymbols || []).map(symbol => String(symbol || '').toUpperCase()).filter(Boolean));
   const shortlistLimit = Math.max(prioritySymbols.size, Math.min(symbols.length, options?.shortlistLimit || symbols.length));
-  const rankedSymbols = [...symbols].sort((a, b) => {
+  const shortlistExclusionReason = options?.shortlistExclusionReason || 'not shortlisted this cycle';
+  const eligibleSymbols = [...symbols].filter((symbol) => {
+    const normalized = symbol.toUpperCase();
+    if (prioritySymbols.has(normalized)) {
+      return true;
+    }
+
+    const stats = tickerStats.get(normalized);
+    const quoteVolume = Math.max(0, stats?.quoteVolume || 0);
+    if (quoteVolume > 0) {
+      return true;
+    }
+
+    preShortlistExcluded.push({
+      symbol,
+      reason: 'no recent ticker volume',
+    });
+    return false;
+  });
+
+  const rankedSymbols = eligibleSymbols.sort((a, b) => {
     const aPriority = prioritySymbols.has(a.toUpperCase()) ? 1 : 0;
     const bPriority = prioritySymbols.has(b.toUpperCase()) ? 1 : 0;
     if (aPriority !== bPriority) return bPriority - aPriority;
@@ -115,6 +143,16 @@ export async function scanMarket(
     return bMove - aMove;
   });
   const symbolsToAnalyze = rankedSymbols.slice(0, shortlistLimit);
+  options?.onSelectionComputed?.({
+    analyzedSymbols: symbolsToAnalyze,
+    excludedSymbols: [
+      ...preShortlistExcluded,
+      ...rankedSymbols.slice(shortlistLimit).map(symbol => ({
+        symbol,
+        reason: shortlistExclusionReason,
+      })),
+    ],
+  });
   const canContinue = () => rateLimitedUntil <= Date.now() && (!shouldContinue || shouldContinue());
   
   for (let i = 0; i < symbolsToAnalyze.length; i += batchSize) {
