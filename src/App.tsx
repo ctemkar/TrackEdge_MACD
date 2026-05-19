@@ -2,9 +2,9 @@ import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { TrendingUp, Activity, ShieldAlert, ShieldCheck, Info, Wallet, DollarSign, ArrowUpRight, ArrowDownRight, Search, Zap, Loader2, History, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { fetchBinanceData, fetchLatestPrice, subscribeToTicker, fetchAllSymbols, fetchTopSymbolsByVolume, getPublicDataSourceSnapshot } from './services/binance';
+import { fetchBinanceData, fetchLatestPrice, subscribeToTicker, fetchAllSymbols, fetchTopSymbolsByVolume, fetchTicker24hStats, getPublicDataSourceSnapshot } from './services/binance';
 import { calculateIndicators, evaluateStrategy, Candle, DEFAULT_STRATEGY_CONFIG, IndicatorResult, StrategyConfig, StrategySignal } from './services/indicators';
-import { scanMarket, MarketScanResult } from './services/scanner';
+import { scanMarket, MarketScanResult, getLowHistorySnapshot } from './services/scanner';
 import { BacktestModule } from './components/BacktestModule';
 
 const STRATEGY_SIGNAL_INTERVAL = '1d';
@@ -72,7 +72,7 @@ const PARAMETER_DEFAULTS = {
   minEdgeAfterFrictionPct: 0.35,
   estimatedRoundTripFrictionBps: 18,
   symbolDailyLossLimit: 12,
-  symbolDailyFlipLimit: 5,
+  symbolDailyFlipLimit: 8,
   liveQuoteAllowlistInput: DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT,
   scanIntervalSec: 40,
   holdingPollIntervalSec: 10,
@@ -744,6 +744,11 @@ export default function App() {
   const liveTradableSymbolsRef = React.useRef<Set<string>>(new Set());
   const liveTradableSymbolsFetchedAtRef = React.useRef(0);
 
+  const isManualLiquidationReason = React.useCallback((reason: string | undefined) => {
+    const normalizedReason = String(reason || '').toUpperCase();
+    return normalizedReason.includes('EMERGENCY_LIQUIDATION') || normalizedReason.includes('MANUAL_DOCK_CONTROL');
+  }, []);
+
   const symbolRiskSummary = React.useMemo(() => {
     const now = Date.now();
     const tradingDayStart = getTradingDayStart(now);
@@ -783,6 +788,7 @@ export default function App() {
       const status = trade.status || 'FILLED';
       if (status !== 'FILLED' && status !== 'SYNC_REMOVED') continue;
       if (typeof trade.pnl !== 'number') continue;
+      if (isManualLiquidationReason(trade.reason)) continue;
 
       const summary = ensureSummary(symbolKey);
       if (!summary) continue;
@@ -807,7 +813,7 @@ export default function App() {
     }
 
     return summaries;
-  }, [tradeHistory, hardReentryCooldownMinutes, symbolDailyFlipLimit, symbolDailyLossLimit]);
+  }, [tradeHistory, hardReentryCooldownMinutes, symbolDailyFlipLimit, symbolDailyLossLimit, isManualLiquidationReason]);
 
   const getSymbolRiskBlock = React.useCallback((rawSymbol: string, at: number = Date.now()) => {
     const { key } = getSymbolRiskIdentity(rawSymbol);
@@ -2515,6 +2521,8 @@ export default function App() {
     hold: 0,
     notShortlisted: 0,
     unavailable: 0,
+    insufficientHistoryUnavailable: 0,
+    otherUnavailable: 0,
     updatedAt: 0,
   });
   const [scanBlockedSummary, setScanBlockedSummary] = useState<{
@@ -3056,6 +3064,11 @@ export default function App() {
       const normalizedLiveExchange = String(serverConfig?.exchange || '').toLowerCase();
       const isLiveBinance = isRealMode && normalizedLiveExchange === 'binance';
       const baseSymbol = isRealMode ? liveNormalized(symbol) : symbol;
+      const prioritySymbols = Array.from(new Set([
+        baseSymbol,
+        ...holdingsRef.current.map(h => h.symbol),
+      ].filter(Boolean)));
+      const prioritySymbolSet = new Set(prioritySymbols.map(value => String(value || '').toUpperCase()));
       const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
       const isLiveTradableFuturesSymbol = (value: string) => liveTradableSymbols.has(normalizeLiveFuturesSymbol(value));
       const preScanExcluded: ScanPreFilterEntry[] = [];
@@ -3077,6 +3090,30 @@ export default function App() {
           })
         : Array.from(new Set([baseSymbol, ...candidateValues]));
 
+      const tickerStats = await fetchTicker24hStats({ forceBinancePublic: true });
+      symbolsToScan = symbolsToScan.filter((value) => {
+        const normalized = String(value || '').toUpperCase();
+        if (!normalized) return false;
+        if (prioritySymbolSet.has(normalized)) return true;
+
+        const lowHistorySnapshot = getLowHistorySnapshot(normalized);
+        if (lowHistorySnapshot) {
+          preScanExcluded.push({
+            symbol: value,
+            reason: `insufficient candle history (${lowHistorySnapshot.candles}/51)`,
+          });
+          return false;
+        }
+
+        const quoteVolume = Math.max(0, tickerStats.get(normalized)?.quoteVolume || 0);
+        if (quoteVolume <= 0) {
+          preScanExcluded.push({ symbol: value, reason: 'no recent ticker volume' });
+          return false;
+        }
+
+        return true;
+      });
+
       if (symbolsToScan.length === 0) {
         setScanPreFilterSummary({
           updatedAt: Date.now(),
@@ -3095,15 +3132,15 @@ export default function App() {
       
       const totalToScan = symbolsToScan.length;
       setScanProgress({ current: 0, total: totalToScan });
-      const prioritySymbols = Array.from(new Set([
-        baseSymbol,
-        ...holdingsRef.current.map(h => h.symbol),
-      ].filter(Boolean)));
       const shortlistLimit = fullUniverseMode
         ? totalToScan
         : Math.min(totalToScan, Math.max(prioritySymbols.length, maxSymbolsPerScan));
       let selectionExcluded: ScanPreFilterEntry[] = [];
       let analyzedSymbols: string[] = [];
+      let unavailableSummary = {
+        insufficientHistory: 0,
+        otherUnavailable: 0,
+      };
       const selectionExclusionReason = 'not shortlisted this cycle';
       
       let lastLoggedCount = 0;
@@ -3123,10 +3160,17 @@ export default function App() {
         {
           shortlistLimit,
           prioritySymbols,
+          tickerStats,
           shortlistExclusionReason: selectionExclusionReason,
           onSelectionComputed: (summary) => {
             analyzedSymbols = summary.analyzedSymbols;
             selectionExcluded = summary.excludedSymbols;
+          },
+          onUnavailableComputed: (summary) => {
+            unavailableSummary = {
+              insufficientHistory: summary.insufficientHistory,
+              otherUnavailable: summary.otherUnavailable,
+            };
           },
           onRateLimit: (retryAt) => {
             if (retryAt > Date.now()) {
@@ -3154,20 +3198,23 @@ export default function App() {
       }
 
       setMarketPicks(results);
+      const unavailableCount = unavailableSummary.insufficientHistory + unavailableSummary.otherUnavailable;
       const signalCounts = results.reduce((acc, row) => {
         const key = row.signal.overall;
         acc[key] = (acc[key] || 0) + 1;
         return acc;
       }, { BUY: 0, SELL: 0, HOLD: 0 } as Record<'BUY' | 'SELL' | 'HOLD', number>);
       setScanSignalSummary({
-        analyzed: results.length,
+        analyzed: results.length + unavailableCount,
         shortlisted: shortlistLimit,
         total: symbolsToScan.length,
         buy: signalCounts.BUY,
         sell: signalCounts.SELL,
         hold: signalCounts.HOLD,
         notShortlisted: Math.max(0, symbolsToScan.length - shortlistLimit),
-        unavailable: Math.max(0, shortlistLimit - results.length),
+        unavailable: unavailableCount,
+        insufficientHistoryUnavailable: unavailableSummary.insufficientHistory,
+        otherUnavailable: unavailableSummary.otherUnavailable,
         updatedAt: Date.now(),
       });
       const scanSummary = `SCAN SUMMARY: ${results.length}/${symbolsToScan.length} analyzed | BUY=${signalCounts.BUY} SELL=${signalCounts.SELL} HOLD=${signalCounts.HOLD}`;
@@ -3638,7 +3685,7 @@ export default function App() {
     : scanSignalSummary.notShortlisted > 0
       ? `Coverage: analyzed ${scanSignalSummary.analyzed}/${scanSignalSummary.shortlisted} shortlisted assets from ${scanSignalSummary.total} in universe; ${scanSignalSummary.notShortlisted} were not analyzed this cycle.`
       : scanSignalSummary.unavailable > 0
-        ? `Coverage: analyzed ${scanSignalSummary.analyzed}/${scanSignalSummary.shortlisted} shortlisted assets; ${scanSignalSummary.unavailable} returned no usable scan result.`
+        ? `Coverage: analyzed ${scanSignalSummary.analyzed}/${scanSignalSummary.shortlisted} shortlisted assets; ${scanSignalSummary.unavailable} returned no usable scan result (${scanSignalSummary.insufficientHistoryUnavailable} insufficient history, ${scanSignalSummary.otherUnavailable} other).`
         : `Coverage: analyzed ${scanSignalSummary.analyzed}/${scanSignalSummary.total} assets this cycle.`;
   const filteredSyncSymbolsPreview = filteredSyncSymbols.slice(0, 3).map((entry: { symbol: string; reason: string }) => entry.symbol).join(', ');
   const filteredSyncNote = filteredSyncSymbols.length > 0
@@ -4540,7 +4587,7 @@ export default function App() {
                 <span>Last Scan Summary</span>
                 <span>{scanSignalSummary.updatedAt ? new Date(scanSignalSummary.updatedAt).toLocaleTimeString() : '--:--:--'}</span>
               </div>
-              <div className="mt-2 grid grid-cols-4 gap-2">
+              <div className="mt-2 grid grid-cols-3 gap-2 md:grid-cols-6">
                 <div className="border border-indigo-200 bg-white/60 px-2 py-1">
                   <span className="opacity-50">Analyzed</span>
                   <p className="font-black text-[13px] text-indigo-800">{scanSignalSummary.analyzed}/{scanSignalSummary.total}</p>
@@ -4556,6 +4603,14 @@ export default function App() {
                 <div className="border border-gray-200 bg-gray-50/70 px-2 py-1">
                   <span className="opacity-50">HOLD</span>
                   <p className="font-black text-[13px] text-gray-700">{scanSignalSummary.hold}</p>
+                </div>
+                <div className="border border-amber-200 bg-amber-50/70 px-2 py-1">
+                  <span className="opacity-50">Insuff Hist</span>
+                  <p className="font-black text-[13px] text-amber-700">{scanSignalSummary.insufficientHistoryUnavailable}</p>
+                </div>
+                <div className="border border-slate-200 bg-slate-50/70 px-2 py-1">
+                  <span className="opacity-50">Other N/A</span>
+                  <p className="font-black text-[13px] text-slate-700">{scanSignalSummary.otherUnavailable}</p>
                 </div>
               </div>
             </div>

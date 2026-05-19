@@ -2,6 +2,8 @@ import { fetchBinanceData, fetchTicker24hStats } from './binance';
 import { Candle } from './indicators';
 import { calculateIndicators, evaluateStrategy, StrategyConfig, StrategySignal } from './indicators';
 
+export type ScanTickerStats = Map<string, { quoteVolume: number; priceChangePercent: number }>;
+
 export interface MarketScanResult {
   symbol: string;
   signal: StrategySignal;
@@ -23,9 +25,15 @@ type ScanMarketOptions = {
   batchSize?: number;
   interBatchDelayMs?: number;
   shortlistExclusionReason?: string;
+  tickerStats?: ScanTickerStats;
   onSelectionComputed?: (summary: {
     analyzedSymbols: string[];
     excludedSymbols: Array<{ symbol: string; reason: string }>;
+  }) => void;
+  onUnavailableComputed?: (summary: {
+    entries: Array<{ symbol: string; reason: string }>;
+    insufficientHistory: number;
+    otherUnavailable: number;
   }) => void;
 };
 
@@ -36,7 +44,7 @@ const LOW_HISTORY_SYMBOL_TTL_MS = 6 * 60 * 60 * 1000;
 
 const lowHistorySymbols = new Map<string, { until: number; candles: number }>();
 
-function getLowHistorySnapshot(symbol: string): { until: number; candles: number } | null {
+export function getLowHistorySnapshot(symbol: string): { until: number; candles: number } | null {
   const normalized = String(symbol || '').toUpperCase();
   if (!normalized) return null;
   const snapshot = lowHistorySymbols.get(normalized);
@@ -128,11 +136,12 @@ export async function scanMarket(
   options?: ScanMarketOptions,
 ): Promise<MarketScanResult[]> {
   const results: MarketScanResult[] = [];
+  const unavailableEntries: Array<{ symbol: string; reason: string }> = [];
   const preShortlistExcluded: Array<{ symbol: string; reason: string }> = [];
   const batchSize = Math.max(1, Math.min(5, options?.batchSize || 3));
   const interBatchDelayMs = Math.max(250, options?.interBatchDelayMs || 550);
   let rateLimitedUntil = 0;
-  const tickerStats = await fetchTicker24hStats({ forceBinancePublic: true });
+  const tickerStats = options?.tickerStats || await fetchTicker24hStats({ forceBinancePublic: true });
   const prioritySymbols = new Set((options?.prioritySymbols || []).map(symbol => String(symbol || '').toUpperCase()).filter(Boolean));
   const shortlistLimit = Math.max(prioritySymbols.size, Math.min(symbols.length, options?.shortlistLimit || symbols.length));
   const shortlistExclusionReason = options?.shortlistExclusionReason || 'not shortlisted this cycle';
@@ -235,6 +244,14 @@ export async function scanMarket(
             priorityRank: computeProfitabilityRank(baseResult),
           };
         }
+
+        const lowHistorySnapshot = getLowHistorySnapshot(symbol);
+        unavailableEntries.push({
+          symbol,
+          reason: lowHistorySnapshot
+            ? `insufficient candle history (${lowHistorySnapshot.candles}/${MIN_SCAN_CANDLE_COUNT})`
+            : 'no usable scan result',
+        });
       } catch (e) {
         const retryAt = Number((e as any)?.retryAt || 0);
         if (retryAt > Date.now()) {
@@ -242,6 +259,10 @@ export async function scanMarket(
           options?.onRateLimit?.(retryAt);
           return null;
         }
+        unavailableEntries.push({
+          symbol,
+          reason: 'scan fetch failed',
+        });
         console.error(`Scanner error for ${symbol}:`, e);
       }
       return null;
@@ -255,6 +276,12 @@ export async function scanMarket(
     const jitterMs = Math.floor(Math.random() * 120);
     await new Promise(resolve => setTimeout(resolve, interBatchDelayMs + jitterMs));
   }
+
+  options?.onUnavailableComputed?.({
+    entries: unavailableEntries,
+    insufficientHistory: unavailableEntries.filter((entry) => entry.reason.startsWith('insufficient candle history')).length,
+    otherUnavailable: unavailableEntries.filter((entry) => !entry.reason.startsWith('insufficient candle history')).length,
+  });
   
   return results.sort((a, b) => {
     const profitabilityDelta = (b.priorityRank || 0) - (a.priorityRank || 0);

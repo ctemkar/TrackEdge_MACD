@@ -1128,8 +1128,18 @@ async function startServer() {
           }
         }
         
+        const skipFurtherPrivatePositionProbes = authDegraded && !positionsFetched;
+        if (skipFurtherPrivatePositionProbes) {
+          logWithThrottle(
+            'warn',
+            'sync-private-auth-short-circuit',
+            '[TradeEdge Sync] Private auth degraded and no position data recovered from direct/account HTTP endpoints. Skipping remaining private fallback probes for this sync cycle.',
+            60 * 1000,
+          );
+        }
+
         // FALLBACK: Try CCXT methods if HTTP didn't work
-        if (!positionsFetched) {
+        if (!positionsFetched && !skipFurtherPrivatePositionProbes) {
           try {
             const fetchedPositions = await (client as any).fetchPositions?.(undefined, { type: 'future' });
             if (Array.isArray(fetchedPositions) && fetchedPositions.length > 0) {
@@ -1144,7 +1154,7 @@ async function startServer() {
           }
         }
 
-        if (!positionsFetched) {
+        if (!positionsFetched && !skipFurtherPrivatePositionProbes) {
           const positionRiskFetchers = [
             { name: 'fapiPrivateV2GetPositionRisk', fn: async () => await (client as any).fapiPrivateV2GetPositionRisk?.() },
             { name: 'fapiPrivateGetPositionRisk', fn: async () => await (client as any).fapiPrivateGetPositionRisk?.() },
@@ -1169,7 +1179,7 @@ async function startServer() {
           }
         }
         
-        if (!positionsFetched && Object.keys(allPositions).length === 0) {
+        if (!positionsFetched && Object.keys(allPositions).length === 0 && !skipFurtherPrivatePositionProbes) {
           console.warn(`[TradeEdge Sync] WARNING: No positions fetched from any endpoint. Attempting direct account info query...`);
           try {
             const acctInfo = await (client as any).privateGetAccount?.();
@@ -1187,7 +1197,7 @@ async function startServer() {
           }
         }
         
-        if (!positionsFetched && Object.keys(allPositions).length === 0) {
+        if (!positionsFetched && Object.keys(allPositions).length === 0 && !skipFurtherPrivatePositionProbes) {
           console.warn(`[TradeEdge Sync] WARNING: No positions fetched from any endpoint. Account may be flat or API keys lack futures permissions.`);
           try {
             const acct = await (client as any).fetchAccount?.();
@@ -1319,6 +1329,19 @@ async function startServer() {
 
       if (authDegraded && authDegradedMessage) {
         authDegradedMessage = 'Some Binance private endpoints are restricted for this account mode. Trading may still work via compatible endpoints.';
+      }
+
+      if (authDegraded && !hasUsablePositions && !hasUsableBalance) {
+        privateSyncState.authFailCount += 1;
+        const blockMs = Math.min(privateSyncState.authFailCount * 2 * 60 * 1000, MAX_AUTH_BLOCK_MS);
+        privateSyncState.authBlockedUntil = Date.now() + blockMs;
+        privateBalanceCache = null;
+        return res.status(401).json({
+          status: 'auth_failed',
+          message: authDegradedMessage || 'Binance private futures endpoints returned auth/permission errors.',
+          blockedUntil: privateSyncState.authBlockedUntil,
+          retryAfterMs: blockMs,
+        });
       }
       
       const positionKeys = Object.keys(allPositions);
