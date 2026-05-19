@@ -845,6 +845,60 @@ export default function App() {
   const strategyConfigRef = React.useRef(strategyConfig);
   const performScanRef = React.useRef<() => Promise<void>>(async () => {});
 
+  const getHoldingActiveNotional = React.useCallback((
+    holding: Pick<Holding, 'amount' | 'contracts' | 'notional' | 'markPrice' | 'entryPrice'> | undefined,
+    fallbackPrice?: number,
+  ) => {
+    if (!holding) return 0;
+    const explicitNotional = Math.abs(Number(holding.notional || 0));
+    if (Number.isFinite(explicitNotional) && explicitNotional > 0) {
+      return explicitNotional;
+    }
+
+    const amount = Math.abs(Number(holding.amount || holding.contracts || 0));
+    const referencePrice = Number(holding.markPrice || fallbackPrice || holding.entryPrice || 0);
+    if (!Number.isFinite(amount) || amount <= 0 || !Number.isFinite(referencePrice) || referencePrice <= 0) {
+      return 0;
+    }
+
+    return amount * referencePrice;
+  }, []);
+
+  const getDesiredLiveEntryNotional = React.useCallback((confidenceScore: number | undefined, tradableCapital: number) => {
+    const minLiveNotional = Math.max(1, liveMinOrderNotional);
+    const availableCapital = Math.max(0, tradableCapital);
+    const strongSignalSizing = Number.isFinite(confidenceScore) && confidenceScore !== undefined && isStrongLiveSignal(confidenceScore, autoEntryMinScore);
+    const cappedMaxLiveNotional = Math.max(
+      minLiveNotional,
+      maxLiveOrderNotional * (strongSignalSizing ? STRONG_LIVE_SIGNAL_NOTIONAL_MULTIPLIER : 1)
+    );
+    const cappedTradableCapital = Math.min(availableCapital, cappedMaxLiveNotional);
+    let allocation = cappedTradableCapital;
+
+    if (Number.isFinite(confidenceScore) && confidenceScore !== undefined) {
+      const confidenceFloor = Math.min(9.5, Math.max(0, autoEntryMinScore));
+      const normalizedConfidence = Math.max(
+        0,
+        Math.min(1, (confidenceScore - confidenceFloor) / Math.max(0.5, 10 - confidenceFloor))
+      );
+      const confidenceBandMax = Math.max(minLiveNotional, cappedTradableCapital);
+      allocation = minLiveNotional + ((confidenceBandMax - minLiveNotional) * normalizedConfidence);
+    }
+
+    allocation = Math.min(Math.max(minLiveNotional, allocation), cappedTradableCapital);
+
+    if (allocation < minLiveNotional) {
+      return 0;
+    }
+
+    if (isDefensiveMode) {
+      allocation *= 0.5;
+      allocation = Math.min(Math.max(minLiveNotional, allocation), cappedTradableCapital);
+    }
+
+    return allocation;
+  }, [autoEntryMinScore, isDefensiveMode, liveMinOrderNotional, maxLiveOrderNotional]);
+
   React.useEffect(() => {
     holdingsRef.current = holdings;
     autoTradeRef.current = autoTrade;
@@ -1697,36 +1751,19 @@ export default function App() {
             ? realFreeCapital
             : Math.max(0, balance);
           const minLiveNotional = Math.max(1, liveMinOrderNotional);
-          const strongSignalSizing = Number.isFinite(confidenceScore) && confidenceScore !== undefined && isStrongLiveSignal(confidenceScore, autoEntryMinScore);
-          const cappedMaxLiveNotional = Math.max(
-            minLiveNotional,
-            maxLiveOrderNotional * (strongSignalSizing ? STRONG_LIVE_SIGNAL_NOTIONAL_MULTIPLIER : 1)
-          );
-          const cappedTradableCapital = Math.min(tradableCapital, cappedMaxLiveNotional);
-          let allocation = cappedTradableCapital;
-
-          if (Number.isFinite(confidenceScore) && confidenceScore !== undefined) {
-            const confidenceFloor = Math.min(9.5, Math.max(0, autoEntryMinScore));
-            const normalizedConfidence = Math.max(
-              0,
-              Math.min(1, (confidenceScore - confidenceFloor) / Math.max(0.5, 10 - confidenceFloor))
-            );
-            const confidenceBandMax = Math.max(minLiveNotional, cappedTradableCapital);
-            allocation = minLiveNotional + ((confidenceBandMax - minLiveNotional) * normalizedConfidence);
-          }
-
-          allocation = Math.min(Math.max(minLiveNotional, allocation), cappedTradableCapital);
+          const desiredNotional = getDesiredLiveEntryNotional(confidenceScore, tradableCapital);
+          const currentHoldingNotional = existingHolding && existingHolding.side === (openingShort ? 'SHORT' : 'LONG')
+            ? getHoldingActiveNotional(existingHolding, price)
+            : 0;
+          const allocation = Math.max(0, desiredNotional - currentHoldingNotional);
 
           if (allocation < minLiveNotional) {
-            addLog(`TRADE ABORTED: Available allocation ($${allocation.toFixed(2)}) below minimum threshold ($${minLiveNotional.toFixed(2)}).`, 'warning');
-            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: Allocation below $${minLiveNotional.toFixed(2)} minimum`, status: 'SKIPPED', cycleId: eventCycleId });
+            const allocationReason = currentHoldingNotional > 0
+              ? `SKIP: Position already sized to rule target (${currentHoldingNotional.toFixed(2)} / ${desiredNotional.toFixed(2)})`
+              : `SKIP: Allocation below $${minLiveNotional.toFixed(2)} minimum`;
+            addLog(`TRADE ABORTED: ${allocationReason.replace('SKIP: ', '')}.`, 'warning');
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: allocationReason, status: 'SKIPPED', cycleId: eventCycleId });
             return;
-          }
-
-          if (isDefensiveMode) {
-            allocation *= 0.5;
-            allocation = Math.min(Math.max(minLiveNotional, allocation), cappedTradableCapital);
-            addLog(`ADAPTIVE DEFENSE: Reducing trade allocation by 50% for ${tradeSymbol}`, 'info');
           }
 
           amount = allocation / price;
@@ -2157,7 +2194,7 @@ export default function App() {
         }
       }
     }
-  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, maxLiveOrderNotional, autoEntryMinScore, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes, hardReentryCooldownMinutes, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock]);
+  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, maxLiveOrderNotional, autoEntryMinScore, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes, hardReentryCooldownMinutes, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional]);
 
   const managePlannedExit = React.useCallback((holding: Holding, price: number, signal?: StrategySignal | null, cycleId?: number) => {
     const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
@@ -3129,6 +3166,9 @@ export default function App() {
         .map(pick => ({ side: pick.signal.overall === 'SELL' ? 'SELL' as const : 'BUY' as const, pick }));
 
       const getEntryBlockReason = ({ side, pick }: { side: 'BUY' | 'SELL'; pick: MarketScanResult }) => {
+        const desiredHoldingSide: 'LONG' | 'SHORT' = side === 'SELL' ? 'SHORT' : 'LONG';
+        const matchingHolding = currentHoldings.find(h => h.symbol === pick.symbol && h.side === desiredHoldingSide);
+        const opposingHolding = currentHoldings.find(h => h.symbol === pick.symbol && h.side !== desiredHoldingSide);
         if (isLiveBinance && !isLikelyBinanceFuturesSymbol(pick.symbol)) {
           return 'invalid futures symbol format';
         }
@@ -3138,8 +3178,8 @@ export default function App() {
         if (isLiveBinance && !isLiveTradableFuturesSymbol(pick.symbol)) {
           return 'not in Binance futures tradable set';
         }
-        if (currentHoldings.some(h => h.symbol === pick.symbol)) {
-          return 'already held';
+        if (opposingHolding) {
+          return `held ${opposingHolding.side.toLowerCase()}`;
         }
         const cooldownUntil = cooldowns[pick.symbol] || 0;
         if (cooldownUntil > scanNow) {
@@ -3154,6 +3194,16 @@ export default function App() {
           const directionalConfidence = getDirectionalEntryScore(side, pick.signal.score);
           if (directionalConfidence < autoEntryMinScore) {
             return `confidence ${directionalConfidence.toFixed(1)} below ${autoEntryMinScore.toFixed(1)}`;
+          }
+          if (matchingHolding) {
+            if (!isStrongLiveSignal(directionalConfidence, autoEntryMinScore)) {
+              return 'already held';
+            }
+            const desiredNotional = getDesiredLiveEntryNotional(directionalConfidence, Math.max(0, availableFunds * 0.99));
+            const currentNotional = getHoldingActiveNotional(matchingHolding, pick.lastPrice);
+            if ((desiredNotional - currentNotional) < liveMinOrderNotional) {
+              return 'already sized';
+            }
           }
           const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(side, pick.lastPrice, pick.signal.tradePlan, estimatedRoundTripFrictionBps);
           if (edgeAfterFrictionPct !== null && edgeAfterFrictionPct < minEdgeAfterFrictionPct) {
@@ -3295,7 +3345,7 @@ export default function App() {
       setScanning(false);
       setTimeout(() => setIsBotActive(false), 2000);
     }
-  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, liveEntriesPerCycle, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode, isUnsupportedLiveScanSymbol, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock]);
+  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, liveEntriesPerCycle, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode, isUnsupportedLiveScanSymbol, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional]);
  // Removed 'scanning' from dependencies
 
   React.useEffect(() => {
@@ -3553,6 +3603,11 @@ export default function App() {
   })();
   const scanSourceHint = `Scan Source: ${scanDataSource}`;
   const activeInspectionUniverseCount = fullUniverseMode ? scanUniverseCounts.discovery : scanUniverseCounts.liveTradableFutures;
+  const effectiveScanUniverseCount = scanProgress.total > 0
+    ? scanProgress.total
+    : scanSignalSummary.total > 0
+      ? scanSignalSummary.total
+      : activeInspectionUniverseCount;
   const scanUniverseHint = fullUniverseMode
     ? `Full Universe Mode: scanning the broader spot + futures metadata universe for discovery; live entries remain restricted to ${liveQuoteAllowlist.join(', ')}.`
     : `Focused quote universe: scanning all discovered symbols, but live entries remain restricted to ${liveQuoteAllowlist.join(', ')}.`;
@@ -4379,7 +4434,7 @@ export default function App() {
             <div className="mt-3 mb-4">
               <div className="flex justify-between text-[11px] font-mono uppercase opacity-60 mb-1">
                 <span>{scanning ? 'Scan Progress' : 'Idle'}</span>
-                <span>{scanning ? (isScanPreparing ? `Preparing scan...` : `${scanProgress.current}/${scanProgress.total} scanned (${Math.round(scanProgressPct)}%)`) : `${availableSymbols.length} assets`}</span>
+                <span>{scanning ? (isScanPreparing ? 'Preparing...' : `${Math.round(scanProgressPct)}%`) : `${availableSymbols.length} assets`}</span>
               </div>
               <div className="h-1 w-full bg-gray-100 rounded-full overflow-hidden">
                 <div
@@ -4391,14 +4446,14 @@ export default function App() {
 
             <div className="mb-4 grid grid-cols-2 gap-2 text-[10px] font-mono uppercase">
               <div className="border border-sky-200 bg-sky-50/50 px-2 py-1">
-                <span className="opacity-50">Inspection Universe</span>
+                <span className="opacity-50">Raw Futures Universe</span>
                 <p className="font-black text-[14px] text-sky-800">{activeInspectionUniverseCount}</p>
-                <p className="text-[9px] opacity-50">Current scan denominator</p>
+                <p className="text-[9px] opacity-50">Tradable futures discovered from Binance</p>
               </div>
               <div className="border border-violet-200 bg-violet-50/50 px-2 py-1">
-                <span className="opacity-50">Live Tradable Futures</span>
-                <p className="font-black text-[14px] text-violet-800">{scanUniverseCounts.liveTradableFutures}</p>
-                <p className="text-[9px] opacity-50">Execution-safe entry set</p>
+                <span className="opacity-50">Current Scan Set</span>
+                <p className="font-black text-[14px] text-violet-800">{effectiveScanUniverseCount}</p>
+                <p className="text-[9px] opacity-50">After normalization and scan safety filters</p>
               </div>
             </div>
 
