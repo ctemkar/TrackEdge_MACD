@@ -98,8 +98,11 @@ async function startServer() {
   const getPublicBlockedUntil = () => Math.max(publicRateLimitState.bannedUntil, publicRateLimitState.backoffUntil);
   const getPrivateBlockedUntil = () => Math.max(privateSyncState.authBlockedUntil, privateSyncState.backoffUntil);
 
+  const traceBinanceRoutesEnabled = false;
+  const syncDebugLogsEnabled = false;
+
   const recordBinanceRouteHit = (route: string, sample: string, intervalMs = 15000) => {
-    if (!(process.env.NODE_ENV === 'development' || process.env.TRADEEDGE_TRACE_BINANCE_ROUTES === 'true')) {
+    if (!traceBinanceRoutesEnabled) {
       return;
     }
 
@@ -114,6 +117,11 @@ async function startServer() {
       current.lastLoggedAt = now;
     }
     routeHitState.set(key, current);
+  };
+
+  const logSyncDebug = (key: string, message: string, throttleMs: number) => {
+    if (!syncDebugLogsEnabled) return;
+    logWithThrottle('log', key, message, throttleMs);
   };
 
   const setPublicSourceHeaders = (res: express.Response, source: string, cached = false, blockedUntil = 0) => {
@@ -238,7 +246,12 @@ async function startServer() {
         if (Array.isArray(data)) {
           binanceRouteHealth.positions = endpoint.label === 'papi-um-position-risk' ? 'PAPI UM' : 'FAPI';
           binanceRouteHealth.updatedAt = Date.now();
-          console.log(`[TradeEdge] Direct Binance HTTP: Got ${data.length} positions from ${endpoint.label}`);
+          logWithThrottle(
+            'log',
+            `direct-http-positions-${endpoint.label}-${data.length}`,
+            `[TradeEdge] Direct Binance HTTP: Got ${data.length} positions from ${endpoint.label}`,
+            2 * 60 * 1000,
+          );
           return { positions: data, authError: false };
         }
       }
@@ -996,14 +1009,18 @@ async function startServer() {
             authDegraded = true;
             authDegradedMessage = httpPositionResult.message || 'Binance private futures endpoint returned auth error (-2015).';
           }
-          logWithThrottle(
-            'log',
+          logSyncDebug(
             'sync-direct-http-attempt-debug',
             `[TradeEdge Sync DEBUG] Direct HTTP attempt: got ${httpPositions.length} positions, authError=${httpPositionResult.authError}${httpPositionResult.message ? `, message=${httpPositionResult.message}` : ''}`,
             60 * 1000,
           );
           if (httpPositions.length > 0) {
-            console.log(`[TradeEdge Sync] Successfully fetched ${httpPositions.length} positions via direct HTTP API`);
+            logWithThrottle(
+              'log',
+              `sync-direct-http-success-${httpPositions.length}`,
+              `[TradeEdge Sync] Successfully fetched ${httpPositions.length} positions via direct HTTP API`,
+              2 * 60 * 1000,
+            );
             httpPositions.forEach(pos => {
               upsertPosition(pos);
             });
@@ -1036,8 +1053,7 @@ async function startServer() {
             // Note: papi response structure may differ, so also fall back to calculating from CCXT info if needed
             if (accountPositionResult.accountData) {
               const acctData = accountPositionResult.accountData;
-              logWithThrottle(
-                'log',
+              logSyncDebug(
                 'sync-account-data-keys-debug',
                 `[TradeEdge Sync DEBUG] Account data keys: ${Object.keys(acctData).join(', ')}`,
                 5 * 60 * 1000,
@@ -1199,8 +1215,7 @@ async function startServer() {
           const u = Number((p as any)?.unrealizedPnl);
           return Number.isFinite(u) ? sum + u : sum;
         }, 0);
-        logWithThrottle(
-          'log',
+        logSyncDebug(
           'sync-total-unrealized-pnl-debug',
           `[TradeEdge Sync DEBUG] totalUnrealizedPnl from positions: ${totalUnrealizedPnl}`,
           60 * 1000,
@@ -1211,8 +1226,7 @@ async function startServer() {
           const umPnlSum = b.info.reduce((sum: number, row: any) => {
             const umPnl = Number(row?.umUnrealizedPNL || 0);
             if (Number.isFinite(umPnl) && umPnl !== 0) {
-              logWithThrottle(
-                'log',
+              logSyncDebug(
                 `sync-um-asset-pnl-${row.asset}`,
                 `[TradeEdge Sync DEBUG] ${row.asset}: umUnrealizedPNL=${umPnl}`,
                 5 * 60 * 1000,
@@ -1220,16 +1234,14 @@ async function startServer() {
             }
             return sum + (Number.isFinite(umPnl) ? umPnl : 0);
           }, 0);
-          logWithThrottle(
-            'log',
+          logSyncDebug(
             'sync-um-pnl-sum-debug',
             `[TradeEdge Sync DEBUG] umPnlSum from info array: ${umPnlSum}`,
             60 * 1000,
           );
           if (umPnlSum !== 0) {
             totalUnrealizedPnl = umPnlSum;
-            logWithThrottle(
-              'log',
+            logSyncDebug(
               'sync-um-pnl-used-debug',
               `[TradeEdge Sync DEBUG] Using umPnlSum as totalUnrealizedPnl: ${totalUnrealizedPnl}`,
               60 * 1000,
@@ -2292,6 +2304,8 @@ async function startServer() {
             if (banMatch) publicRateLimitState.bannedUntil = parseInt(banMatch[1], 10);
             else publicRateLimitState.backoffUntil = Date.now() + 60000;
             console.warn('[TradeEdge RateLimit] ticker24hr Binance public rate limited');
+          } else if (response.status === 451) {
+            logWithThrottle('warn', 'ticker24hr-451', '[TradeEdge] ticker24hr: Binance futures blocked by location, serving degraded fallback', 60000);
           }
           const bybitTickers = await fetchBybitTickers();
           if (bybitTickers.length > 0) {
@@ -2303,7 +2317,8 @@ async function startServer() {
             setPublicSourceHeaders(res, 'BINANCE_PUBLIC', true);
             return res.json(publicTicker24hCache.rows);
           }
-          throw new Error('Binance public ticker failed');
+          setPublicSourceHeaders(res, 'BINANCE_PUBLIC', true);
+          return res.json([]);
         }
 
         // Try Bybit first (primary ticker source)

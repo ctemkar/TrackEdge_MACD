@@ -60,14 +60,14 @@ const CRITERIA_HELP: Record<string, string> = {
 };
 
 const PARAMETER_DEFAULTS = {
-  maxConcurrentTrades: 18,
+  maxConcurrentTrades: 10,
   takeProfitPercent: 8,
   stopLossPercent: 3.5,
   maxDrawdownPercent: 10,
   isDefensiveMode: false,
   autoEntryMinScore: 6.8,
   liveMinOrderNotional: 10,
-  maxLiveOrderNotional: 200,
+  maxLiveOrderNotional: 500,
   hardReentryCooldownMinutes: 120,
   minEdgeAfterFrictionPct: 0.35,
   estimatedRoundTripFrictionBps: 18,
@@ -5538,7 +5538,7 @@ export default function App() {
             <MetricBox 
               icon={<TrendingUp className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Current P&L"
-              value={`${openPnl >= 0 ? '+' : '-'}$${Math.abs(openPnl).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+              value={`${openPnl >= 0 ? '+' : '-'}$${Math.abs(openPnl).toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 4 })}`}
               trend={openPnl >= 0 ? 'up' : 'down'}
               subValue="Unrealized (Open Positions)"
             />
@@ -5619,7 +5619,7 @@ export default function App() {
                       const direction = activePositionSortDirection(header.key);
                       const priority = activePositionSortPriority(header.key);
                       return (
-                        <th key={header.key} className={`px-1.5 py-2 tracking-widest ${header.rightAlign ? 'text-right' : ''}`}>
+                        <th key={header.key} className={`px-1 py-1.5 tracking-widest ${header.rightAlign ? 'text-right' : ''}`}>
                           <button
                             type="button"
                             onClick={(event) => updateActivePositionSort(header.key, event.shiftKey)}
@@ -5642,7 +5642,7 @@ export default function App() {
                 <tbody className="divide-y divide-gray-100">
                   {holdings.length === 0 ? (
                     <tr>
-                      <td colSpan={11} className="px-2 py-16 text-center">
+                      <td colSpan={11} className="px-2 py-10 text-center">
                         <div className="flex flex-col items-center gap-2 opacity-30">
                           <Zap size={24} />
                           <p className="text-xs font-mono uppercase tracking-[0.2em]">Awaiting signal confluence. No open vectors.</p>
@@ -5659,43 +5659,43 @@ export default function App() {
                       const { mark, contracts, margin, notional, unrealizedPnl: pnlVal, pnlPct: pnlPctVal, closeSide, displaySymbol } = row;
                       return (
                         <tr key={h.id} className="hover:bg-gray-50/50 transition-colors group cursor-pointer" onClick={() => setSymbol(h.symbol)}>
-                        <td className="px-1.5 py-2.5 font-mono text-[11px] opacity-70">
+                        <td className="px-1 py-1.5 font-mono text-[10px] opacity-70">
                          {row.exchange}
                           </td>
-                          <td className="px-1.5 py-2.5">
-                              <span className={`text-[9px] font-black px-1.5 py-0.5 rounded-sm ${h.side === 'SHORT' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{h.side}</span>
+                          <td className="px-1 py-1.5">
+                              <span className={`text-[8px] font-black px-1 py-0.5 rounded-sm ${h.side === 'SHORT' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{h.side}</span>
                           </td>
-                        <td className="px-1.5 py-2.5 font-mono text-[11px] font-black uppercase tracking-tight">
+                        <td className="px-1 py-1.5 font-mono text-[10px] font-black uppercase tracking-tight">
                           {displaySymbol}
                         </td>
-                          <td className="px-1.5 py-2.5 font-mono text-[11px] opacity-60">
+                          <td className="px-1 py-1.5 font-mono text-[10px] opacity-60">
                           {contracts < 1 ? contracts.toFixed(8) : contracts.toFixed(4)}
                           </td>
-                          <td className="px-1.5 py-2.5 font-mono text-[11px] opacity-60">
+                          <td className="px-1 py-1.5 font-mono text-[10px] opacity-60">
                              ${formatPrice(h.entryPrice)}
                           </td>
-                          <td className={`px-1.5 py-2.5 font-mono text-[11px] font-bold ${pnlVal > 0 ? 'text-emerald-600' : pnlVal < 0 ? 'text-rose-600' : 'text-[#141414]'}`}>
+                          <td className={`px-1 py-1.5 font-mono text-[10px] font-bold ${pnlVal > 0 ? 'text-emerald-600' : pnlVal < 0 ? 'text-rose-600' : 'text-[#141414]'}`}>
                           ${formatPrice(mark)}
                           </td>
-                          <td className="px-1.5 py-2.5 font-mono text-[11px] font-bold">
+                          <td className="px-1 py-1.5 font-mono text-[10px] font-bold">
                           ${margin.toFixed(2)}
                         </td>
-                        <td className="px-1.5 py-2.5 font-mono text-[11px] font-bold">
+                        <td className="px-1 py-1.5 font-mono text-[10px] font-bold">
                           ${notional.toFixed(2)}
                         </td>
-                          <td className={`px-1.5 py-2.5 font-black text-[13px] ${pnlVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                          <td className={`px-1 py-1.5 font-black text-[11px] ${pnlVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                              {pnlVal >= 0 ? '+' : ''}${pnlVal.toFixed(2)}
                         </td>
-                        <td className={`px-1.5 py-2.5 font-black text-[13px] ${pnlPctVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                        <td className={`px-1 py-1.5 font-black text-[11px] ${pnlPctVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                           {pnlPctVal >= 0 ? '+' : ''}{pnlPctVal.toFixed(2)}%
                           </td>
-                          <td className="px-1.5 py-2.5 text-right">
+                          <td className="px-1 py-1.5 text-right">
                              <button 
                                onClick={(e) => {
                                  e.stopPropagation();
                             confirmAndClosePosition(h, mark);
                                }}
-                               className="bg-[#141414] text-white hover:bg-[#F27D26] px-3 py-1 text-[9px] font-black uppercase tracking-tighter transition-all"
+                               className="bg-[#141414] text-white hover:bg-[#F27D26] px-2 py-0.5 text-[8px] font-black uppercase tracking-tighter transition-all"
                              >
                                Close Pos
                              </button>
@@ -5721,16 +5721,16 @@ export default function App() {
               <table className="w-full text-left border-collapse">
                 <thead className="bg-gray-50/50 uppercase font-mono text-[8px] opacity-40 border-b">
                   <tr>
-                    <th className="px-4 py-2">Symbol</th>
-                    <th className="px-4 py-2">Realized</th>
-                    <th className="px-4 py-2">Rounds</th>
-                    <th className="px-4 py-2">Status</th>
+                    <th className="px-3 py-1.5">Symbol</th>
+                    <th className="px-3 py-1.5">Realized</th>
+                    <th className="px-3 py-1.5">Rounds</th>
+                    <th className="px-3 py-1.5">Status</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-50">
                   {symbolRiskRows.length === 0 ? (
                     <tr>
-                      <td colSpan={4} className="px-4 py-10 text-center text-[10px] opacity-30 italic">No realized symbol exits recorded for today yet.</td>
+                      <td colSpan={4} className="px-3 py-7 text-center text-[10px] opacity-30 italic">No realized symbol exits recorded for today yet.</td>
                     </tr>
                   ) : symbolRiskRows.map((row) => {
                     const now = Date.now();
@@ -5738,13 +5738,13 @@ export default function App() {
                     const coolingDown = !dailyStopped && row.hardReentryUntil > now;
                     return (
                       <tr key={row.symbol} className="hover:bg-gray-50/30 transition-colors cursor-pointer" onClick={() => setSymbol(row.symbol)}>
-                        <td className="px-4 py-3 text-xs font-black">{row.symbol.replace('USDT', '').replace('USDC', '').replace('USD', '')}</td>
-                        <td className={`px-4 py-3 text-[11px] font-black ${row.realizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                        <td className="px-3 py-2 text-[11px] font-black">{row.symbol.replace('USDT', '').replace('USDC', '').replace('USD', '')}</td>
+                        <td className={`px-3 py-2 text-[10px] font-black ${row.realizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                           {row.realizedPnl >= 0 ? '+' : '-'}${Math.abs(row.realizedPnl).toFixed(2)}
                           <div className="text-[8px] opacity-50">{row.realizedPnlPct >= 0 ? '+' : ''}{row.realizedPnlPct.toFixed(2)}%</div>
                         </td>
-                        <td className="px-4 py-3 text-[10px] font-mono opacity-70">{row.closedTrades}/{Math.max(1, symbolDailyFlipLimit)}</td>
-                        <td className="px-4 py-3">
+                        <td className="px-3 py-2 text-[9px] font-mono opacity-70">{row.closedTrades}/{Math.max(1, symbolDailyFlipLimit)}</td>
+                        <td className="px-3 py-2">
                           <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-sm ${dailyStopped ? 'bg-rose-100 text-rose-700' : coolingDown ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'}`}>
                             {dailyStopped ? 'KILLED' : coolingDown ? 'COOLDOWN' : 'ACTIVE'}
                           </span>
@@ -5761,8 +5761,8 @@ export default function App() {
           </section>
 
           {/* Trade History & Command Logs */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-             <section className="bg-white border-2 border-[#141414] shadow-[8px_8px_0px_0px_#141414] overflow-hidden flex flex-col h-[400px]">
+           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+             <section className="bg-white border-2 border-[#141414] shadow-[8px_8px_0px_0px_#141414] overflow-hidden flex flex-col h-[320px]">
                 <div className="bg-gray-50 border-b border-[#141414]/10 p-4 flex items-center justify-between">
                    <div className="flex items-center gap-2">
                      <History size={14} className="opacity-40" />
@@ -5774,31 +5774,31 @@ export default function App() {
                    <table className="w-full text-left border-collapse">
                       <thead className="bg-gray-50/50 sticky top-0 uppercase font-mono text-[8px] opacity-40 border-b">
                          <tr>
-                            <th className="px-4 py-2">Asset/Time</th>
-                            <th className="px-4 py-2">Side/Price</th>
-                            <th className="px-4 py-2 text-right">P&L</th>
+                             <th className="px-3 py-1.5">Asset/Time</th>
+                             <th className="px-3 py-1.5">Side/Price</th>
+                             <th className="px-3 py-1.5 text-right">P&L</th>
                          </tr>
                       </thead>
                       <tbody className="divide-y divide-gray-50">
                         {visibleTradeHistory.length === 0 ? (
-                          <tr><td colSpan={3} className="px-4 py-12 text-center text-[10px] opacity-30 italic">No historical nodes recorded.</td></tr>
+                            <tr><td colSpan={3} className="px-3 py-8 text-center text-[10px] opacity-30 italic">No historical nodes recorded.</td></tr>
                         ) : (
                           visibleTradeHistory.map((trade, i) => (
                             <tr key={i} className="hover:bg-gray-50/30 transition-colors">
-                               <td className="px-4 py-3">
+                               <td className="px-3 py-2">
                                   <div className="flex flex-col">
-                                     <span className="text-xs font-black">{trade.symbol.replace('USDT', '').replace('USD', '')}</span>
+                                   <span className="text-[11px] font-black">{trade.symbol.replace('USDT', '').replace('USD', '')}</span>
                                      <span className="text-[8px] opacity-40 uppercase">{new Date(trade.time).toLocaleTimeString()}</span>
                                   </div>
                                </td>
-                               <td className="px-4 py-3">
+                               <td className="px-3 py-2">
                                   <div className="flex flex-col">
                                      <span className={`text-[10px] font-black ${trade.type === 'BUY' ? 'text-emerald-600' : 'text-rose-600'}`}>{trade.type}</span>
                                      <span className="text-[9px] font-mono opacity-60">${formatPrice(trade.price)}</span>
                                      {trade.reason && <span className="text-[8px] opacity-40">{trade.reason}</span>}
                                   </div>
                                </td>
-                               <td className="px-4 py-3 text-right">
+                               <td className="px-3 py-2 text-right">
                                   <div className="flex items-center justify-end gap-2 mb-1">
                                     <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-sm ${
                                       (trade.status || 'FILLED') === 'FILLED'
@@ -5833,7 +5833,7 @@ export default function App() {
                 </div>
              </section>
 
-             <section className="bg-white border-2 border-[#141414] shadow-[8px_8px_0px_0px_#141414] overflow-hidden flex flex-col h-[400px]">
+             <section className="bg-white border-2 border-[#141414] shadow-[8px_8px_0px_0px_#141414] overflow-hidden flex flex-col h-[320px]">
                 <div className="bg-gray-50 border-b border-[#141414]/10 p-4 flex items-center justify-between">
                    <div className="flex items-center gap-2">
                      <Activity size={14} className="opacity-40" />
@@ -5841,19 +5841,19 @@ export default function App() {
                    </div>
                    <button onClick={() => setSystemLogs([])} className="text-[9px] font-bold opacity-30 hover:opacity-100 uppercase transition-opacity">Clear All</button>
                 </div>
-                <div className="flex-grow overflow-y-auto custom-scrollbar p-3 space-y-2">
+                <div className="flex-grow overflow-y-auto custom-scrollbar p-2 space-y-1.5">
                   {systemLogs.length === 0 ? (
                     <div className="h-full flex items-center justify-center text-[10px] opacity-30 italic">No command logs yet.</div>
                   ) : (
                     systemLogs.map((log, i) => (
-                      <div key={i} className={`border px-3 py-2 text-[10px] font-mono ${
+                      <div key={i} className={`border px-2.5 py-1.5 text-[9px] font-mono ${
                         log.type === 'success'
                           ? 'border-emerald-200 bg-emerald-50/60 text-emerald-900'
                           : log.type === 'warning'
                             ? 'border-amber-200 bg-amber-50/60 text-amber-900'
                             : 'border-gray-200 bg-gray-50/60 text-gray-800'
                       }`}>
-                        <div className="flex items-center justify-between mb-1">
+                        <div className="flex items-center justify-between mb-0.5">
                           <span className="font-black uppercase opacity-70">{log.type}</span>
                           <span className="opacity-50">{log.time}</span>
                         </div>
