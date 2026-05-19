@@ -15,6 +15,7 @@ const DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT = 'USDT,USDC,FDUSD,BUSD,TUSD';
 const CRITERIA_HELP: Record<string, string> = {
   autoEntryMinScore: 'Minimum strategy confidence required before opening a new position. Higher values reduce trade frequency and prioritize stronger setups.',
   liveMinOrderNotional: 'Minimum USDT notional value allowed per live order. Helps avoid exchange min-notional rejects and tiny low-quality entries.',
+  maxLiveOrderNotional: 'Maximum USDT notional value allowed per live order. Live entries scale between the minimum and this cap based on directional confidence.',
   macdFastPeriod: 'Fast EMA period used by MACD. Lower values react faster to price changes but can create more noise.',
   macdSlowPeriod: 'Slow EMA period used by MACD. Higher values smooth trend detection but react slower to reversals.',
   macdSignalPeriod: 'Signal-line EMA period for MACD cross detection. Larger values filter noise but delay entry/exit confirmation.',
@@ -61,6 +62,7 @@ const PARAMETER_DEFAULTS = {
   isDefensiveMode: false,
   autoEntryMinScore: 6,
   liveMinOrderNotional: 10,
+  maxLiveOrderNotional: 150,
   liveQuoteAllowlistInput: DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT,
   scanIntervalSec: 40,
   holdingPollIntervalSec: 10,
@@ -256,6 +258,10 @@ export default function App() {
   const [liveMinOrderNotional, setLiveMinOrderNotional] = useState(() => {
     const saved = localStorage.getItem('te_live_min_order_notional');
     return saved ? (parseFloat(saved) || 10) : 10;
+  });
+  const [maxLiveOrderNotional, setMaxLiveOrderNotional] = useState(() => {
+    const saved = localStorage.getItem('te_live_max_order_notional');
+    return saved ? Math.max(1, parseFloat(saved) || 150) : 150;
   });
   const [liveQuoteAllowlistInput, setLiveQuoteAllowlistInput] = useState(() => {
     const saved = localStorage.getItem('te_live_quote_allowlist');
@@ -1198,7 +1204,7 @@ export default function App() {
     }
   }, [setPrivateSyncBlockedUntil, setRateLimitUntil]);
 
-  const executeTrade = React.useCallback(async (type: 'BUY' | 'SELL', tradeSymbol: string, price: number, reason: string = 'Strategy Match', targetId?: string, cycleId?: number, tradePlan?: StrategySignal['tradePlan'], requestedAmount?: number) => {
+  const executeTrade = React.useCallback(async (type: 'BUY' | 'SELL', tradeSymbol: string, price: number, reason: string = 'Strategy Match', targetId?: string, cycleId?: number, tradePlan?: StrategySignal['tradePlan'], requestedAmount?: number, confidenceScore?: number) => {
     if (loadingRef.current || !price) return;
     const time = new Date().toISOString();
     const eventCycleId = typeof cycleId === 'number' ? cycleId : undefined;
@@ -1431,21 +1437,26 @@ export default function App() {
         if (closingExisting) {
           amount = Math.min(heldAmount, requestedAmount && requestedAmount > 0 ? requestedAmount : heldAmount);
         } else if (type === 'BUY' || openingShort) {
-          const effectiveSplitSlots = 1;
           const realFreeCapital = Math.max(0, availableFunds * 0.99);
           const tradableCapital = isRealMode
             ? realFreeCapital
             : Math.max(0, balance);
-          let allocation = Math.min(tradableCapital, tradableCapital / effectiveSplitSlots);
-          const minLiveNotional = liveMinOrderNotional;
+          const minLiveNotional = Math.max(1, liveMinOrderNotional);
+          const cappedMaxLiveNotional = Math.max(minLiveNotional, maxLiveOrderNotional);
+          const cappedTradableCapital = Math.min(tradableCapital, cappedMaxLiveNotional);
+          let allocation = cappedTradableCapital;
 
-          // Avoid over-fragmenting capital across many slots; if we can fund at least one
-          // minimal order, keep per-trade allocation at $10+ instead of skipping every entry.
-          if (tradableCapital >= minLiveNotional) {
-            allocation = Math.max(allocation, minLiveNotional);
+          if (Number.isFinite(confidenceScore) && confidenceScore !== undefined) {
+            const confidenceFloor = Math.min(9.5, Math.max(0, autoEntryMinScore));
+            const normalizedConfidence = Math.max(
+              0,
+              Math.min(1, (confidenceScore - confidenceFloor) / Math.max(0.5, 10 - confidenceFloor))
+            );
+            const confidenceBandMax = Math.max(minLiveNotional, cappedTradableCapital);
+            allocation = minLiveNotional + ((confidenceBandMax - minLiveNotional) * normalizedConfidence);
           }
 
-          allocation = Math.min(allocation, tradableCapital);
+          allocation = Math.min(Math.max(minLiveNotional, allocation), cappedTradableCapital);
 
           if (allocation < minLiveNotional) {
             addLog(`TRADE ABORTED: Available allocation ($${allocation.toFixed(2)}) below minimum threshold ($${minLiveNotional.toFixed(2)}).`, 'warning');
@@ -1455,6 +1466,7 @@ export default function App() {
 
           if (isDefensiveMode) {
             allocation *= 0.5;
+            allocation = Math.min(Math.max(minLiveNotional, allocation), cappedTradableCapital);
             addLog(`ADAPTIVE DEFENSE: Reducing trade allocation by 50% for ${tradeSymbol}`, 'info');
           }
 
@@ -1885,7 +1897,7 @@ export default function App() {
         }
       }
     }
-  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes]);
+  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, maxLiveOrderNotional, autoEntryMinScore, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes]);
 
   const managePlannedExit = React.useCallback((holding: Holding, price: number, signal?: StrategySignal | null, cycleId?: number) => {
     const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
@@ -2086,6 +2098,7 @@ export default function App() {
     localStorage.setItem('te_is_defensive_mode', isDefensiveMode.toString());
     localStorage.setItem('te_auto_entry_min_score', autoEntryMinScore.toString());
     localStorage.setItem('te_live_min_order_notional', liveMinOrderNotional.toString());
+    localStorage.setItem('te_live_max_order_notional', maxLiveOrderNotional.toString());
     localStorage.setItem('te_live_quote_allowlist', liveQuoteAllowlistInput);
     localStorage.setItem('te_scan_interval_sec', scanIntervalSec.toString());
     localStorage.setItem('te_holding_poll_interval_sec', holdingPollIntervalSec.toString());
@@ -2101,7 +2114,7 @@ export default function App() {
     localStorage.setItem('te_close_failure_lock_minutes', closeFailureLockMinutes.toString());
     localStorage.setItem('te_hard_failure_lock_minutes', hardFailureLockMinutes.toString());
     localStorage.setItem('te_strategy_config', JSON.stringify(strategyConfig));
-  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
+  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
 
   useEffect(() => {
     localStorage.setItem('te_show_extra_criteria', showExtraCriteria ? '1' : '0');
@@ -2236,6 +2249,7 @@ export default function App() {
   type AiCriteriaSnapshot = {
     autoEntryMinScore: number;
     liveMinOrderNotional: number;
+    maxLiveOrderNotional: number;
     scanIntervalSec: number;
     holdingPollIntervalSec: number;
     maxSymbolsPerScan: number;
@@ -2273,6 +2287,7 @@ export default function App() {
 
     setAutoEntryMinScore(aiCriteriaSnapshot.autoEntryMinScore);
     setLiveMinOrderNotional(aiCriteriaSnapshot.liveMinOrderNotional);
+    setMaxLiveOrderNotional(aiCriteriaSnapshot.maxLiveOrderNotional);
     setScanIntervalSec(aiCriteriaSnapshot.scanIntervalSec);
     setHoldingPollIntervalSec(aiCriteriaSnapshot.holdingPollIntervalSec);
     setMaxSymbolsPerScan(aiCriteriaSnapshot.maxSymbolsPerScan);
@@ -2306,6 +2321,7 @@ export default function App() {
     setIsDefensiveMode(PARAMETER_DEFAULTS.isDefensiveMode);
     setAutoEntryMinScore(PARAMETER_DEFAULTS.autoEntryMinScore);
     setLiveMinOrderNotional(PARAMETER_DEFAULTS.liveMinOrderNotional);
+    setMaxLiveOrderNotional(PARAMETER_DEFAULTS.maxLiveOrderNotional);
     setLiveQuoteAllowlistInput(PARAMETER_DEFAULTS.liveQuoteAllowlistInput);
     setScanIntervalSec(PARAMETER_DEFAULTS.scanIntervalSec);
     setHoldingPollIntervalSec(PARAMETER_DEFAULTS.holdingPollIntervalSec);
@@ -2355,6 +2371,7 @@ export default function App() {
     const previousSnapshot: AiCriteriaSnapshot = {
       autoEntryMinScore,
       liveMinOrderNotional,
+      maxLiveOrderNotional,
       scanIntervalSec,
       holdingPollIntervalSec,
       maxSymbolsPerScan,
@@ -2382,8 +2399,13 @@ export default function App() {
       if (part.includes('auto entry') && val !== null) {
         setAutoEntryMinScore(Math.max(0, Math.min(10, val)));
         touched.push('Auto Entry Score');
+      } else if ((part.includes('max live notional') || part.includes('max notional')) && val !== null) {
+        setMaxLiveOrderNotional(Math.max(liveMinOrderNotional, val));
+        touched.push('Max Live Notional');
       } else if ((part.includes('live notional') || part.includes('min notional')) && val !== null) {
-        setLiveMinOrderNotional(Math.max(1, val));
+        const nextMinLiveNotional = Math.max(1, val);
+        setLiveMinOrderNotional(nextMinLiveNotional);
+        setMaxLiveOrderNotional(prev => Math.max(prev, nextMinLiveNotional));
         touched.push('Min Live Notional');
       } else if (part.includes('scan interval') && val !== null) {
         setScanIntervalSec(Math.max(10, Math.round(val)));
@@ -2520,6 +2542,7 @@ export default function App() {
     aiCriteriaPrompt,
     autoEntryMinScore,
     liveMinOrderNotional,
+    maxLiveOrderNotional,
     scanIntervalSec,
     holdingPollIntervalSec,
     maxSymbolsPerScan,
@@ -2925,7 +2948,7 @@ export default function App() {
                 continue;
               }
               const entryType = side === 'BUY' ? 'LONG' : 'SHORT';
-              await executeTrade(side, pick.symbol, pick.lastPrice, `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`, undefined, cycleId, pick.signal.tradePlan);
+              await executeTrade(side, pick.symbol, pick.lastPrice, `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`, undefined, cycleId, pick.signal.tradePlan, undefined, getDirectionalEntryScore(side, pick.signal.score));
               if (!autoTradeRef.current || entryLockUntilRef.current > Date.now()) break;
               if (isRealMode) {
                 await new Promise(r => setTimeout(r, liveEntryDelayMs));
@@ -4315,7 +4338,7 @@ export default function App() {
 
                     <div className="flex justify-end">
                       <button 
-                        onClick={() => executeTrade(pick.signal.overall === 'SELL' ? 'SELL' : 'BUY', pick.symbol, pick.lastPrice, `AI_${pick.signal.overall}_DISCOVERY_${pick.signal.score}`)}
+                        onClick={() => executeTrade(pick.signal.overall === 'SELL' ? 'SELL' : 'BUY', pick.symbol, pick.lastPrice, `AI_${pick.signal.overall}_DISCOVERY_${pick.signal.score}`, undefined, undefined, undefined, undefined, getDirectionalEntryScore(pick.signal.overall === 'SELL' ? 'SELL' : 'BUY', pick.signal.score))}
                         disabled={pick.signal.overall === 'HOLD' || entryLockActive || holdings.length >= maxConcurrentTrades || holdings.some(h => h.symbol === pick.symbol)}
                         className="text-[#141414] hover:bg-[#F27D26] hover:text-white border border-[#141414]/10 text-[10px] px-2 py-0.5 font-bold uppercase transition-all disabled:opacity-0"
                       >
@@ -4548,7 +4571,14 @@ export default function App() {
                       <input type="number" min="0" max="10" step="0.5" value={autoEntryMinScore} onChange={(e) => setAutoEntryMinScore(parseFloat(e.target.value) || 0)} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Min Live Notional" detail={CRITERIA_HELP.liveMinOrderNotional} />
-                      <input type="number" min="1" step="1" value={liveMinOrderNotional} onChange={(e) => setLiveMinOrderNotional(parseFloat(e.target.value) || 1)} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
+                      <input type="number" min="1" step="1" value={liveMinOrderNotional} onChange={(e) => {
+                        const nextMinLiveNotional = Math.max(1, parseFloat(e.target.value) || 1);
+                        setLiveMinOrderNotional(nextMinLiveNotional);
+                        setMaxLiveOrderNotional(prev => Math.max(prev, nextMinLiveNotional));
+                      }} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
+                    </label>
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Max Live Notional" detail={CRITERIA_HELP.maxLiveOrderNotional} />
+                      <input type="number" min={liveMinOrderNotional} step="1" value={maxLiveOrderNotional} onChange={(e) => setMaxLiveOrderNotional(Math.max(liveMinOrderNotional, parseFloat(e.target.value) || liveMinOrderNotional))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="MACD Fast" detail={CRITERIA_HELP.macdFastPeriod} />
                       <input type="number" min="1" step="1" value={strategyConfig.macdFastPeriod} onChange={(e) => updateStrategyConfig({ macdFastPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />

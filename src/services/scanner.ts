@@ -32,6 +32,30 @@ type ScanMarketOptions = {
 const MIN_SCAN_CANDLE_COUNT = 51;
 const MAX_SCAN_FETCH_ATTEMPTS = 3;
 const SCAN_FETCH_RETRY_DELAY_MS = 180;
+const LOW_HISTORY_SYMBOL_TTL_MS = 6 * 60 * 60 * 1000;
+
+const lowHistorySymbols = new Map<string, { until: number; candles: number }>();
+
+function getLowHistorySnapshot(symbol: string): { until: number; candles: number } | null {
+  const normalized = String(symbol || '').toUpperCase();
+  if (!normalized) return null;
+  const snapshot = lowHistorySymbols.get(normalized);
+  if (!snapshot) return null;
+  if (snapshot.until <= Date.now()) {
+    lowHistorySymbols.delete(normalized);
+    return null;
+  }
+  return snapshot;
+}
+
+function markLowHistorySymbol(symbol: string, candles: number) {
+  const normalized = String(symbol || '').toUpperCase();
+  if (!normalized) return;
+  lowHistorySymbols.set(normalized, {
+    until: Date.now() + LOW_HISTORY_SYMBOL_TTL_MS,
+    candles: Math.max(0, candles),
+  });
+}
 
 function getDirectionalSignalStrength(signal: StrategySignal): number {
   if (signal.overall === 'SELL') return 10 - signal.score;
@@ -64,14 +88,17 @@ function computeProfitabilityRank(result: MarketScanResult): number {
 
 async function fetchScanCandlesWithRetry(symbol: string): Promise<Candle[]> {
   let lastError: unknown = null;
+  let lastCandleCount = 0;
 
   for (let attempt = 1; attempt <= MAX_SCAN_FETCH_ATTEMPTS; attempt++) {
     try {
       const candles = await fetchBinanceData(symbol, '1d', 500, { forceBinancePublic: true });
       if (candles.length >= MIN_SCAN_CANDLE_COUNT) {
+        lowHistorySymbols.delete(String(symbol || '').toUpperCase());
         return candles;
       }
 
+      lastCandleCount = candles.length;
       lastError = new Error(`INSUFFICIENT_CANDLES:${candles.length}`);
     } catch (error) {
       if ((error as any)?.message === 'RATE_LIMITED') {
@@ -86,6 +113,7 @@ async function fetchScanCandlesWithRetry(symbol: string): Promise<Candle[]> {
   }
 
   if (lastError) {
+    markLowHistorySymbol(symbol, lastCandleCount);
     console.warn(`[TradeEdge] Scanner exhausted fetch retries for ${symbol}:`, lastError);
   }
 
@@ -112,6 +140,15 @@ export async function scanMarket(
     const normalized = symbol.toUpperCase();
     if (prioritySymbols.has(normalized)) {
       return true;
+    }
+
+    const lowHistorySnapshot = getLowHistorySnapshot(normalized);
+    if (lowHistorySnapshot) {
+      preShortlistExcluded.push({
+        symbol,
+        reason: `insufficient candle history (${lowHistorySnapshot.candles}/${MIN_SCAN_CANDLE_COUNT})`,
+      });
+      return false;
     }
 
     const stats = tickerStats.get(normalized);
