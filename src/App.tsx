@@ -864,6 +864,20 @@ export default function App() {
     return amount * referencePrice;
   }, []);
 
+  const getHoldingCommittedCapital = React.useCallback((
+    holding: Pick<Holding, 'amount' | 'contracts' | 'entryPrice'> | undefined,
+  ) => {
+    if (!holding) return 0;
+
+    const contracts = Math.abs(Number(holding.amount || holding.contracts || 0));
+    const entryPrice = Number(holding.entryPrice || 0);
+    if (!Number.isFinite(contracts) || contracts <= 0 || !Number.isFinite(entryPrice) || entryPrice <= 0) {
+      return 0;
+    }
+
+    return contracts * entryPrice;
+  }, []);
+
   const getDesiredLiveEntryNotional = React.useCallback((confidenceScore: number | undefined, tradableCapital: number) => {
     const minLiveNotional = Math.max(1, liveMinOrderNotional);
     const availableCapital = Math.max(0, tradableCapital);
@@ -3708,8 +3722,12 @@ export default function App() {
     ? Math.max(0, Math.min(exchangeFreeMargin * 0.99, remainingLiveSlots * Math.max(1, maxLiveOrderNotional)))
     : balance;
   const displayedAvailableFunds = exchangeFreeMargin;
+  const grossInvestedCapital = holdings.reduce((total, holding) => total + getHoldingCommittedCapital(holding), 0);
   const usedCapital = Math.max(0, equity - exchangeFreeMargin);
   const investedPct = equity > 0
+    ? Math.max(0, (grossInvestedCapital / equity) * 100)
+    : 0;
+  const usedMarginPct = equity > 0
     ? Math.min(100, Math.max(0, (usedCapital / equity) * 100))
     : 0;
   const entryLockActive = entryLockUntil > Date.now();
@@ -5544,7 +5562,7 @@ export default function App() {
               icon={<Activity className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Budget Efficiency"
               value={`${investedPct.toFixed(1)}%`}
-              subValue="Used Equity %"
+              subValue={`Entry capital $${grossInvestedCapital.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | Margin used ${usedMarginPct.toFixed(1)}%`}
             />
           </div>
 
