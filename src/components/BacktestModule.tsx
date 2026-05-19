@@ -282,36 +282,36 @@ export function BacktestModule({ symbol: initialSymbol, availableSymbols, strate
               
               {showTrades && (
                 <div className="overflow-x-auto border-t border-white/10">
-                  <table className="w-full text-left text-xs">
+                  <table className="w-full text-left text-[11px]">
                     <thead className="bg-black/40 text-gray-400 border-b border-white/10">
                       <tr>
-                        <th className="px-4 py-3 font-medium">Entry/Exit Time</th>
-                        <th className="px-4 py-3 font-medium">Prices</th>
-                        <th className="px-4 py-3 font-medium">Result</th>
-                        <th className="px-4 py-3 font-medium">Reason</th>
+                        <th className="px-3 py-2 font-medium">Entry/Exit Time</th>
+                        <th className="px-3 py-2 font-medium">Prices</th>
+                        <th className="px-3 py-2 font-medium">Result</th>
+                        <th className="px-3 py-2 font-medium">Reason</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/5">
                       {result.trades.map((trade, idx) => (
                         <tr key={idx} className="hover:bg-white/5 transition-all group">
-                          <td className="px-4 py-3">
+                          <td className="px-3 py-2">
                             <div className="text-white group-hover:text-blue-400 transition-colors uppercase">{formatDate(trade.entryTime).split(',')[1]}</div>
-                            <div className="text-gray-500 text-[10px]">{formatDate(trade.entryTime).split(',')[0]}</div>
+                            <div className="text-gray-500 text-[9px]">{formatDate(trade.entryTime).split(',')[0]}</div>
                           </td>
-                          <td className="px-4 py-3">
+                          <td className="px-3 py-2">
                             <div className="text-gray-400 font-mono">In: {trade.entryPrice.toLocaleString()}</div>
                             <div className="text-white font-mono">Out: {trade.exitPrice.toLocaleString()}</div>
                           </td>
-                          <td className="px-4 py-3">
+                          <td className="px-3 py-2">
                             <div className={`font-medium ${trade.profit > 0 ? 'text-green-400' : 'text-red-400'}`}>
                               {trade.profit > 0 ? '+' : ''}{trade.profitPercent.toFixed(2)}%
                             </div>
-                            <div className="text-[10px] text-gray-500">
+                            <div className="text-[9px] text-gray-500">
                               ${trade.profit.toFixed(2)}
                             </div>
                           </td>
-                          <td className="px-4 py-3">
-                            <span className="px-2 py-0.5 bg-white/5 rounded-full text-[10px] text-gray-400">
+                          <td className="px-3 py-2">
+                            <span className="px-1.5 py-0.5 bg-white/5 rounded-full text-[9px] text-gray-400">
                               {trade.reason}
                             </span>
                           </td>
@@ -319,7 +319,7 @@ export function BacktestModule({ symbol: initialSymbol, availableSymbols, strate
                       ))}
                       {result.trades.length === 0 && (
                         <tr>
-                          <td colSpan={4} className="px-4 py-12 text-center text-gray-500 italic">
+                          <td colSpan={4} className="px-3 py-8 text-center text-[10px] text-gray-500 italic">
                             No trades matching the strategy criteria were found in this period.
                           </td>
                         </tr>

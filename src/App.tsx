@@ -72,7 +72,7 @@ const PARAMETER_DEFAULTS = {
   minEdgeAfterFrictionPct: 0.35,
   estimatedRoundTripFrictionBps: 18,
   symbolDailyLossLimit: 12,
-  symbolDailyFlipLimit: 3,
+  symbolDailyFlipLimit: 5,
   liveQuoteAllowlistInput: DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT,
   scanIntervalSec: 40,
   holdingPollIntervalSec: 10,
@@ -4567,17 +4567,17 @@ export default function App() {
               </div>
               <div className="mt-2 space-y-3">
                 <div className="overflow-x-auto border border-gray-200 bg-white/70">
-                  <table className="min-w-full border-collapse text-left text-[9px] uppercase">
+                  <table className="min-w-full border-collapse text-left text-[8px] uppercase">
                     <thead className="bg-gray-100/80 text-gray-700">
                       <tr>
-                        <th className="border-b border-gray-200 px-2 py-2">Reject Reason</th>
-                        <th className="border-b border-gray-200 px-2 py-2 text-right">Coins</th>
+                        <th className="border-b border-gray-200 px-1.5 py-1.5">Reject Reason</th>
+                        <th className="border-b border-gray-200 px-1.5 py-1.5 text-right">Coins</th>
                       </tr>
                     </thead>
                     <tbody>
                       {rejectReasonGroups.length === 0 ? (
                         <tr>
-                          <td colSpan={2} className="border-b border-gray-200 px-2 py-3 text-[9px] normal-case tracking-normal text-gray-700/70">
+                          <td colSpan={2} className="border-b border-gray-200 px-1.5 py-2 text-[8px] normal-case tracking-normal text-gray-700/70">
                             No aggregated HOLD rejection reasons are available yet for this session. HOLD count in the last scan: {scanSignalSummary.hold}.
                           </td>
                         </tr>
@@ -4586,8 +4586,8 @@ export default function App() {
                           const isSelected = group.reason === selectedRejectReason;
                           return (
                             <tr key={`reject-reason-row-${group.reason}`} className={isSelected ? 'bg-amber-50/80' : 'bg-white/40'}>
-                              <td className="border-b border-gray-200 px-2 py-2 text-[9px] normal-case tracking-normal text-gray-900">{group.reason}</td>
-                              <td className="border-b border-gray-200 px-2 py-2 text-right">
+                              <td className="border-b border-gray-200 px-1.5 py-1.5 text-[8px] normal-case tracking-normal text-gray-900">{group.reason}</td>
+                              <td className="border-b border-gray-200 px-1.5 py-1.5 text-right">
                                 <button
                                   type="button"
                                   onClick={() => setSelectedRejectReason(group.reason)}
