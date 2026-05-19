@@ -5117,7 +5117,7 @@ export default function App() {
 
                     <div className="flex justify-center">
                       <div className="flex flex-col items-center gap-1">
-                        <div className={`text-[10px] font-black px-1 rounded-sm ${
+                        <div className={`text-[11px] font-black px-1.5 py-0.5 rounded-sm ${
                           pick.signal.overall === 'BUY' ? 'bg-emerald-100 text-emerald-800' : 
                           pick.signal.overall === 'SELL' ? 'bg-rose-100 text-rose-800' : 'bg-gray-100 text-gray-400'
                         }`}>
@@ -5125,11 +5125,11 @@ export default function App() {
                         </div>
                         {pick.signal.overall === 'HOLD' && pick.signal.holdReason && (
                           <div className="max-w-[140px] text-center leading-tight">
-                            <span className="text-[8px] font-mono uppercase text-amber-700 opacity-80">
+                            <span className="text-[9px] font-mono uppercase text-amber-700 opacity-80">
                               {describeHoldReason(pick.signal.holdReason)}
                             </span>
                             {pick.signal.rejectReasons && pick.signal.rejectReasons.length > 0 && (
-                              <span className="mt-1 block text-[8px] normal-case font-mono text-amber-700/75">
+                              <span className="mt-1 block text-[9px] normal-case font-mono text-amber-700/75">
                                 {summarizeRejectReasons(pick.signal.rejectReasons)}
                               </span>
                             )}
