@@ -60,14 +60,14 @@ const CRITERIA_HELP: Record<string, string> = {
 };
 
 const PARAMETER_DEFAULTS = {
-  maxConcurrentTrades: 15,
+  maxConcurrentTrades: 18,
   takeProfitPercent: 8,
   stopLossPercent: 3.5,
   maxDrawdownPercent: 10,
   isDefensiveMode: false,
   autoEntryMinScore: 6.8,
   liveMinOrderNotional: 10,
-  maxLiveOrderNotional: 150,
+  maxLiveOrderNotional: 200,
   hardReentryCooldownMinutes: 120,
   minEdgeAfterFrictionPct: 0.35,
   estimatedRoundTripFrictionBps: 18,
@@ -105,6 +105,18 @@ const isNonTradableQuoteBaseSymbol = (raw: string) => {
   return /(?:USDT|USDC|USD){2,}$/.test(parts.compact) || NON_TRADABLE_QUOTE_BASES.has(parts.base);
 };
 
+const getSymbolRiskIdentity = (raw: string) => {
+  const compact = String(raw || '').toUpperCase().split(':')[0].replace('/', '');
+  if (!compact) {
+    return { key: '', symbol: '' };
+  }
+  const parts = getCompactUsdSymbolParts(compact);
+  return {
+    key: parts?.base || compact,
+    symbol: parts?.compact || compact,
+  };
+};
+
 const normalizeLiveFuturesSymbol = (raw: string) => {
   const normalized = String(raw || '').toUpperCase().replace(/[/:]/g, '');
   if (!normalized) return normalized;
@@ -117,6 +129,25 @@ const countNormalizedLiveSymbols = (symbols: Array<{ value: string }>) => {
 
 const getDirectionalEntryScore = (side: 'BUY' | 'SELL', score: number) => {
   return side === 'SELL' ? 10 - score : score;
+};
+
+const STRONG_LIVE_SIGNAL_SCORE_BUFFER = 0.2;
+const STRONG_LIVE_SIGNAL_NOTIONAL_MULTIPLIER = 1.5;
+const STRONG_LIVE_SIGNAL_EXTRA_SLOTS = 2;
+
+const isStrongLiveSignal = (directionalScore: number, minScore: number) => {
+  return directionalScore >= Math.min(10, Math.max(0, minScore) + STRONG_LIVE_SIGNAL_SCORE_BUFFER);
+};
+
+const compareExecutionPriority = (
+  a: { side: 'BUY' | 'SELL'; pick: Pick<MarketScanResult, 'priorityRank' | 'signal'> },
+  b: { side: 'BUY' | 'SELL'; pick: Pick<MarketScanResult, 'priorityRank' | 'signal'> },
+) => {
+  const priorityRankDelta = (b.pick.priorityRank || 0) - (a.pick.priorityRank || 0);
+  if (priorityRankDelta !== 0) return priorityRankDelta;
+  const directionalScoreDelta = getDirectionalEntryScore(b.side, b.pick.signal.score) - getDirectionalEntryScore(a.side, a.pick.signal.score);
+  if (directionalScoreDelta !== 0) return directionalScoreDelta;
+  return (b.pick.signal.macdScore || 0) - (a.pick.signal.macdScore || 0);
 };
 
 const describeMacdHistogram = (state?: string) => {
@@ -544,6 +575,20 @@ export default function App() {
     filteredSymbols: Record<string, string>;
   }
 
+  interface ExecuteTradeOptions {
+    allowManualOverride?: boolean;
+  }
+  
+  interface PendingManualOverrideTrade {
+    type: 'BUY' | 'SELL';
+    symbol: string;
+    price: number;
+    confidenceScore?: number;
+    reason: string;
+    strategyReason: string;
+    buttonLabel: string;
+  }
+
   interface SystemLogEntry {
     time: string;
     message: string;
@@ -660,6 +705,7 @@ export default function App() {
   const [scanExecutionStats, setScanExecutionStats] = useState({ cycleId: 0, attempted: 0, filled: 0, failed: 0, skipped: 0 });
   const [scanExecutionTotals, setScanExecutionTotals] = useState({ attempted: 0, filled: 0, failed: 0, skipped: 0 });
   const [executionFeedback, setExecutionFeedback] = useState<{ type: 'info' | 'success' | 'warning', message: string } | null>(null);
+  const [pendingManualOverrideTrade, setPendingManualOverrideTrade] = useState<PendingManualOverrideTrade | null>(null);
   const [entryLockUntil, setEntryLockUntil] = useState(0);
   const lastRateLimitWarnAtRef = React.useRef(0);
   const dismissedSyncErrorRef = React.useRef<{ message: string; until: number } | null>(null);
@@ -671,6 +717,17 @@ export default function App() {
     const t = setTimeout(() => setExecutionFeedback(null), delay);
     return () => clearTimeout(t);
   }, [executionFeedback]);
+  
+  React.useEffect(() => {
+    if (!pendingManualOverrideTrade) return;
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setPendingManualOverrideTrade(null);
+      }
+    };
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [pendingManualOverrideTrade]);
   const tradeLockout = React.useRef<Set<string>>(new Set());
   const isSyncingRef = React.useRef(false);
   const loadingRef = React.useRef(loading);
@@ -692,11 +749,17 @@ export default function App() {
     const summaries = new Map<string, SymbolRiskSummary>();
 
     const ensureSummary = (symbol: string) => {
-      const normalizedSymbol = String(symbol || '').toUpperCase();
-      const existing = summaries.get(normalizedSymbol);
-      if (existing) return existing;
+      const { key, symbol: displaySymbol } = getSymbolRiskIdentity(symbol);
+      if (!key) return null;
+      const existing = summaries.get(key);
+      if (existing) {
+        if (!getCompactUsdSymbolParts(existing.symbol) && getCompactUsdSymbolParts(displaySymbol)) {
+          existing.symbol = displaySymbol;
+        }
+        return existing;
+      }
       const created: SymbolRiskSummary = {
-        symbol: normalizedSymbol,
+        symbol: displaySymbol,
         realizedPnl: 0,
         realizedPnlPct: 0,
         entryNotional: 0,
@@ -706,7 +769,7 @@ export default function App() {
         dailyStopUntil: 0,
         dailyStopReason: null,
       };
-      summaries.set(normalizedSymbol, created);
+      summaries.set(key, created);
       return created;
     };
 
@@ -720,6 +783,7 @@ export default function App() {
       if (typeof trade.pnl !== 'number') continue;
 
       const summary = ensureSummary(symbolKey);
+      if (!summary) continue;
       summary.realizedPnl += trade.pnl;
       summary.entryNotional += Math.max(0, Number(trade.entryPrice || trade.price || 0) * Math.abs(Number(trade.amount || 0)));
       summary.closedTrades += 1;
@@ -744,8 +808,8 @@ export default function App() {
   }, [tradeHistory, hardReentryCooldownMinutes, symbolDailyFlipLimit, symbolDailyLossLimit]);
 
   const getSymbolRiskBlock = React.useCallback((rawSymbol: string, at: number = Date.now()) => {
-    const normalizedSymbol = String(rawSymbol || '').toUpperCase();
-    const summary = symbolRiskSummary.get(normalizedSymbol);
+    const { key } = getSymbolRiskIdentity(rawSymbol);
+    const summary = key ? symbolRiskSummary.get(key) : null;
     if (!summary) return null;
     if (summary.dailyStopUntil > at && summary.dailyStopReason) {
       const hoursRemaining = Math.max(1, Math.ceil((summary.dailyStopUntil - at) / (60 * 60 * 1000)));
@@ -1348,12 +1412,13 @@ export default function App() {
     }
   }, [setPrivateSyncBlockedUntil, setRateLimitUntil]);
 
-  const executeTrade = React.useCallback(async (type: 'BUY' | 'SELL', tradeSymbol: string, price: number, reason: string = 'Strategy Match', targetId?: string, cycleId?: number, tradePlan?: StrategySignal['tradePlan'], requestedAmount?: number, confidenceScore?: number) => {
+  const executeTrade = React.useCallback(async (type: 'BUY' | 'SELL', tradeSymbol: string, price: number, reason: string = 'Strategy Match', targetId?: string, cycleId?: number, tradePlan?: StrategySignal['tradePlan'], requestedAmount?: number, confidenceScore?: number, options?: ExecuteTradeOptions) => {
     if (loadingRef.current || !price) return;
     const time = new Date().toISOString();
     const eventCycleId = typeof cycleId === 'number' ? cycleId : undefined;
     const normalizedTradeSymbol = String(tradeSymbol || '').toUpperCase();
     const hasAllowedLiveQuote = liveQuoteAllowlist.some((quote: string) => normalizedTradeSymbol.endsWith(quote));
+    const allowManualOverride = options?.allowManualOverride === true;
     
     if (tradeSymbol.includes('undefined') || price <= 0) {
        addLog(`TRADE ABORTED: Invalid symbol or price [${tradeSymbol} @ ${price}]`, 'warning');
@@ -1452,39 +1517,55 @@ export default function App() {
       if ((type === 'BUY' || openingShort) && !closingExisting && entryLockActive) {
         const remainingSec = Math.max(1, Math.ceil((entryLockUntilRef.current - Date.now()) / 1000));
         const lockMsg = `ENTRY LOCK ACTIVE (${remainingSec}s): waiting for successful exits before new positions.`;
-        addLog(lockMsg, 'warning');
-        setExecutionFeedback({ type: 'warning', message: lockMsg });
-        pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${lockMsg}`, status: 'SKIPPED', cycleId: eventCycleId });
-        return;
+        if (!allowManualOverride) {
+          addLog(lockMsg, 'warning');
+          setExecutionFeedback({ type: 'warning', message: lockMsg });
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${lockMsg}`, status: 'SKIPPED', cycleId: eventCycleId });
+          return;
+        }
+        addLog(`MANUAL OVERRIDE: ${tradeSymbol} bypassing entry lock. ${lockMsg}`, 'warning');
+        setExecutionFeedback({ type: 'warning', message: `Manual override for ${tradeSymbol}: ${lockMsg}` });
       }
 
       if ((type === 'BUY' || openingShort) && !closingExisting) {
         const symbolRiskBlock = getSymbolRiskBlock(tradeSymbol);
         if (symbolRiskBlock) {
-          addLog(`TRADE SKIPPED: ${tradeSymbol} blocked by symbol guard (${symbolRiskBlock.reason}).`, 'warning');
-          setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${symbolRiskBlock.reason}.` });
-          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${symbolRiskBlock.reason}`, status: 'SKIPPED', cycleId: eventCycleId });
-          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Math.max(prev[tradeSymbol] || 0, symbolRiskBlock.until) }));
-          return;
+          if (!allowManualOverride) {
+            addLog(`TRADE SKIPPED: ${tradeSymbol} blocked by symbol guard (${symbolRiskBlock.reason}).`, 'warning');
+            setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${symbolRiskBlock.reason}.` });
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${symbolRiskBlock.reason}`, status: 'SKIPPED', cycleId: eventCycleId });
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Math.max(prev[tradeSymbol] || 0, symbolRiskBlock.until) }));
+            return;
+          }
+          addLog(`MANUAL OVERRIDE: ${tradeSymbol} bypassing symbol guard (${symbolRiskBlock.reason}).`, 'warning');
+          setExecutionFeedback({ type: 'warning', message: `Manual override for ${tradeSymbol}: ${symbolRiskBlock.reason}.` });
         }
 
         if (Number.isFinite(confidenceScore) && confidenceScore !== undefined && confidenceScore < autoEntryMinScore) {
           const confidenceMsg = `confidence ${confidenceScore.toFixed(1)} below live minimum ${autoEntryMinScore.toFixed(1)}`;
-          addLog(`TRADE SKIPPED: ${tradeSymbol} ${confidenceMsg}.`, 'warning');
-          setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${confidenceMsg}.` });
-          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${confidenceMsg}`, status: 'SKIPPED', cycleId: eventCycleId });
-          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * softCooldownMinutes) }));
-          return;
+          if (!allowManualOverride) {
+            addLog(`TRADE SKIPPED: ${tradeSymbol} ${confidenceMsg}.`, 'warning');
+            setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${confidenceMsg}.` });
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${confidenceMsg}`, status: 'SKIPPED', cycleId: eventCycleId });
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * softCooldownMinutes) }));
+            return;
+          }
+          addLog(`MANUAL OVERRIDE: ${tradeSymbol} bypassing confidence gate (${confidenceMsg}).`, 'warning');
+          setExecutionFeedback({ type: 'warning', message: `Manual override for ${tradeSymbol}: ${confidenceMsg}.` });
         }
 
         const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(type, price, tradePlan, estimatedRoundTripFrictionBps);
         if (edgeAfterFrictionPct !== null && edgeAfterFrictionPct < minEdgeAfterFrictionPct) {
           const edgeMsg = `edge after friction ${edgeAfterFrictionPct.toFixed(2)}% below ${minEdgeAfterFrictionPct.toFixed(2)}%`;
-          addLog(`TRADE SKIPPED: ${tradeSymbol} ${edgeMsg}.`, 'warning');
-          setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${edgeMsg}.` });
-          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${edgeMsg}`, status: 'SKIPPED', cycleId: eventCycleId });
-          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * softCooldownMinutes) }));
-          return;
+          if (!allowManualOverride) {
+            addLog(`TRADE SKIPPED: ${tradeSymbol} ${edgeMsg}.`, 'warning');
+            setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${edgeMsg}.` });
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${edgeMsg}`, status: 'SKIPPED', cycleId: eventCycleId });
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * softCooldownMinutes) }));
+            return;
+          }
+          addLog(`MANUAL OVERRIDE: ${tradeSymbol} bypassing edge gate (${edgeMsg}).`, 'warning');
+          setExecutionFeedback({ type: 'warning', message: `Manual override for ${tradeSymbol}: ${edgeMsg}.` });
         }
       }
 
@@ -1616,7 +1697,11 @@ export default function App() {
             ? realFreeCapital
             : Math.max(0, balance);
           const minLiveNotional = Math.max(1, liveMinOrderNotional);
-          const cappedMaxLiveNotional = Math.max(minLiveNotional, maxLiveOrderNotional);
+          const strongSignalSizing = Number.isFinite(confidenceScore) && confidenceScore !== undefined && isStrongLiveSignal(confidenceScore, autoEntryMinScore);
+          const cappedMaxLiveNotional = Math.max(
+            minLiveNotional,
+            maxLiveOrderNotional * (strongSignalSizing ? STRONG_LIVE_SIGNAL_NOTIONAL_MULTIPLIER : 1)
+          );
           const cappedTradableCapital = Math.min(tradableCapital, cappedMaxLiveNotional);
           let allocation = cappedTradableCapital;
 
@@ -3137,16 +3222,13 @@ export default function App() {
 
         const entries = signalCandidates
           .filter(entry => !getEntryBlockReason(entry))
-          .sort((a, b) => {
-            const directionalScoreDelta = getDirectionalEntryScore(b.side, b.pick.signal.score) - getDirectionalEntryScore(a.side, a.pick.signal.score);
-            if (directionalScoreDelta !== 0) return directionalScoreDelta;
-            return (b.pick.priorityRank || 0) - (a.pick.priorityRank || 0);
-          });
+          .sort(compareExecutionPriority);
         const eligibleBuyCount = entries.filter(entry => entry.side === 'BUY').length;
         const eligibleSellCount = entries.filter(entry => entry.side === 'SELL').length;
+        const baseAvailableSlots = Math.max(0, currentMaxTrades - currentHoldings.length);
+        const boostedAvailableSlots = Math.max(0, (currentMaxTrades + STRONG_LIVE_SIGNAL_EXTRA_SLOTS) - currentHoldings.length);
 
-        if (currentHoldings.length < currentMaxTrades) {
-          const availableSlots = currentMaxTrades - currentHoldings.length;
+        if (boostedAvailableSlots > 0) {
           const realFreeCapital = Math.max(0, availableFunds * 0.95);
           const realTradableCapital = realFreeCapital;
           if (isRealMode && realTradableCapital < liveMinOrderNotional) {
@@ -3155,12 +3237,17 @@ export default function App() {
             pushScanSkipEvent(`SKIP: Free margin too low for minimum order ($${realFreeCapital.toFixed(2)} effective $${realTradableCapital.toFixed(2)} < $${liveMinOrderNotional.toFixed(2)})`, cycleId);
             return;
           }
-          const toTrade = entries.slice(0, availableSlots);
+          const baseTrades = entries.slice(0, baseAvailableSlots);
+          const extraStrongTrades = entries
+            .slice(baseAvailableSlots)
+            .filter(({ side, pick }) => isStrongLiveSignal(getDirectionalEntryScore(side, pick.signal.score), autoEntryMinScore))
+            .slice(0, Math.max(0, boostedAvailableSlots - baseAvailableSlots));
+          const toTrade = [...baseTrades, ...extraStrongTrades];
           const selectedCount = toTrade.length;
           const deferredCount = 0;
           const coverageSummary = `coverage=${results.length}/${shortlistLimit}/${symbolsToScan.length}`;
           addLog(
-            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} ${coverageSummary}`,
+            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${baseAvailableSlots}${extraStrongTrades.length > 0 ? `+${extraStrongTrades.length} strong` : ''} ${coverageSummary}`,
             selectedCount > 0 ? 'success' : 'info',
           );
           
@@ -3193,10 +3280,10 @@ export default function App() {
               }
             }
           } else {
-            pushScanSkipEvent(`SKIP: No eligible entries (BUY=${eligibleBuyCount}, SELL=${eligibleSellCount}, slots=${availableSlots})`, cycleId);
+            pushScanSkipEvent(`SKIP: No eligible entries (BUY=${eligibleBuyCount}, SELL=${eligibleSellCount}, slots=${baseAvailableSlots}${boostedAvailableSlots > baseAvailableSlots ? `+${boostedAvailableSlots - baseAvailableSlots} strong-only` : ''})`, cycleId);
           }
         } else {
-          pushScanSkipEvent(`SKIP: No free slots (${currentHoldings.length}/${currentMaxTrades})`, cycleId);
+          pushScanSkipEvent(`SKIP: No free slots (${currentHoldings.length}/${currentMaxTrades}${STRONG_LIVE_SIGNAL_EXTRA_SLOTS > 0 ? ` base, +${STRONG_LIVE_SIGNAL_EXTRA_SLOTS} strong-only` : ''})`, cycleId);
         }
 
       }
@@ -3560,8 +3647,13 @@ export default function App() {
   const totalPnl = pnl;
   const openPnl = displayedUnrealizedRisk;
   const realizedPnl = totalPnl - openPnl;
-  const displayedAvailableFunds = isRealMode ? availableFunds : balance;
-  const usedCapital = Math.max(0, equity - displayedAvailableFunds);
+  const exchangeFreeMargin = isRealMode ? availableFunds : balance;
+  const remainingLiveSlots = Math.max(0, maxConcurrentTrades - holdings.length);
+  const deployableLiveMargin = isRealMode
+    ? Math.max(0, Math.min(exchangeFreeMargin * 0.99, remainingLiveSlots * Math.max(1, maxLiveOrderNotional)))
+    : balance;
+  const displayedAvailableFunds = exchangeFreeMargin;
+  const usedCapital = Math.max(0, equity - exchangeFreeMargin);
   const investedPct = equity > 0
     ? Math.min(100, Math.max(0, (usedCapital / equity) * 100))
     : 0;
@@ -3962,6 +4054,61 @@ export default function App() {
       }];
     }));
   }, [visibleSignalTablePicks, serverConfig?.exchange, isRealMode, liveQuoteAllowlist, fullUniverseMode, holdings, cooldowns, isUnsupportedLiveScanSymbol, autoEntryMinScore, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock]);
+  
+  const requestRankedSignalTrade = React.useCallback((pick: MarketScanResult, eligibility: { label: string; detail: string; className: string }) => {
+    const tradeType: 'BUY' | 'SELL' = pick.signal.overall === 'SELL' ? 'SELL' : 'BUY';
+    const isHeld = holdings.some(h => h.symbol === pick.symbol);
+    if (pick.signal.overall === 'HOLD' || isHeld) return;
+
+    const confidenceScore = getDirectionalEntryScore(tradeType, pick.signal.score);
+    const strategyReason = `AI_${pick.signal.overall}_DISCOVERY_${pick.signal.score}`;
+    const buttonLabel = eligibility.label === 'BLOCKED'
+      ? tradeType === 'SELL' ? 'Force Short' : 'Force Long'
+      : tradeType === 'SELL' ? 'Short' : 'Long';
+
+    if (eligibility.label === 'BLOCKED') {
+      setPendingManualOverrideTrade({
+        type: tradeType,
+        symbol: pick.symbol,
+        price: pick.lastPrice,
+        confidenceScore,
+        reason: eligibility.detail,
+        strategyReason,
+        buttonLabel,
+      });
+      return;
+    }
+
+    executeTrade(
+      tradeType,
+      pick.symbol,
+      pick.lastPrice,
+      strategyReason,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      confidenceScore,
+    );
+  }, [executeTrade, holdings]);
+  
+  const confirmManualOverrideTrade = React.useCallback(async () => {
+    if (!pendingManualOverrideTrade) return;
+    const pendingTrade = pendingManualOverrideTrade;
+    setPendingManualOverrideTrade(null);
+    await executeTrade(
+      pendingTrade.type,
+      pendingTrade.symbol,
+      pendingTrade.price,
+      pendingTrade.strategyReason,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      pendingTrade.confidenceScore,
+      { allowManualOverride: true },
+    );
+  }, [executeTrade, pendingManualOverrideTrade]);
 
   return (
     <div className="min-h-screen bg-[#E4E3E0] text-[#141414] p-4 md:p-8 font-sans selection:bg-[#F27D26] selection:text-white overflow-x-hidden">
@@ -3978,6 +4125,44 @@ export default function App() {
           <span className="leading-relaxed">{executionFeedback.message}</span>
           <button onClick={() => setExecutionFeedback(null)} className="shrink-0 font-black opacity-60 hover:opacity-100 text-xs">✕</button>
         </div>
+      )}
+
+      {pendingManualOverrideTrade && createPortal(
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-[#141414]/55 px-4 backdrop-blur-[2px]" onClick={() => setPendingManualOverrideTrade(null)}>
+          <div className="w-full max-w-md border-2 border-[#141414] bg-[#EDE9E1] p-5 shadow-[10px_10px_0px_0px_#141414]" onClick={(event) => event.stopPropagation()}>
+            <p className="text-[10px] font-mono uppercase tracking-[0.25em] text-rose-700">Manual Override</p>
+            <h3 className="mt-2 text-[20px] font-black uppercase tracking-tight text-[#141414]">
+              {pendingManualOverrideTrade.buttonLabel} {pendingManualOverrideTrade.symbol}
+            </h3>
+            <p className="mt-3 text-[11px] font-mono uppercase tracking-wide text-[#141414]/65">
+              This setup is currently blocked by a soft guard. Force entry will continue with a warning.
+            </p>
+            <div className="mt-4 border border-rose-300 bg-rose-50 px-3 py-3">
+              <p className="text-[9px] font-mono uppercase tracking-[0.2em] text-rose-800/75">Current Block</p>
+              <p className="mt-1 text-[12px] font-semibold leading-relaxed text-rose-950">{pendingManualOverrideTrade.reason}</p>
+            </div>
+            <p className="mt-4 text-[10px] font-mono uppercase tracking-wide text-[#141414]/55">
+              Hard exchange-validity checks still apply. Invalid symbols, quote restrictions, and non-tradable futures markets will still be rejected.
+            </p>
+            <div className="mt-5 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setPendingManualOverrideTrade(null)}
+                className="border border-[#141414]/20 px-3 py-2 text-[10px] font-black uppercase tracking-wide text-[#141414] transition-colors hover:bg-white"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={confirmManualOverrideTrade}
+                className="bg-rose-600 px-3 py-2 text-[10px] font-black uppercase tracking-wide text-white transition-colors hover:bg-rose-700"
+              >
+                {pendingManualOverrideTrade.buttonLabel}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
       )}
 
       {isAuthDisabledBannerVisible && (
@@ -4531,6 +4716,13 @@ export default function App() {
                     detail: 'status unavailable',
                     className: 'bg-gray-100 text-gray-600',
                   };
+                      const isHeld = holdings.some(h => h.symbol === pick.symbol);
+                      const isBlocked = eligibility.label === 'BLOCKED';
+                      const actionLabel = pick.signal.overall === 'SELL'
+                        ? (isBlocked ? 'Force Short' : 'Short')
+                        : pick.signal.overall === 'BUY'
+                          ? (isBlocked ? 'Force Long' : 'Long')
+                          : 'Hold';
                   return (
                   <div key={pick.symbol} className="grid grid-cols-6 items-center group py-1.5 hover:bg-gray-50/50 px-2 border-b border-gray-50 transition-colors">
                     <button 
@@ -4603,11 +4795,16 @@ export default function App() {
 
                     <div className="flex justify-end">
                       <button 
-                        onClick={() => executeTrade(pick.signal.overall === 'SELL' ? 'SELL' : 'BUY', pick.symbol, pick.lastPrice, `AI_${pick.signal.overall}_DISCOVERY_${pick.signal.score}`, undefined, undefined, undefined, undefined, getDirectionalEntryScore(pick.signal.overall === 'SELL' ? 'SELL' : 'BUY', pick.signal.score))}
-                        disabled={pick.signal.overall === 'HOLD' || entryLockActive || holdings.length >= maxConcurrentTrades || holdings.some(h => h.symbol === pick.symbol)}
-                        className="text-[#141414] hover:bg-[#F27D26] hover:text-white border border-[#141414]/10 text-[10px] px-2 py-0.5 font-bold uppercase transition-all disabled:opacity-0"
+                        onClick={() => requestRankedSignalTrade(pick, eligibility)}
+                        disabled={pick.signal.overall === 'HOLD' || isHeld}
+                        title={isBlocked ? `Manual override required: ${eligibility.detail}` : `${actionLabel} ${pick.symbol}`}
+                        className={`border text-[10px] px-2 py-0.5 font-bold uppercase transition-all disabled:opacity-0 ${
+                          isBlocked
+                            ? 'border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-600 hover:text-white'
+                            : 'border-[#141414]/10 text-[#141414] hover:bg-[#F27D26] hover:text-white'
+                        }`}
                       >
-                        {pick.signal.overall === 'SELL' ? 'Short' : pick.signal.overall === 'BUY' ? 'Long' : 'Hold'}
+                        {actionLabel}
                       </button>
                     </div>
                   </div>
@@ -5238,22 +5435,24 @@ export default function App() {
               </div>
             </section>
           )}
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2 xl:grid-cols-3">
             <MetricBox 
               icon={<Wallet className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Portfolio Value"
               value={`$${equity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
               trend={pnl >= 0 ? 'up' : 'down'}
+              action={
+                <button 
+                  onClick={(e) => { e.stopPropagation(); resetAccount(); }}
+                  className="border border-[#141414]/10 px-1.5 py-[2px] text-[7px] font-black uppercase tracking-wide text-[#141414]/60 transition-colors hover:bg-[#141414] hover:text-white"
+                >
+                  Reset
+                </button>
+              }
               subValue={
-                <div className="flex items-center gap-2">
-                   <span className="opacity-60">AVAILABLE: ${displayedAvailableFunds.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
-                   <button 
-                     onClick={(e) => { e.stopPropagation(); resetAccount(); }}
-                     className="text-[8px] bg-white/5 hover:bg-white/10 px-2 py-0.5 rounded transition-colors uppercase font-bold"
-                   >
-                     Reset
-                   </button>
-                </div>
+                isRealMode
+                  ? `Free $${exchangeFreeMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | Deploy $${deployableLiveMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                  : `Available $${displayedAvailableFunds.toLocaleString(undefined, { minimumFractionDigits: 2 })}`
               }
             />
             <MetricBox 
@@ -5268,21 +5467,23 @@ export default function App() {
               label="Total P&L"
               value={`${totalPnl >= 0 ? '+' : '-'}$${Math.abs(totalPnl).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
               trend={totalPnl >= 0 ? 'up' : 'down'}
-              subValue={`Realized: ${realizedPnl >= 0 ? '+' : '-'}$${Math.abs(realizedPnl).toFixed(2)} | Open: ${openPnl >= 0 ? '+' : '-'}$${Math.abs(openPnl).toFixed(2)}`}
+              subValue={`Realized ${realizedPnl >= 0 ? '+' : '-'}$${Math.abs(realizedPnl).toFixed(2)} | Open ${openPnl >= 0 ? '+' : '-'}$${Math.abs(openPnl).toFixed(2)}`}
             />
             <MetricBox 
               icon={<Zap className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Network Status"
               value={isSyncing ? "SYNCING..." : (isRealMode ? "LIVE" : "PAPER")}
               subValue={serverConfig?.exchange
-                ? `${serverConfig.exchange.toUpperCase()} | ${holdings.length}/${maxConcurrentTrades} SLOTS${entryLockActive ? ' | ENTRY LOCK' : ''} | ${scanDataSource}`
+                ? `${serverConfig.exchange.toUpperCase()} | ${holdings.length}/${maxConcurrentTrades} slots${entryLockActive ? ' | lock' : ''} | ${scanDataSource}`
                 : "SIMULATION"}
             />
             <MetricBox 
               icon={<DollarSign className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
-              label="Available Margin"
-              value={`$${displayedAvailableFunds.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-              subValue={isRealMode ? "Available Balance After Reserved Margin" : "Simulated Capital"}
+              label={isRealMode ? "Deployable Now" : "Available Margin"}
+              value={`$${(isRealMode ? deployableLiveMargin : displayedAvailableFunds).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+              subValue={isRealMode
+                ? `Free $${exchangeFreeMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | ${remainingLiveSlots} slots @ $${maxLiveOrderNotional.toFixed(0)}`
+                : "Simulated Capital"}
             />
             <MetricBox 
               icon={<Activity className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
@@ -5610,19 +5811,22 @@ export default function App() {
   );
 }
 
-const MetricBox = ({ icon, label, value, trend, subValue }: { icon: React.ReactNode, label: string, value: string, trend?: 'up' | 'down', subValue?: React.ReactNode }) => {
+const MetricBox = ({ icon, label, value, trend, subValue, action }: { icon: React.ReactNode, label: string, value: string, trend?: 'up' | 'down', subValue?: React.ReactNode, action?: React.ReactNode }) => {
   return (
-    <div className="bg-white border-2 border-[#141414] px-4 py-3.5 flex items-center justify-between group hover:bg-[#141414] hover:text-white transition-colors duration-300 font-sans">
-      <div className="flex items-center gap-3">
-        <div className="p-2 bg-[#141414] text-white group-hover:bg-[#F27D26] transition-colors">
+    <div className="bg-white border-2 border-[#141414] px-2.5 py-2 flex items-center justify-between group hover:bg-[#141414] hover:text-white transition-colors duration-300 font-sans">
+      <div className="flex items-center gap-2.5 min-w-0">
+        <div className="p-1 bg-[#141414] text-white group-hover:bg-[#F27D26] transition-colors shrink-0">
           {icon}
         </div>
         <div className="min-w-0">
-          <p className="text-[10px] uppercase font-bold opacity-40 tracking-tighter group-hover:opacity-60">{label}</p>
+          <div className="flex items-center justify-between gap-2">
+            <p className="truncate text-[8px] uppercase font-bold opacity-40 tracking-tight group-hover:opacity-60">{label}</p>
+            {action && <div className="shrink-0">{action}</div>}
+          </div>
           <div className="flex flex-col">
-            <p className="whitespace-nowrap text-[24px] font-black tabular-nums tracking-tighter leading-none">{value}</p>
+            <p className="whitespace-nowrap text-[17px] font-black tabular-nums tracking-tight leading-none md:text-[18px]">{value}</p>
             {subValue && (
-              <div className="mt-0.5 font-mono uppercase text-[8px] font-bold opacity-60 break-words">
+              <div className="mt-0.5 font-mono text-[6.5px] font-bold opacity-60 break-words leading-[1.25] uppercase">
                 {subValue}
               </div>
             )}
@@ -5630,8 +5834,8 @@ const MetricBox = ({ icon, label, value, trend, subValue }: { icon: React.ReactN
         </div>
       </div>
       {trend && (
-        <div className={trend === 'up' ? 'text-emerald-600' : 'text-rose-600'}>
-          {trend === 'up' ? <ArrowUpRight size={22} /> : <ArrowDownRight size={22} />}
+        <div className={`shrink-0 ${trend === 'up' ? 'text-emerald-600' : 'text-rose-600'}`}>
+          {trend === 'up' ? <ArrowUpRight size={16} /> : <ArrowDownRight size={16} />}
         </div>
       )}
     </div>
