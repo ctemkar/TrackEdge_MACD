@@ -337,7 +337,9 @@ export default function App() {
   });
   const [maxLiveOrderNotional, setMaxLiveOrderNotional] = useState(() => {
     const saved = localStorage.getItem('te_live_max_order_notional');
-    return saved ? Math.max(1, parseFloat(saved) || 150) : 150;
+    return saved
+      ? Math.max(liveMinOrderNotional, parseFloat(saved) || PARAMETER_DEFAULTS.maxLiveOrderNotional)
+      : PARAMETER_DEFAULTS.maxLiveOrderNotional;
   });
   const [hardReentryCooldownMinutes, setHardReentryCooldownMinutes] = useState(() => {
     const saved = localStorage.getItem('te_hard_reentry_cooldown_minutes');
@@ -882,24 +884,32 @@ export default function App() {
     const minLiveNotional = Math.max(1, liveMinOrderNotional);
     const availableCapital = Math.max(0, tradableCapital);
     const strongSignalSizing = Number.isFinite(confidenceScore) && confidenceScore !== undefined && isStrongLiveSignal(confidenceScore, autoEntryMinScore);
-    const cappedMaxLiveNotional = Math.max(
-      minLiveNotional,
-      maxLiveOrderNotional * (strongSignalSizing ? STRONG_LIVE_SIGNAL_NOTIONAL_MULTIPLIER : 1)
+    const confidenceFloor = Math.min(9.5, Math.max(0, autoEntryMinScore));
+    const normalizedConfidence = Number.isFinite(confidenceScore) && confidenceScore !== undefined
+      ? Math.max(0, Math.min(1, (confidenceScore - confidenceFloor) / Math.max(0.5, 10 - confidenceFloor)))
+      : 0;
+    const proportionalCapitalShare = strongSignalSizing
+      ? (0.2 + (normalizedConfidence * 0.2))
+      : (0.16 + (normalizedConfidence * 0.12));
+    const proportionalTargetNotional = availableCapital * proportionalCapitalShare;
+    const cappedMaxLiveNotional = Math.min(
+      availableCapital,
+      Math.max(
+        minLiveNotional,
+        maxLiveOrderNotional,
+        proportionalTargetNotional,
+        maxLiveOrderNotional * (strongSignalSizing ? STRONG_LIVE_SIGNAL_NOTIONAL_MULTIPLIER : 1)
+      )
     );
-    const cappedTradableCapital = Math.min(availableCapital, cappedMaxLiveNotional);
-    let allocation = cappedTradableCapital;
+    let allocation = cappedMaxLiveNotional;
 
-    if (Number.isFinite(confidenceScore) && confidenceScore !== undefined) {
-      const confidenceFloor = Math.min(9.5, Math.max(0, autoEntryMinScore));
-      const normalizedConfidence = Math.max(
-        0,
-        Math.min(1, (confidenceScore - confidenceFloor) / Math.max(0.5, 10 - confidenceFloor))
-      );
-      const confidenceBandMax = Math.max(minLiveNotional, cappedTradableCapital);
-      allocation = minLiveNotional + ((confidenceBandMax - minLiveNotional) * normalizedConfidence);
+    if (normalizedConfidence > 0) {
+      const confidenceFloorAllocation = strongSignalSizing ? 0.7 : 0.55;
+      const scaledConfidence = confidenceFloorAllocation + ((1 - confidenceFloorAllocation) * normalizedConfidence);
+      allocation = minLiveNotional + ((cappedMaxLiveNotional - minLiveNotional) * scaledConfidence);
     }
 
-    allocation = Math.min(Math.max(minLiveNotional, allocation), cappedTradableCapital);
+    allocation = Math.min(Math.max(minLiveNotional, allocation), cappedMaxLiveNotional);
 
     if (allocation < minLiveNotional) {
       return 0;
@@ -907,7 +917,7 @@ export default function App() {
 
     if (isDefensiveMode) {
       allocation *= 0.5;
-      allocation = Math.min(Math.max(minLiveNotional, allocation), cappedTradableCapital);
+      allocation = Math.min(Math.max(minLiveNotional, allocation), cappedMaxLiveNotional);
     }
 
     return allocation;
@@ -3210,9 +3220,6 @@ export default function App() {
             return `confidence ${directionalConfidence.toFixed(1)} below ${autoEntryMinScore.toFixed(1)}`;
           }
           if (matchingHolding) {
-            if (!isStrongLiveSignal(directionalConfidence, autoEntryMinScore)) {
-              return 'already held';
-            }
             const desiredNotional = getDesiredLiveEntryNotional(directionalConfidence, Math.max(0, availableFunds * 0.99));
             const currentNotional = getHoldingActiveNotional(matchingHolding, pick.lastPrice);
             if ((desiredNotional - currentNotional) < liveMinOrderNotional) {
@@ -4433,7 +4440,7 @@ export default function App() {
                   {scanning
                     ? (isScanPreparing
                       ? `Scanner Active: Preparing ${scanDisplayTotal} Assets`
-                      : `Scanner Active: ${scanProgress.current} / ${scanProgress.total} Assets`)
+                      : `Scanner Active: ${scanProgress.current} / ${scanProgress.total} Assets (${Math.round(scanProgressPct)}%)`)
                     : `Scanner Online: Monitoring ${availableSymbols.length} Assets`}
                 </span>
               </div>
@@ -4452,7 +4459,7 @@ export default function App() {
             <div className="mt-3 mb-4">
               <div className="flex justify-between text-[11px] font-mono uppercase opacity-60 mb-1">
                 <span>{scanning ? 'Scan Progress' : 'Idle'}</span>
-                <span>{scanning ? (isScanPreparing ? 'Preparing...' : `${Math.round(scanProgressPct)}%`) : `${availableSymbols.length} assets`}</span>
+                <span>{scanning ? (isScanPreparing ? 'Preparing...' : 'Live') : 'Ready'}</span>
               </div>
               <div className="h-1 w-full bg-gray-100 rounded-full overflow-hidden">
                 <div
