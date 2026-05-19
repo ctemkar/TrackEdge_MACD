@@ -16,6 +16,11 @@ const CRITERIA_HELP: Record<string, string> = {
   autoEntryMinScore: 'Minimum strategy confidence required before opening a new position. Higher values reduce trade frequency and prioritize stronger setups.',
   liveMinOrderNotional: 'Minimum USDT notional value allowed per live order. Helps avoid exchange min-notional rejects and tiny low-quality entries.',
   maxLiveOrderNotional: 'Maximum USDT notional value allowed per live order. Live entries scale between the minimum and this cap based on directional confidence.',
+  hardReentryCooldownMinutes: 'Hard per-symbol cooldown after any filled exit. Prevents immediate re-entry churn on the same market after a close.',
+  minEdgeAfterFrictionPct: 'Minimum expected take-profit edge left after estimated fees and slippage. Blocks live entries whose edge is too thin to justify friction.',
+  estimatedRoundTripFrictionBps: 'Estimated round-trip fees plus slippage in basis points. Used to reject setups where expected edge is mostly consumed by execution costs.',
+  symbolDailyLossLimit: 'Maximum realized loss per symbol per trading day before that symbol is disabled for the rest of the day.',
+  symbolDailyFlipLimit: 'Maximum number of realized round trips per symbol per trading day before the symbol is kill-switched until the next day.',
   macdFastPeriod: 'Fast EMA period used by MACD. Lower values react faster to price changes but can create more noise.',
   macdSlowPeriod: 'Slow EMA period used by MACD. Higher values smooth trend detection but react slower to reversals.',
   macdSignalPeriod: 'Signal-line EMA period for MACD cross detection. Larger values filter noise but delay entry/exit confirmation.',
@@ -60,9 +65,14 @@ const PARAMETER_DEFAULTS = {
   stopLossPercent: 3.5,
   maxDrawdownPercent: 10,
   isDefensiveMode: false,
-  autoEntryMinScore: 6,
+  autoEntryMinScore: 6.8,
   liveMinOrderNotional: 10,
   maxLiveOrderNotional: 150,
+  hardReentryCooldownMinutes: 120,
+  minEdgeAfterFrictionPct: 0.35,
+  estimatedRoundTripFrictionBps: 18,
+  symbolDailyLossLimit: 12,
+  symbolDailyFlipLimit: 3,
   liveQuoteAllowlistInput: DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT,
   scanIntervalSec: 40,
   holdingPollIntervalSec: 10,
@@ -142,6 +152,41 @@ const describeHoldReason = (reason?: string) => {
 const summarizeRejectReasons = (reasons?: string[], limit: number = 2) => {
   if (!reasons || reasons.length === 0) return '';
   return reasons.slice(0, limit).join(' | ');
+};
+
+type SymbolRiskSummary = {
+  symbol: string;
+  realizedPnl: number;
+  realizedPnlPct: number;
+  entryNotional: number;
+  closedTrades: number;
+  lastExitAt: number;
+  hardReentryUntil: number;
+  dailyStopUntil: number;
+  dailyStopReason: string | null;
+};
+
+const TRADING_DAY_MS = 24 * 60 * 60 * 1000;
+
+const getTradingDayStart = (timestamp: number) => {
+  const next = new Date(timestamp);
+  next.setHours(0, 0, 0, 0);
+  return next.getTime();
+};
+
+const getExpectedEdgeAfterFrictionPct = (
+  side: 'BUY' | 'SELL',
+  price: number,
+  tradePlan: StrategySignal['tradePlan'] | undefined,
+  estimatedRoundTripFrictionBps: number,
+) => {
+  if (!tradePlan || !price || price <= 0) return null;
+  const targetPrice = tradePlan.tp1Price || tradePlan.tp2Price;
+  if (!targetPrice || targetPrice <= 0) return null;
+  const grossEdgePct = side === 'BUY'
+    ? ((targetPrice - price) / price) * 100
+    : ((price - targetPrice) / price) * 100;
+  return grossEdgePct - (estimatedRoundTripFrictionBps / 100);
 };
 
 const CriteriaInfoLabel = ({ text, detail }: { text: string; detail: string }) => {
@@ -253,7 +298,7 @@ export default function App() {
   });
   const [autoEntryMinScore, setAutoEntryMinScore] = useState(() => {
     const saved = localStorage.getItem('te_auto_entry_min_score');
-    return saved ? (parseFloat(saved) || 2) : 2;
+    return saved ? (parseFloat(saved) || PARAMETER_DEFAULTS.autoEntryMinScore) : PARAMETER_DEFAULTS.autoEntryMinScore;
   });
   const [liveMinOrderNotional, setLiveMinOrderNotional] = useState(() => {
     const saved = localStorage.getItem('te_live_min_order_notional');
@@ -262,6 +307,26 @@ export default function App() {
   const [maxLiveOrderNotional, setMaxLiveOrderNotional] = useState(() => {
     const saved = localStorage.getItem('te_live_max_order_notional');
     return saved ? Math.max(1, parseFloat(saved) || 150) : 150;
+  });
+  const [hardReentryCooldownMinutes, setHardReentryCooldownMinutes] = useState(() => {
+    const saved = localStorage.getItem('te_hard_reentry_cooldown_minutes');
+    return saved ? (parseInt(saved, 10) || PARAMETER_DEFAULTS.hardReentryCooldownMinutes) : PARAMETER_DEFAULTS.hardReentryCooldownMinutes;
+  });
+  const [minEdgeAfterFrictionPct, setMinEdgeAfterFrictionPct] = useState(() => {
+    const saved = localStorage.getItem('te_min_edge_after_friction_pct');
+    return saved ? (parseFloat(saved) || PARAMETER_DEFAULTS.minEdgeAfterFrictionPct) : PARAMETER_DEFAULTS.minEdgeAfterFrictionPct;
+  });
+  const [estimatedRoundTripFrictionBps, setEstimatedRoundTripFrictionBps] = useState(() => {
+    const saved = localStorage.getItem('te_estimated_round_trip_friction_bps');
+    return saved ? (parseFloat(saved) || PARAMETER_DEFAULTS.estimatedRoundTripFrictionBps) : PARAMETER_DEFAULTS.estimatedRoundTripFrictionBps;
+  });
+  const [symbolDailyLossLimit, setSymbolDailyLossLimit] = useState(() => {
+    const saved = localStorage.getItem('te_symbol_daily_loss_limit');
+    return saved ? (parseFloat(saved) || PARAMETER_DEFAULTS.symbolDailyLossLimit) : PARAMETER_DEFAULTS.symbolDailyLossLimit;
+  });
+  const [symbolDailyFlipLimit, setSymbolDailyFlipLimit] = useState(() => {
+    const saved = localStorage.getItem('te_symbol_daily_flip_limit');
+    return saved ? (parseInt(saved, 10) || PARAMETER_DEFAULTS.symbolDailyFlipLimit) : PARAMETER_DEFAULTS.symbolDailyFlipLimit;
   });
   const [liveQuoteAllowlistInput, setLiveQuoteAllowlistInput] = useState(() => {
     const saved = localStorage.getItem('te_live_quote_allowlist');
@@ -619,6 +684,85 @@ export default function App() {
   const UNSUPPORTED_SCAN_SYMBOLS_KEY = 'te_unsupported_scan_symbols';
   const liveTradableSymbolsRef = React.useRef<Set<string>>(new Set());
   const liveTradableSymbolsFetchedAtRef = React.useRef(0);
+
+  const symbolRiskSummary = React.useMemo(() => {
+    const now = Date.now();
+    const tradingDayStart = getTradingDayStart(now);
+    const tradingDayEnd = tradingDayStart + TRADING_DAY_MS;
+    const summaries = new Map<string, SymbolRiskSummary>();
+
+    const ensureSummary = (symbol: string) => {
+      const normalizedSymbol = String(symbol || '').toUpperCase();
+      const existing = summaries.get(normalizedSymbol);
+      if (existing) return existing;
+      const created: SymbolRiskSummary = {
+        symbol: normalizedSymbol,
+        realizedPnl: 0,
+        realizedPnlPct: 0,
+        entryNotional: 0,
+        closedTrades: 0,
+        lastExitAt: 0,
+        hardReentryUntil: 0,
+        dailyStopUntil: 0,
+        dailyStopReason: null,
+      };
+      summaries.set(normalizedSymbol, created);
+      return created;
+    };
+
+    for (const trade of tradeHistory) {
+      const symbolKey = String(trade.symbol || '').toUpperCase();
+      if (!symbolKey || symbolKey === 'SCAN') continue;
+      const tradeTs = Date.parse(trade.time || '');
+      if (!Number.isFinite(tradeTs) || tradeTs < tradingDayStart || tradeTs >= tradingDayEnd) continue;
+      const status = trade.status || 'FILLED';
+      if (status !== 'FILLED' && status !== 'SYNC_REMOVED') continue;
+      if (typeof trade.pnl !== 'number') continue;
+
+      const summary = ensureSummary(symbolKey);
+      summary.realizedPnl += trade.pnl;
+      summary.entryNotional += Math.max(0, Number(trade.entryPrice || trade.price || 0) * Math.abs(Number(trade.amount || 0)));
+      summary.closedTrades += 1;
+      summary.lastExitAt = Math.max(summary.lastExitAt, tradeTs);
+    }
+
+    for (const summary of summaries.values()) {
+      summary.realizedPnlPct = summary.entryNotional > 0 ? (summary.realizedPnl / summary.entryNotional) * 100 : 0;
+      summary.hardReentryUntil = summary.lastExitAt > 0
+        ? summary.lastExitAt + (hardReentryCooldownMinutes * 60 * 1000)
+        : 0;
+      if (summary.realizedPnl <= -Math.abs(symbolDailyLossLimit)) {
+        summary.dailyStopUntil = tradingDayEnd;
+        summary.dailyStopReason = `kill switch: realized loss $${Math.abs(summary.realizedPnl).toFixed(2)} >= $${Math.abs(symbolDailyLossLimit).toFixed(2)}`;
+      } else if (summary.closedTrades >= Math.max(1, symbolDailyFlipLimit)) {
+        summary.dailyStopUntil = tradingDayEnd;
+        summary.dailyStopReason = `kill switch: ${summary.closedTrades} round trips >= ${Math.max(1, symbolDailyFlipLimit)} today`;
+      }
+    }
+
+    return summaries;
+  }, [tradeHistory, hardReentryCooldownMinutes, symbolDailyFlipLimit, symbolDailyLossLimit]);
+
+  const getSymbolRiskBlock = React.useCallback((rawSymbol: string, at: number = Date.now()) => {
+    const normalizedSymbol = String(rawSymbol || '').toUpperCase();
+    const summary = symbolRiskSummary.get(normalizedSymbol);
+    if (!summary) return null;
+    if (summary.dailyStopUntil > at && summary.dailyStopReason) {
+      const hoursRemaining = Math.max(1, Math.ceil((summary.dailyStopUntil - at) / (60 * 60 * 1000)));
+      return {
+        reason: `${summary.dailyStopReason} (${hoursRemaining}h remaining)`,
+        until: summary.dailyStopUntil,
+      };
+    }
+    if (summary.hardReentryUntil > at) {
+      const minutesRemaining = Math.max(1, Math.ceil((summary.hardReentryUntil - at) / 60000));
+      return {
+        reason: `hard re-entry cooldown ${minutesRemaining}m remaining`,
+        until: summary.hardReentryUntil,
+      };
+    }
+    return null;
+  }, [symbolRiskSummary]);
   const currentScanCycleRef = React.useRef(0);
   const entryLockUntilRef = React.useRef(0);
   const lastScanSkipLogRef = React.useRef<Record<string, number>>({});
@@ -1314,6 +1458,36 @@ export default function App() {
         return;
       }
 
+      if ((type === 'BUY' || openingShort) && !closingExisting) {
+        const symbolRiskBlock = getSymbolRiskBlock(tradeSymbol);
+        if (symbolRiskBlock) {
+          addLog(`TRADE SKIPPED: ${tradeSymbol} blocked by symbol guard (${symbolRiskBlock.reason}).`, 'warning');
+          setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${symbolRiskBlock.reason}.` });
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${symbolRiskBlock.reason}`, status: 'SKIPPED', cycleId: eventCycleId });
+          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Math.max(prev[tradeSymbol] || 0, symbolRiskBlock.until) }));
+          return;
+        }
+
+        if (Number.isFinite(confidenceScore) && confidenceScore !== undefined && confidenceScore < autoEntryMinScore) {
+          const confidenceMsg = `confidence ${confidenceScore.toFixed(1)} below live minimum ${autoEntryMinScore.toFixed(1)}`;
+          addLog(`TRADE SKIPPED: ${tradeSymbol} ${confidenceMsg}.`, 'warning');
+          setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${confidenceMsg}.` });
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${confidenceMsg}`, status: 'SKIPPED', cycleId: eventCycleId });
+          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * softCooldownMinutes) }));
+          return;
+        }
+
+        const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(type, price, tradePlan, estimatedRoundTripFrictionBps);
+        if (edgeAfterFrictionPct !== null && edgeAfterFrictionPct < minEdgeAfterFrictionPct) {
+          const edgeMsg = `edge after friction ${edgeAfterFrictionPct.toFixed(2)}% below ${minEdgeAfterFrictionPct.toFixed(2)}%`;
+          addLog(`TRADE SKIPPED: ${tradeSymbol} ${edgeMsg}.`, 'warning');
+          setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${edgeMsg}.` });
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${edgeMsg}`, status: 'SKIPPED', cycleId: eventCycleId });
+          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * softCooldownMinutes) }));
+          return;
+        }
+      }
+
       const lockEntries = (ms: number, why: string) => {
         const until = Date.now() + ms;
         setEntryLockUntil(prev => Math.max(prev, until));
@@ -1560,7 +1734,7 @@ export default function App() {
               applyOptimisticLiveFill(type, tradeSymbol, amount, price, time);
               setExecutionFeedback({ type: 'info', message: `${type} submitted for ${tradeSymbol}. Awaiting exchange confirmation.` });
               pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason: `SUBMITTED: ${msg}`, status: 'SUBMITTED', cycleId: eventCycleId });
-              setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * successCooldownMinutes) }));
+              setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * Math.max(successCooldownMinutes, hardReentryCooldownMinutes)) }));
               setTimeout(syncRealBalance, 1500);
               setTimeout(syncRealBalance, 4500);
               return;
@@ -1580,7 +1754,7 @@ export default function App() {
             if (closingExisting) {
               lockEntries(closeFailureLockMinutes * 60 * 1000, `Close verification failed for ${tradeSymbol}. New entries paused for ${closeFailureLockMinutes}m.`);
             }
-            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * softCooldownMinutes) }));
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * Math.max(softCooldownMinutes, hardReentryCooldownMinutes)) }));
             setTimeout(syncRealBalance, 1500);
             setTimeout(syncRealBalance, 4500);
             return;
@@ -1602,7 +1776,7 @@ export default function App() {
               status: 'FILLED',
               cycleId: eventCycleId,
             });
-            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * successCooldownMinutes) }));
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * Math.max(successCooldownMinutes, hardReentryCooldownMinutes)) }));
             setTimeout(syncRealBalance, 2000);
             return;
           }
@@ -1649,7 +1823,7 @@ export default function App() {
 
           addLog(`REAL ${type} SUCCESS: ${tradeSymbol}`, 'success');
           setExecutionFeedback({ type: 'success', message: `${type} confirmed on exchange for ${tradeSymbol}.` });
-          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * successCooldownMinutes) }));
+          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * Math.max(successCooldownMinutes, hardReentryCooldownMinutes)) }));
           setTimeout(syncRealBalance, 1500); 
         } else {
           throw new Error(result.message || 'Order failed');
@@ -1722,7 +1896,7 @@ export default function App() {
             }
             setExecutionFeedback({ type: 'info', message: `${type} submitted for ${tradeSymbol}. Waiting for exchange confirmation.` });
             pushTradeEvent({ type, symbol: tradeSymbol, price, amount: optimisticAmount, time, reason: `SUBMITTED: ${msg}`, status: 'SUBMITTED', cycleId: eventCycleId });
-            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * successCooldownMinutes) }));
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * Math.max(successCooldownMinutes, hardReentryCooldownMinutes)) }));
             setTimeout(syncRealBalance, 1500);
             setTimeout(syncRealBalance, 4500);
             return;
@@ -1872,9 +2046,10 @@ export default function App() {
           }
 
           if (pnlPct < 0) {
-             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * paperLossCooldownMinutes) }));
+             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * Math.max(paperLossCooldownMinutes, hardReentryCooldownMinutes)) }));
              addLog(`TRADE EXIT [${tradeSymbol}]: Loss of $${Math.abs(pnl).toFixed(2)} (${pnlPct.toFixed(2)}%)`, 'warning');
           } else {
+             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * hardReentryCooldownMinutes) }));
              addLog(`TRADE EXIT [${tradeSymbol}]: Profit of $${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)`, 'success');
           }
 
@@ -1897,7 +2072,7 @@ export default function App() {
         }
       }
     }
-  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, maxLiveOrderNotional, autoEntryMinScore, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes]);
+  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, maxLiveOrderNotional, autoEntryMinScore, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes, hardReentryCooldownMinutes, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock]);
 
   const managePlannedExit = React.useCallback((holding: Holding, price: number, signal?: StrategySignal | null, cycleId?: number) => {
     const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
@@ -2108,6 +2283,11 @@ export default function App() {
     localStorage.setItem('te_auto_entry_min_score', autoEntryMinScore.toString());
     localStorage.setItem('te_live_min_order_notional', liveMinOrderNotional.toString());
     localStorage.setItem('te_live_max_order_notional', maxLiveOrderNotional.toString());
+    localStorage.setItem('te_hard_reentry_cooldown_minutes', hardReentryCooldownMinutes.toString());
+    localStorage.setItem('te_min_edge_after_friction_pct', minEdgeAfterFrictionPct.toString());
+    localStorage.setItem('te_estimated_round_trip_friction_bps', estimatedRoundTripFrictionBps.toString());
+    localStorage.setItem('te_symbol_daily_loss_limit', symbolDailyLossLimit.toString());
+    localStorage.setItem('te_symbol_daily_flip_limit', symbolDailyFlipLimit.toString());
     localStorage.setItem('te_live_quote_allowlist', liveQuoteAllowlistInput);
     localStorage.setItem('te_scan_interval_sec', scanIntervalSec.toString());
     localStorage.setItem('te_holding_poll_interval_sec', holdingPollIntervalSec.toString());
@@ -2123,7 +2303,7 @@ export default function App() {
     localStorage.setItem('te_close_failure_lock_minutes', closeFailureLockMinutes.toString());
     localStorage.setItem('te_hard_failure_lock_minutes', hardFailureLockMinutes.toString());
     localStorage.setItem('te_strategy_config', JSON.stringify(strategyConfig));
-  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
+  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, hardReentryCooldownMinutes, minEdgeAfterFrictionPct, estimatedRoundTripFrictionBps, symbolDailyLossLimit, symbolDailyFlipLimit, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
 
   useEffect(() => {
     localStorage.setItem('te_show_extra_criteria', showExtraCriteria ? '1' : '0');
@@ -2259,6 +2439,11 @@ export default function App() {
     autoEntryMinScore: number;
     liveMinOrderNotional: number;
     maxLiveOrderNotional: number;
+    hardReentryCooldownMinutes: number;
+    minEdgeAfterFrictionPct: number;
+    estimatedRoundTripFrictionBps: number;
+    symbolDailyLossLimit: number;
+    symbolDailyFlipLimit: number;
     scanIntervalSec: number;
     holdingPollIntervalSec: number;
     maxSymbolsPerScan: number;
@@ -2297,6 +2482,11 @@ export default function App() {
     setAutoEntryMinScore(aiCriteriaSnapshot.autoEntryMinScore);
     setLiveMinOrderNotional(aiCriteriaSnapshot.liveMinOrderNotional);
     setMaxLiveOrderNotional(aiCriteriaSnapshot.maxLiveOrderNotional);
+    setHardReentryCooldownMinutes(aiCriteriaSnapshot.hardReentryCooldownMinutes);
+    setMinEdgeAfterFrictionPct(aiCriteriaSnapshot.minEdgeAfterFrictionPct);
+    setEstimatedRoundTripFrictionBps(aiCriteriaSnapshot.estimatedRoundTripFrictionBps);
+    setSymbolDailyLossLimit(aiCriteriaSnapshot.symbolDailyLossLimit);
+    setSymbolDailyFlipLimit(aiCriteriaSnapshot.symbolDailyFlipLimit);
     setScanIntervalSec(aiCriteriaSnapshot.scanIntervalSec);
     setHoldingPollIntervalSec(aiCriteriaSnapshot.holdingPollIntervalSec);
     setMaxSymbolsPerScan(aiCriteriaSnapshot.maxSymbolsPerScan);
@@ -2331,6 +2521,11 @@ export default function App() {
     setAutoEntryMinScore(PARAMETER_DEFAULTS.autoEntryMinScore);
     setLiveMinOrderNotional(PARAMETER_DEFAULTS.liveMinOrderNotional);
     setMaxLiveOrderNotional(PARAMETER_DEFAULTS.maxLiveOrderNotional);
+    setHardReentryCooldownMinutes(PARAMETER_DEFAULTS.hardReentryCooldownMinutes);
+    setMinEdgeAfterFrictionPct(PARAMETER_DEFAULTS.minEdgeAfterFrictionPct);
+    setEstimatedRoundTripFrictionBps(PARAMETER_DEFAULTS.estimatedRoundTripFrictionBps);
+    setSymbolDailyLossLimit(PARAMETER_DEFAULTS.symbolDailyLossLimit);
+    setSymbolDailyFlipLimit(PARAMETER_DEFAULTS.symbolDailyFlipLimit);
     setLiveQuoteAllowlistInput(PARAMETER_DEFAULTS.liveQuoteAllowlistInput);
     setScanIntervalSec(PARAMETER_DEFAULTS.scanIntervalSec);
     setHoldingPollIntervalSec(PARAMETER_DEFAULTS.holdingPollIntervalSec);
@@ -2381,6 +2576,11 @@ export default function App() {
       autoEntryMinScore,
       liveMinOrderNotional,
       maxLiveOrderNotional,
+      hardReentryCooldownMinutes,
+      minEdgeAfterFrictionPct,
+      estimatedRoundTripFrictionBps,
+      symbolDailyLossLimit,
+      symbolDailyFlipLimit,
       scanIntervalSec,
       holdingPollIntervalSec,
       maxSymbolsPerScan,
@@ -2408,6 +2608,21 @@ export default function App() {
       if (part.includes('auto entry') && val !== null) {
         setAutoEntryMinScore(Math.max(0, Math.min(10, val)));
         touched.push('Auto Entry Score');
+      } else if ((part.includes('re-entry cooldown') || part.includes('reentry cooldown')) && val !== null) {
+        setHardReentryCooldownMinutes(Math.max(1, Math.round(val)));
+        touched.push('Hard Re-entry Cooldown');
+      } else if ((part.includes('edge after friction') || part.includes('min edge')) && val !== null) {
+        setMinEdgeAfterFrictionPct(Math.max(0, val));
+        touched.push('Min Edge After Friction');
+      } else if ((part.includes('friction bps') || part.includes('round trip friction') || part.includes('fees and slippage')) && val !== null) {
+        setEstimatedRoundTripFrictionBps(Math.max(0, val));
+        touched.push('Estimated Friction');
+      } else if ((part.includes('symbol daily loss') || part.includes('daily loss limit')) && val !== null) {
+        setSymbolDailyLossLimit(Math.max(1, val));
+        touched.push('Symbol Daily Loss Limit');
+      } else if ((part.includes('symbol daily flip') || part.includes('daily flip limit')) && val !== null) {
+        setSymbolDailyFlipLimit(Math.max(1, Math.round(val)));
+        touched.push('Symbol Daily Flip Limit');
       } else if ((part.includes('max live notional') || part.includes('max notional')) && val !== null) {
         setMaxLiveOrderNotional(Math.max(liveMinOrderNotional, val));
         touched.push('Max Live Notional');
@@ -2828,7 +3043,7 @@ export default function App() {
         .filter(r => r.signal.overall === 'BUY' || (isRealMode && r.signal.overall === 'SELL'))
         .map(pick => ({ side: pick.signal.overall === 'SELL' ? 'SELL' as const : 'BUY' as const, pick }));
 
-      const getEntryBlockReason = ({ pick }: { side: 'BUY' | 'SELL'; pick: MarketScanResult }) => {
+      const getEntryBlockReason = ({ side, pick }: { side: 'BUY' | 'SELL'; pick: MarketScanResult }) => {
         if (isLiveBinance && !isLikelyBinanceFuturesSymbol(pick.symbol)) {
           return 'invalid futures symbol format';
         }
@@ -2845,6 +3060,20 @@ export default function App() {
         if (cooldownUntil > scanNow) {
           const minutesRemaining = Math.max(1, Math.ceil((cooldownUntil - scanNow) / 60000));
           return `cooldown ${minutesRemaining}m remaining`;
+        }
+        const symbolRiskBlock = getSymbolRiskBlock(pick.symbol, scanNow);
+        if (symbolRiskBlock) {
+          return symbolRiskBlock.reason;
+        }
+        if (isRealMode) {
+          const directionalConfidence = getDirectionalEntryScore(side, pick.signal.score);
+          if (directionalConfidence < autoEntryMinScore) {
+            return `confidence ${directionalConfidence.toFixed(1)} below ${autoEntryMinScore.toFixed(1)}`;
+          }
+          const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(side, pick.lastPrice, pick.signal.tradePlan, estimatedRoundTripFrictionBps);
+          if (edgeAfterFrictionPct !== null && edgeAfterFrictionPct < minEdgeAfterFrictionPct) {
+            return `edge ${edgeAfterFrictionPct.toFixed(2)}% below ${minEdgeAfterFrictionPct.toFixed(2)}%`;
+          }
         }
         if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
           return 'quote asset treated as cash';
@@ -2979,7 +3208,7 @@ export default function App() {
       setScanning(false);
       setTimeout(() => setIsBotActive(false), 2000);
     }
-  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, liveEntriesPerCycle, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode, isUnsupportedLiveScanSymbol]);
+  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, liveEntriesPerCycle, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode, isUnsupportedLiveScanSymbol, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock]);
  // Removed 'scanning' from dependencies
 
   React.useEffect(() => {
@@ -3568,6 +3797,17 @@ export default function App() {
     return true;
   });
 
+  const symbolRiskRows = React.useMemo(() => {
+    return Array.from(symbolRiskSummary.values())
+      .sort((a, b) => {
+        const aBlocked = a.dailyStopUntil > Date.now() ? 1 : 0;
+        const bBlocked = b.dailyStopUntil > Date.now() ? 1 : 0;
+        if (bBlocked !== aBlocked) return bBlocked - aBlocked;
+        return Math.abs(b.realizedPnl) - Math.abs(a.realizedPnl);
+      })
+      .slice(0, 8);
+  }, [symbolRiskSummary]);
+
   // Auto-Recovery - Clean wipe if core state is corrupted
   useEffect(() => {
     if (isDataBroken) {
@@ -3684,10 +3924,26 @@ export default function App() {
         if (cooldownUntil > scanNow) {
           const minutesRemaining = Math.max(1, Math.ceil((cooldownUntil - scanNow) / 60000));
           reason = `cooldown ${minutesRemaining}m`;
-        } else if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
-          reason = 'quote asset treated as cash';
-        } else if (isLiveBinance && isUnsupportedLiveScanSymbol(pick.symbol)) {
-          reason = 'unsupported market';
+        } else {
+          const symbolRiskBlock = getSymbolRiskBlock(pick.symbol, scanNow);
+          if (symbolRiskBlock) {
+            reason = symbolRiskBlock.reason;
+          } else {
+            const directionalSide = pick.signal.overall === 'SELL' ? 'SELL' : 'BUY';
+            const directionalConfidence = getDirectionalEntryScore(directionalSide, pick.signal.score);
+            if (isRealMode && directionalConfidence < autoEntryMinScore) {
+              reason = `confidence ${directionalConfidence.toFixed(1)} below ${autoEntryMinScore.toFixed(1)}`;
+            } else {
+              const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(directionalSide, pick.lastPrice, pick.signal.tradePlan, estimatedRoundTripFrictionBps);
+              if (isRealMode && edgeAfterFrictionPct !== null && edgeAfterFrictionPct < minEdgeAfterFrictionPct) {
+                reason = `edge ${edgeAfterFrictionPct.toFixed(2)}% below ${minEdgeAfterFrictionPct.toFixed(2)}%`;
+              } else if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
+                reason = 'quote asset treated as cash';
+              } else if (isLiveBinance && isUnsupportedLiveScanSymbol(pick.symbol)) {
+                reason = 'unsupported market';
+              }
+            }
+          }
         }
       }
 
@@ -3705,7 +3961,7 @@ export default function App() {
         className: 'bg-emerald-100 text-emerald-700',
       }];
     }));
-  }, [visibleSignalTablePicks, serverConfig?.exchange, isRealMode, liveQuoteAllowlist, fullUniverseMode, holdings, cooldowns, isUnsupportedLiveScanSymbol]);
+  }, [visibleSignalTablePicks, serverConfig?.exchange, isRealMode, liveQuoteAllowlist, fullUniverseMode, holdings, cooldowns, isUnsupportedLiveScanSymbol, autoEntryMinScore, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock]);
 
   return (
     <div className="min-h-screen bg-[#E4E3E0] text-[#141414] p-4 md:p-8 font-sans selection:bg-[#F27D26] selection:text-white overflow-x-hidden">
@@ -4589,6 +4845,21 @@ export default function App() {
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Max Live Notional" detail={CRITERIA_HELP.maxLiveOrderNotional} />
                       <input type="number" min={liveMinOrderNotional} step="1" value={maxLiveOrderNotional} onChange={(e) => setMaxLiveOrderNotional(Math.max(liveMinOrderNotional, parseFloat(e.target.value) || liveMinOrderNotional))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Hard Re-entry Cooldown (m)" detail={CRITERIA_HELP.hardReentryCooldownMinutes} />
+                      <input type="number" min="1" step="1" value={hardReentryCooldownMinutes} onChange={(e) => setHardReentryCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
+                    </label>
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Min Edge After Friction (%)" detail={CRITERIA_HELP.minEdgeAfterFrictionPct} />
+                      <input type="number" min="0" step="0.05" value={minEdgeAfterFrictionPct} onChange={(e) => setMinEdgeAfterFrictionPct(Math.max(0, parseFloat(e.target.value) || 0))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
+                    </label>
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Round-trip Friction (bps)" detail={CRITERIA_HELP.estimatedRoundTripFrictionBps} />
+                      <input type="number" min="0" step="1" value={estimatedRoundTripFrictionBps} onChange={(e) => setEstimatedRoundTripFrictionBps(Math.max(0, parseFloat(e.target.value) || 0))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
+                    </label>
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Symbol Daily Loss Limit" detail={CRITERIA_HELP.symbolDailyLossLimit} />
+                      <input type="number" min="1" step="1" value={symbolDailyLossLimit} onChange={(e) => setSymbolDailyLossLimit(Math.max(1, parseFloat(e.target.value) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
+                    </label>
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Symbol Daily Flip Limit" detail={CRITERIA_HELP.symbolDailyFlipLimit} />
+                      <input type="number" min="1" step="1" value={symbolDailyFlipLimit} onChange={(e) => setSymbolDailyFlipLimit(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
+                    </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="MACD Fast" detail={CRITERIA_HELP.macdFastPeriod} />
                       <input type="number" min="1" step="1" value={strategyConfig.macdFastPeriod} onChange={(e) => updateStrategyConfig({ macdFastPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
@@ -5011,7 +5282,7 @@ export default function App() {
               icon={<DollarSign className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Available Margin"
               value={`$${displayedAvailableFunds.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-              subValue={isRealMode ? "Live Exchange Free Balance" : "Simulated Capital"}
+              subValue={isRealMode ? "Available Balance After Reserved Margin" : "Simulated Capital"}
             />
             <MetricBox 
               icon={<Activity className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
@@ -5157,6 +5428,57 @@ export default function App() {
             </div>
           </section>
 
+          <section className="bg-white border-2 border-[#141414] shadow-[8px_8px_0px_0px_#141414] overflow-hidden">
+            <div className="bg-gray-50 border-b border-[#141414]/10 p-4 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <ShieldAlert size={14} className="opacity-50" />
+                <h3 className="font-mono text-[10px] uppercase tracking-widest font-bold">Symbol Risk Ledger</h3>
+              </div>
+              <span className="text-[9px] font-mono uppercase opacity-50">Realized P&amp;L Today</span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead className="bg-gray-50/50 uppercase font-mono text-[8px] opacity-40 border-b">
+                  <tr>
+                    <th className="px-4 py-2">Symbol</th>
+                    <th className="px-4 py-2">Realized</th>
+                    <th className="px-4 py-2">Rounds</th>
+                    <th className="px-4 py-2">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-50">
+                  {symbolRiskRows.length === 0 ? (
+                    <tr>
+                      <td colSpan={4} className="px-4 py-10 text-center text-[10px] opacity-30 italic">No realized symbol exits recorded for today yet.</td>
+                    </tr>
+                  ) : symbolRiskRows.map((row) => {
+                    const now = Date.now();
+                    const dailyStopped = row.dailyStopUntil > now;
+                    const coolingDown = !dailyStopped && row.hardReentryUntil > now;
+                    return (
+                      <tr key={row.symbol} className="hover:bg-gray-50/30 transition-colors cursor-pointer" onClick={() => setSymbol(row.symbol)}>
+                        <td className="px-4 py-3 text-xs font-black">{row.symbol.replace('USDT', '').replace('USDC', '').replace('USD', '')}</td>
+                        <td className={`px-4 py-3 text-[11px] font-black ${row.realizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                          {row.realizedPnl >= 0 ? '+' : '-'}${Math.abs(row.realizedPnl).toFixed(2)}
+                          <div className="text-[8px] opacity-50">{row.realizedPnlPct >= 0 ? '+' : ''}{row.realizedPnlPct.toFixed(2)}%</div>
+                        </td>
+                        <td className="px-4 py-3 text-[10px] font-mono opacity-70">{row.closedTrades}/{Math.max(1, symbolDailyFlipLimit)}</td>
+                        <td className="px-4 py-3">
+                          <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-sm ${dailyStopped ? 'bg-rose-100 text-rose-700' : coolingDown ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'}`}>
+                            {dailyStopped ? 'KILLED' : coolingDown ? 'COOLDOWN' : 'ACTIVE'}
+                          </span>
+                          <div className="text-[8px] opacity-50 mt-1">
+                            {dailyStopped ? row.dailyStopReason : coolingDown ? `re-entry until ${new Date(row.hardReentryUntil).toLocaleTimeString()}` : 'eligible if current scan edge passes'}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
           {/* Trade History & Command Logs */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
              <section className="bg-white border-2 border-[#141414] shadow-[8px_8px_0px_0px_#141414] overflow-hidden flex flex-col h-[400px]">
@@ -5213,7 +5535,7 @@ export default function App() {
                                       {trade.status || 'FILLED'}
                                     </span>
                                   </div>
-                                  {trade.type === 'SELL' && trade.pnl !== undefined ? (
+                                  {trade.pnl !== undefined ? (
                                     <div className={`flex flex-col ${trade.pnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                                        <span className="text-[11px] font-black">${trade.pnl.toFixed(2)}</span>
                                        <span className="text-[9px] font-bold opacity-60">{trade.pnlPct?.toFixed(2)}%</span>
