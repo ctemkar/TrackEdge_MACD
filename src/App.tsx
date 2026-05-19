@@ -607,6 +607,24 @@ export default function App() {
     repeatCount: number;
   }
 
+  interface ScanArchiveEntry {
+    id: string;
+    completedAt: number;
+    summary: string;
+    decision?: string;
+    analyzed: number;
+    total: number;
+    buy: number;
+    sell: number;
+    hold: number;
+    topSignals: Array<{
+      symbol: string;
+      signal: 'BUY' | 'SELL' | 'HOLD';
+      score: number;
+      priorityRank: number;
+    }>;
+  }
+
   type MarketPickLifecycle = {
     label: 'Signal Found' | 'Order Submitted' | 'Exchange Confirmed' | 'Watching';
     className: string;
@@ -695,6 +713,16 @@ export default function App() {
     return saved !== null ? saved === 'true' : false;
   });
   const [systemLogs, setSystemLogs] = useState<SystemLogEntry[]>([]);
+  const [scanArchive, setScanArchive] = useState<ScanArchiveEntry[]>(() => {
+    const saved = localStorage.getItem('te_scan_archive');
+    if (!saved) return [];
+    try {
+      const parsed = JSON.parse(saved);
+      return Array.isArray(parsed) ? parsed as ScanArchiveEntry[] : [];
+    } catch {
+      return [];
+    }
+  });
   const [holdingPrices, setHoldingPrices] = useState<Record<string, number>>({});
   const [liveUnrealizedPnl, setLiveUnrealizedPnl] = useState(0);
   const [cooldowns, setCooldowns] = useState<Record<string, number>>({});
@@ -1086,6 +1114,21 @@ export default function App() {
     });
   }, []);
 
+  const appendScanArchiveEntry = React.useCallback((entry: Omit<ScanArchiveEntry, 'id'>) => {
+    const archiveEntry: ScanArchiveEntry = {
+      id: `${entry.completedAt}-${Math.random().toString(36).slice(2, 8)}`,
+      ...entry,
+    };
+    setScanArchive((prev) => [archiveEntry, ...prev]);
+  }, []);
+
+  const updateLatestScanArchiveDecision = React.useCallback((decision: string) => {
+    setScanArchive((prev) => {
+      if (prev.length === 0) return prev;
+      return [{ ...prev[0], decision }, ...prev.slice(1)];
+    });
+  }, []);
+
   const pushTradeEvent = React.useCallback((event: TradeEvent) => {
     const normalized = { ...event, status: event.status || 'FILLED' };
     setTradeHistory(prev => [normalized, ...prev]);
@@ -1111,6 +1154,14 @@ export default function App() {
       });
     }
   }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('te_scan_archive', JSON.stringify(scanArchive));
+    } catch (error) {
+      console.warn('[TradeEdge] Failed to persist scan archive:', error);
+    }
+  }, [scanArchive]);
 
   const pushScanSkipEvent = React.useCallback((reason: string, cycleId: number) => {
     const now = Date.now();
@@ -3228,6 +3279,7 @@ export default function App() {
         acc[key] = (acc[key] || 0) + 1;
         return acc;
       }, { BUY: 0, SELL: 0, HOLD: 0 } as Record<'BUY' | 'SELL' | 'HOLD', number>);
+      const completedAt = Date.now();
       setScanSignalSummary({
         analyzed: results.length + unavailableCount,
         shortlisted: shortlistLimit,
@@ -3239,9 +3291,26 @@ export default function App() {
         unavailable: unavailableCount,
         insufficientHistoryUnavailable: unavailableSummary.insufficientHistory,
         otherUnavailable: unavailableSummary.otherUnavailable,
-        updatedAt: Date.now(),
+        updatedAt: completedAt,
       });
       const scanSummary = `SCAN SUMMARY: ${results.length}/${symbolsToScan.length} analyzed | BUY=${signalCounts.BUY} SELL=${signalCounts.SELL} HOLD=${signalCounts.HOLD}`;
+      appendScanArchiveEntry({
+        completedAt,
+        summary: scanSummary,
+        analyzed: results.length + unavailableCount,
+        total: symbolsToScan.length,
+        buy: signalCounts.BUY,
+        sell: signalCounts.SELL,
+        hold: signalCounts.HOLD,
+        topSignals: results
+          .slice(0, 8)
+          .map((pick) => ({
+            symbol: pick.symbol,
+            signal: pick.signal.overall,
+            score: pick.signal.score,
+            priorityRank: pick.priorityRank || 0,
+          })),
+      });
       addLog(
         scanSummary,
         signalCounts.BUY > 0 || signalCounts.SELL > 0 ? 'success' : 'info'
@@ -3478,6 +3547,7 @@ export default function App() {
             `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${baseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE} ${coverageSummary}`,
             selectedCount > 0 ? 'success' : 'info',
           );
+          updateLatestScanArchiveDecision(`SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${baseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE} ${coverageSummary}`);
           
           if (selectedTrades.length > 0 || deferredTrades.length > 0) {
             // Live mode safety: execute entries sequentially to avoid burst margin failures.
@@ -3530,6 +3600,7 @@ export default function App() {
   }, [performScan]);
 
   const resetAccount = React.useCallback(() => {
+    const persistedScanArchive = localStorage.getItem('te_scan_archive');
     setBalance(seedCapital);
     setAvailableFunds(seedCapital);
     setBenchmarkCapital(seedCapital);
@@ -3537,6 +3608,9 @@ export default function App() {
     setTradeHistory([]);
     setSystemLogs([]);
     localStorage.clear();
+    if (persistedScanArchive) {
+      localStorage.setItem('te_scan_archive', persistedScanArchive);
+    }
     localStorage.setItem('te_seed', seedCapital.toString());
     localStorage.setItem('te_benchmark_capital', seedCapital.toString());
     localStorage.setItem('te_available_funds', seedCapital.toString());
@@ -4323,6 +4397,42 @@ export default function App() {
       undefined,
       undefined,
       undefined,
+      undefined,
+      confidenceScore,
+    );
+  }, [executeTrade, holdings]);
+
+  const requestRankedSignalBuy = React.useCallback((pick: MarketScanResult) => {
+    const currentHolding = holdings.find((holding) => holding.symbol === pick.symbol);
+    const confidenceScore = getDirectionalEntryScore('BUY', pick.signal.score);
+    const strategyReason = `MANUAL_TOP_RANKED_BUY_${pick.signal.overall}_${pick.signal.score}`;
+    const buyBlockedReason = pick.signal.overall !== 'BUY'
+      ? `strategy signal is ${pick.signal.overall}; manual buy override required`
+      : null;
+
+    if (buyBlockedReason) {
+      setPendingManualOverrideTrade({
+        type: 'BUY',
+        symbol: pick.symbol,
+        price: pick.lastPrice,
+        confidenceScore,
+        reason: currentHolding?.side === 'SHORT'
+          ? `${buyBlockedReason}. Existing short will be closed before a new long can be established.`
+          : buyBlockedReason,
+        strategyReason,
+        buttonLabel: currentHolding?.side === 'LONG' ? 'Buy More' : 'Force Buy',
+      });
+      return;
+    }
+
+    executeTrade(
+      'BUY',
+      pick.symbol,
+      pick.lastPrice,
+      strategyReason,
+      undefined,
+      undefined,
+      pick.signal.tradePlan,
       undefined,
       confidenceScore,
     );
