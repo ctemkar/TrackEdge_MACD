@@ -187,6 +187,17 @@ const summarizeRejectReasons = (reasons?: string[], limit: number = 2) => {
   return reasons.slice(0, limit).join(' | ');
 };
 
+const formatSignalAge = (foundAt: number) => {
+  const elapsedMs = Math.max(0, Date.now() - foundAt);
+  const elapsedMinutes = Math.floor(elapsedMs / 60000);
+  if (elapsedMinutes < 1) return 'found just now';
+  if (elapsedMinutes === 1) return 'found 1 min ago';
+  if (elapsedMinutes < 60) return `found ${elapsedMinutes} min ago`;
+  const elapsedHours = Math.floor(elapsedMinutes / 60);
+  if (elapsedHours === 1) return 'found 1 hr ago';
+  return `found ${elapsedHours} hr ago`;
+};
+
 type SymbolRiskSummary = {
   symbol: string;
   realizedPnl: number;
@@ -318,6 +329,16 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
   const [marketPicks, setMarketPicks] = useState<MarketScanResult[]>([]);
+  const [persistedRankedSignals, setPersistedRankedSignals] = useState<RankedSignalSnapshotEntry[]>(() => {
+    const saved = localStorage.getItem('te_persisted_ranked_signals');
+    if (!saved) return [];
+    try {
+      const parsed = JSON.parse(saved);
+      return Array.isArray(parsed) ? parsed as RankedSignalSnapshotEntry[] : [];
+    } catch {
+      return [];
+    }
+  });
   const [symbol, setSymbol] = useState('BTCUSDT');
   const [availableSymbols, setAvailableSymbols] = useState<{ label: string, value: string }[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
@@ -623,6 +644,11 @@ export default function App() {
       score: number;
       priorityRank: number;
     }>;
+  }
+
+  interface RankedSignalSnapshotEntry {
+    pick: MarketScanResult;
+    foundAt: number;
   }
 
   type MarketPickLifecycle = {
@@ -1128,6 +1154,14 @@ export default function App() {
       return [{ ...prev[0], decision }, ...prev.slice(1)];
     });
   }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('te_persisted_ranked_signals', JSON.stringify(persistedRankedSignals));
+    } catch (error) {
+      console.warn('[TradeEdge] Failed to persist ranked signals:', error);
+    }
+  }, [persistedRankedSignals]);
 
   const pushTradeEvent = React.useCallback((event: TradeEvent) => {
     const normalized = { ...event, status: event.status || 'FILLED' };
@@ -3273,6 +3307,10 @@ export default function App() {
       }
 
       setMarketPicks(results);
+      if (results.length > 0) {
+        const foundAt = Date.now();
+        setPersistedRankedSignals(results.slice(0, visibleSignalTableLimit).map((pick) => ({ pick, foundAt })));
+      }
       const unavailableCount = unavailableSummary.insufficientHistory + unavailableSummary.otherUnavailable;
       const signalCounts = results.reduce((acc, row) => {
         const key = row.signal.overall;
@@ -3601,6 +3639,7 @@ export default function App() {
 
   const resetAccount = React.useCallback(() => {
     const persistedScanArchive = localStorage.getItem('te_scan_archive');
+    const persistedRankedSignalSnapshot = localStorage.getItem('te_persisted_ranked_signals');
     setBalance(seedCapital);
     setAvailableFunds(seedCapital);
     setBenchmarkCapital(seedCapital);
@@ -3610,6 +3649,9 @@ export default function App() {
     localStorage.clear();
     if (persistedScanArchive) {
       localStorage.setItem('te_scan_archive', persistedScanArchive);
+    }
+    if (persistedRankedSignalSnapshot) {
+      localStorage.setItem('te_persisted_ranked_signals', persistedRankedSignalSnapshot);
     }
     localStorage.setItem('te_seed', seedCapital.toString());
     localStorage.setItem('te_benchmark_capital', seedCapital.toString());
@@ -4287,8 +4329,17 @@ export default function App() {
     }
   }, [rejectReasonGroups, selectedRejectReason]);
 
-  const visibleSignalTablePicks = marketPicks
-    .slice(0, visibleSignalTableLimit);
+  const visibleSignalTableEntries = React.useMemo(() => {
+    if (marketPicks.length > 0) {
+      const foundAt = scanSignalSummary.updatedAt || Date.now();
+      return marketPicks
+        .slice(0, visibleSignalTableLimit)
+        .map((pick) => ({ pick, foundAt }));
+    }
+    return persistedRankedSignals.slice(0, visibleSignalTableLimit);
+  }, [marketPicks, persistedRankedSignals, scanSignalSummary.updatedAt]);
+  const visibleSignalTablePicks = visibleSignalTableEntries.map((entry) => entry.pick);
+  const usingPersistedRankedSignals = marketPicks.length === 0 && persistedRankedSignals.length > 0;
   const rankedSignalStatuses = React.useMemo(() => {
     const normalizedLiveExchange = String(serverConfig?.exchange || '').toLowerCase();
     const isLiveBinance = isRealMode && normalizedLiveExchange === 'binance';
@@ -5051,10 +5102,10 @@ export default function App() {
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <h3 className="font-mono text-[12px] uppercase tracking-[0.2em] opacity-75">Top Ranked Signals</h3>
-                <span className="text-[10px] font-mono uppercase opacity-50">{visibleSignalTablePicks.length} shown</span>
+                <span className="text-[10px] font-mono uppercase opacity-50">{visibleSignalTablePicks.length} shown{usingPersistedRankedSignals ? ' | last non-empty' : ''}</span>
               </div>
               <p className="text-[9px] font-mono uppercase tracking-wide opacity-45 px-2">
-                Displaying strategy score and profitability rank side by side.
+                Displaying strategy score, profitability rank, and when the signal was found.
               </p>
               <div className="grid grid-cols-6 items-center border-b pb-2 text-[10px] font-mono opacity-50 uppercase tracking-wide px-2">
                 <span>Asset</span>
@@ -5065,7 +5116,7 @@ export default function App() {
                 <span className="text-right">Action</span>
               </div>
               <div className="space-y-2 max-h-[520px] overflow-y-auto custom-scrollbar pr-2">
-                {visibleSignalTablePicks.map((pick) => {
+                {visibleSignalTableEntries.map(({ pick, foundAt }) => {
                   const lifecycle = getMarketPickLifecycle(pick);
                   const eligibility = rankedSignalStatuses[pick.symbol] || {
                     label: 'UNKNOWN',
@@ -5088,6 +5139,9 @@ export default function App() {
                       <span>{pick.symbol.replace('USDT', '')}</span>
                       <span className={`mt-1 rounded-sm px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide ${lifecycle.className}`}>
                         {lifecycle.label}
+                      </span>
+                      <span className="mt-1 text-[8px] font-mono uppercase opacity-45">
+                        {formatSignalAge(foundAt)}
                       </span>
                     </button>
                     
