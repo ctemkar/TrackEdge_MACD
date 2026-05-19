@@ -2066,6 +2066,15 @@ export default function App() {
     }
   }, [holdings, holdingPrices, symbol, currentPrice, executeTrade, addLog]);
 
+  const confirmAndClosePosition = React.useCallback((holding: Holding, markPrice: number) => {
+    const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
+    const confirmed = window.confirm(
+      `Confirm close for ${holding.symbol} (${holding.side}) at about $${formatPrice(markPrice)}?`
+    );
+    if (!confirmed) return;
+    executeTrade(closeSide, holding.symbol, markPrice, 'MANUAL_DOCK_CONTROL', holding.id);
+  }, [executeTrade]);
+
   useEffect(() => {
     checkServer();
   }, [checkServer]);
@@ -5132,7 +5141,7 @@ export default function App() {
                              <button 
                                onClick={(e) => {
                                  e.stopPropagation();
-                            executeTrade(closeSide, h.symbol, mark, 'MANUAL_DOCK_CONTROL', h.id);
+                            confirmAndClosePosition(h, mark);
                                }}
                                className="bg-[#141414] text-white hover:bg-[#F27D26] px-3 py-1 text-[9px] font-black uppercase tracking-tighter transition-all"
                              >
