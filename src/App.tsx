@@ -4402,13 +4402,15 @@ export default function App() {
     );
   }, [executeTrade, holdings]);
 
-  const requestRankedSignalBuy = React.useCallback((pick: MarketScanResult) => {
+  const requestRankedSignalBuy = React.useCallback((pick: MarketScanResult, eligibility: { label: string; detail: string; className: string }) => {
     const currentHolding = holdings.find((holding) => holding.symbol === pick.symbol);
     const confidenceScore = getDirectionalEntryScore('BUY', pick.signal.score);
     const strategyReason = `MANUAL_TOP_RANKED_BUY_${pick.signal.overall}_${pick.signal.score}`;
     const buyBlockedReason = pick.signal.overall !== 'BUY'
       ? `strategy signal is ${pick.signal.overall}; manual buy override required`
-      : null;
+      : eligibility.label === 'BLOCKED'
+        ? eligibility.detail
+        : null;
 
     if (buyBlockedReason) {
       setPendingManualOverrideTrade({
@@ -5147,7 +5149,7 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="flex justify-end">
+                    <div className="flex justify-end gap-1">
                       <button 
                         onClick={() => requestRankedSignalTrade(pick, eligibility)}
                         disabled={pick.signal.overall === 'HOLD' || isHeld}
@@ -5159,6 +5161,13 @@ export default function App() {
                         }`}
                       >
                         {actionLabel}
+                      </button>
+                      <button
+                        onClick={() => requestRankedSignalBuy(pick, eligibility)}
+                        title={pick.signal.overall === 'BUY' && eligibility.label !== 'BLOCKED' ? `Buy ${pick.symbol}` : `Manual buy override for ${pick.symbol}`}
+                        className="border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-[10px] font-bold uppercase text-emerald-700 transition-all hover:bg-emerald-600 hover:text-white"
+                      >
+                        {isHeld ? 'Buy More' : 'Buy'}
                       </button>
                     </div>
                   </div>
@@ -6137,6 +6146,53 @@ export default function App() {
                         <div className="leading-relaxed">
                           {log.repeatCount > 1 ? `${log.message} ... (x${log.repeatCount})` : log.message}
                         </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+             </section>
+
+             <section className="bg-white border-2 border-[#141414] shadow-[8px_8px_0px_0px_#141414] overflow-hidden flex flex-col h-[320px] lg:col-span-2">
+                <div className="bg-gray-50 border-b border-[#141414]/10 p-4 flex items-center justify-between">
+                   <div className="flex items-center gap-2">
+                     <RefreshCw size={14} className="opacity-40" />
+                     <h3 className="font-mono text-[10px] uppercase tracking-widest font-bold">Scan Archive</h3>
+                   </div>
+                   <div className="flex items-center gap-3">
+                     <span className="text-[9px] font-mono uppercase opacity-50">{scanArchive.length} cycles persisted</span>
+                     <button onClick={() => setScanArchive([])} className="text-[9px] font-bold opacity-30 hover:opacity-100 uppercase transition-opacity">Clear Archive</button>
+                   </div>
+                </div>
+                <div className="flex-grow overflow-y-auto custom-scrollbar p-2 space-y-2">
+                  {scanArchive.length === 0 ? (
+                    <div className="h-full flex items-center justify-center text-[10px] opacity-30 italic">No completed scan cycles archived yet.</div>
+                  ) : (
+                    scanArchive.map((entry) => (
+                      <div key={entry.id} className="border border-slate-200 bg-slate-50/60 px-3 py-2">
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <p className="text-[10px] font-mono uppercase tracking-[0.18em] opacity-60">{new Date(entry.completedAt).toLocaleString()}</p>
+                            <p className="mt-1 text-[10px] font-mono text-slate-900">{entry.summary}</p>
+                          </div>
+                          <span className="text-[9px] font-mono uppercase opacity-50">{entry.analyzed}/{entry.total}</span>
+                        </div>
+                        {entry.decision && (
+                          <p className="mt-2 text-[9px] font-mono text-slate-700">{entry.decision}</p>
+                        )}
+                        {entry.topSignals.length > 0 && (
+                          <div className="mt-2 flex flex-wrap gap-1.5">
+                            {entry.topSignals.map((signal) => (
+                              <button
+                                key={`${entry.id}-${signal.symbol}`}
+                                type="button"
+                                onClick={() => setSymbol(signal.symbol)}
+                                className={`border px-1.5 py-0.5 text-[8px] font-mono uppercase ${signal.signal === 'BUY' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : signal.signal === 'SELL' ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-gray-200 bg-gray-50 text-gray-600'}`}
+                              >
+                                {signal.symbol} {signal.signal} {signal.score.toFixed(1)} | {signal.priorityRank.toFixed(2)}
+                              </button>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     ))
                   )}
