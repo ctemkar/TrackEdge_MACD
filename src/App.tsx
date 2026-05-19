@@ -3508,11 +3508,31 @@ export default function App() {
         const eligibleSellCount = entries.filter(entry => entry.side === 'SELL').length;
         const baseAvailableSlots = Math.max(0, currentMaxTrades - currentHoldings.length);
         const boostedAvailableSlots = Math.max(0, (currentMaxTrades + STRONG_LIVE_SIGNAL_EXTRA_SLOTS) - currentHoldings.length);
+        const totalLiveCapacity = Math.max(1, currentMaxTrades + STRONG_LIVE_SIGNAL_EXTRA_SLOTS);
         const sideSelectionCap = boostedAvailableSlots <= 1
           ? 1
           : Math.min(3, Math.max(2, Math.ceil(boostedAvailableSlots / 2)));
+        const portfolioSideCap = totalLiveCapacity <= 2
+          ? 1
+          : Math.max(2, Math.ceil(totalLiveCapacity * 0.6));
 
         if (boostedAvailableSlots > 0) {
+          const openSideCounts = currentHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
+            acc[holding.side === 'SHORT' ? 'SELL' : 'BUY'] += 1;
+            return acc;
+          }, { BUY: 0, SELL: 0 });
+          const openSideNotional = currentHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
+            const side = holding.side === 'SHORT' ? 'SELL' : 'BUY';
+            acc[side] += getHoldingActiveNotional(holding);
+            return acc;
+          }, { BUY: 0, SELL: 0 });
+          const totalOpenNotional = openSideNotional.BUY + openSideNotional.SELL;
+          const totalOpenPositions = currentHoldings.length;
+          const shortCountShare = totalOpenPositions > 0 ? openSideCounts.SELL / totalOpenPositions : 0;
+          const shortNotionalShare = totalOpenNotional > 0 ? openSideNotional.SELL / totalOpenNotional : 0;
+          const shortBookDominant = totalOpenPositions >= 3
+            && openSideCounts.SELL >= (openSideCounts.BUY + 2)
+            && (shortCountShare >= 0.6 || shortNotionalShare >= 0.6);
           const realFreeCapital = getBufferedLiveCapital(availableFunds);
           const realTradableCapital = realFreeCapital;
           if (isRealMode && realTradableCapital < liveMinOrderNotional) {
@@ -3523,7 +3543,11 @@ export default function App() {
           }
           const selectedTrades: typeof entries = [];
           const deferredTrades: ScanDeferredSignal[] = [];
-          const selectedBySide: Record<'BUY' | 'SELL', number> = { BUY: 0, SELL: 0 };
+          const selectedThisCycleBySide: Record<'BUY' | 'SELL', number> = { BUY: 0, SELL: 0 };
+          const selectedPortfolioBySide: Record<'BUY' | 'SELL', number> = {
+            BUY: openSideCounts.BUY,
+            SELL: openSideCounts.SELL,
+          };
           const selectedCohorts = new Map<string, number>();
 
           entries.forEach((entry) => {
@@ -3551,13 +3575,33 @@ export default function App() {
               });
               return;
             }
-            if (selectedBySide[entry.side] >= sideSelectionCap) {
+            if (selectedThisCycleBySide[entry.side] >= sideSelectionCap) {
               deferredTrades.push({
                 symbol: entry.pick.symbol,
                 side: entry.side,
                 score: entry.pick.signal.score,
                 priorityRank: entry.pick.priorityRank || 0,
                 reason: `same-side cap reached (${sideSelectionCap} ${entry.side.toLowerCase()}s this cycle)`,
+              });
+              return;
+            }
+            if (selectedPortfolioBySide[entry.side] >= portfolioSideCap) {
+              deferredTrades.push({
+                symbol: entry.pick.symbol,
+                side: entry.side,
+                score: entry.pick.signal.score,
+                priorityRank: entry.pick.priorityRank || 0,
+                reason: `same-side portfolio cap reached (${portfolioSideCap} max ${entry.side.toLowerCase()}s open or queued)`,
+              });
+              return;
+            }
+            if (entry.side === 'SELL' && shortBookDominant) {
+              deferredTrades.push({
+                symbol: entry.pick.symbol,
+                side: entry.side,
+                score: entry.pick.signal.score,
+                priorityRank: entry.pick.priorityRank || 0,
+                reason: `portfolio rebalance: short exposure already dominant (${openSideCounts.SELL} shorts vs ${openSideCounts.BUY} longs, ${(shortCountShare * 100).toFixed(0)}% count share)`,
               });
               return;
             }
@@ -3573,7 +3617,8 @@ export default function App() {
             }
 
             selectedTrades.push(entry);
-            selectedBySide[entry.side] += 1;
+            selectedThisCycleBySide[entry.side] += 1;
+            selectedPortfolioBySide[entry.side] += 1;
             selectedCohorts.set(cohortKey, (selectedCohorts.get(cohortKey) || 0) + 1);
           });
 
@@ -3581,11 +3626,12 @@ export default function App() {
           const deferredCount = deferredTrades.length;
           const extraStrongTradeCount = Math.max(0, selectedTrades.length - Math.min(selectedTrades.length, baseAvailableSlots));
           const coverageSummary = `coverage=${results.length}/${shortlistLimit}/${symbolsToScan.length}`;
+          const exposureSummary = `openSides=BUY:${openSideCounts.BUY}|SELL:${openSideCounts.SELL}`;
           addLog(
-            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${baseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE} ${coverageSummary}`,
+            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${baseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} portfolioSideCap=${portfolioSideCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE} ${exposureSummary} ${coverageSummary}`,
             selectedCount > 0 ? 'success' : 'info',
           );
-          updateLatestScanArchiveDecision(`SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${baseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE} ${coverageSummary}`);
+          updateLatestScanArchiveDecision(`SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${baseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} portfolioSideCap=${portfolioSideCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE} ${exposureSummary} ${coverageSummary}`);
           
           if (selectedTrades.length > 0 || deferredTrades.length > 0) {
             // Live mode safety: execute entries sequentially to avoid burst margin failures.
