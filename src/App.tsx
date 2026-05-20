@@ -1671,15 +1671,15 @@ export default function App() {
     const isHeld = targetId 
       ? holdings.some(h => h.id === targetId)
       : holdings.some(h => h.symbol === tradeSymbol);
-    const isRealShortEntry = isRealMode && type === 'SELL' && !targetId && !isHeld;
+    const isShortEntry = type === 'SELL' && !targetId && !isHeld;
     const requiresLiveFuturesValidation = isRealMode;
-    if (type === 'SELL' && !isHeld && !isRealShortEntry) {
+    if (type === 'SELL' && !isHeld && !isShortEntry) {
       setExecutionFeedback({ type: 'warning', message: `SELL skipped for ${tradeSymbol}: no open position to close.` });
       pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: No open position to close', status: 'SKIPPED', cycleId: eventCycleId });
       return;
     }
 
-    if (requiresLiveFuturesValidation && (type === 'BUY' || isRealShortEntry)) {
+    if (requiresLiveFuturesValidation && (type === 'BUY' || isShortEntry)) {
       let tradableSymbols = liveTradableSymbolsRef.current;
       const normalizedTradeSymbolKey = normalizeLiveFuturesSymbol(tradeSymbol);
       const shouldRefreshTradableSymbols = tradableSymbols.size === 0 || !tradableSymbols.has(normalizedTradeSymbolKey);
