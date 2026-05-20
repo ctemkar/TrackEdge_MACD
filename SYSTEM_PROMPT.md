@@ -149,6 +149,9 @@ That means:
 5. Enforce allowed quote checks.
 6. Enforce per-symbol risk locks.
 7. Enforce hard cooldowns where appropriate.
+8. Keep balance and position sync running even while new entries are temporarily locked.
+
+Entry locks and safety locks should stop new autonomous entries. They must not freeze portfolio value refresh, balance sync, or position visibility.
 
 ### Manual Operator Control
 
@@ -162,6 +165,19 @@ This includes:
 
 Manual override must remain explicit and visible. It must not silently bypass safeguards.
 
+### Emergency Liquidation Handling
+
+Emergency liquidation must be treated as a protective event, not as a permanent ban and not as an immediate auto re-entry.
+
+After emergency liquidation:
+
+1. The affected symbols should enter a persistent post-liquidation review queue.
+2. Re-entry should wait for the hard cooldown to expire.
+3. A later ranked scan should determine whether the symbol still merits a BUY or SELL review.
+4. The operator should be able to act manually from that review surface once a fresh ranked match exists.
+
+The system should preserve operator visibility into whether a liquidated symbol is still worth trading later, without reflexively re-entering it.
+
 ## Exposure Control
 
 TradeEdge must not cluster too many similar live positions in a single cycle.
@@ -171,8 +187,12 @@ The live selector should prevent baskets that are overly concentrated by:
 1. Side concentration.
 2. Similar momentum cohort.
 3. Highly correlated same-cycle exposure.
+4. Portfolio-wide same-side overload across already open positions.
+5. Adding fresh shorts when the open book is already materially short-dominant.
 
 The goal is not to suppress good trades entirely. The goal is to reduce bursty same-side stacking that turns a small market move into a portfolio-wide drawdown spike.
+
+Do not force low-quality longs merely to look balanced. Prefer deferring additional same-side exposure when the existing book is already imbalanced.
 
 ## Margin Policy
 
@@ -211,8 +231,13 @@ Persist at minimum:
 2. Ranked signal snapshot.
 3. Scan archive.
 4. Relevant operator settings.
+5. Last completed ranked market picks.
+6. Last completed scan summaries, blocked/deferred/pre-filter diagnostics, and universe/source metadata.
+7. Post-liquidation review queue state.
 
 Do not clear scan archive or ranked snapshots during ordinary resets unless the operator explicitly clears them.
+
+Persisted state must be hydrated defensively. Older or partially populated localStorage entries must not crash rendering or blank the app.
 
 ## UX Principles
 
@@ -246,6 +271,7 @@ When modifying TradeEdge:
 5. Avoid removing diagnostics just to simplify the UI.
 6. Keep live execution safer than paper execution.
 7. Preserve compatibility with persisted state when reasonable.
+8. Keep paper and live execution semantics aligned where possible, including valid short-entry behavior from ranked SELL actions.
 
 ## What Must Never Happen
 
@@ -255,6 +281,9 @@ When modifying TradeEdge:
 4. Live execution spends to zero margin by default.
 5. The system silently stops trading without exposing the reason.
 6. Broad discovery is replaced by an overly narrow universe without clear operator intent.
+7. Emergency-liquidated symbols are forgotten instead of being reviewable later.
+8. Entry locks stop account-sync or portfolio-value updates.
+9. Stale persisted UI state causes a render crash or blank screen.
 
 ## Preferred Operating Mindset
 
