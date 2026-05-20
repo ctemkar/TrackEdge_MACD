@@ -339,6 +339,16 @@ export default function App() {
       return [];
     }
   });
+  const [liquidationReviewQueue, setLiquidationReviewQueue] = useState<LiquidationReviewEntry[]>(() => {
+    const saved = localStorage.getItem('te_liquidation_review_queue');
+    if (!saved) return [];
+    try {
+      const parsed = JSON.parse(saved);
+      return Array.isArray(parsed) ? parsed as LiquidationReviewEntry[] : [];
+    } catch {
+      return [];
+    }
+  });
   const [symbol, setSymbol] = useState('BTCUSDT');
   const [availableSymbols, setAvailableSymbols] = useState<{ label: string, value: string }[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
@@ -649,6 +659,15 @@ export default function App() {
   interface RankedSignalSnapshotEntry {
     pick: MarketScanResult;
     foundAt: number;
+  }
+
+  interface LiquidationReviewEntry {
+    symbol: string;
+    liquidatedAt: number;
+    reviewEligibleAt: number;
+    lastReviewedAt: number;
+    matchedFoundAt: number | null;
+    pick: MarketScanResult | null;
   }
 
   type MarketPickLifecycle = {
@@ -1163,6 +1182,14 @@ export default function App() {
     }
   }, [persistedRankedSignals]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem('te_liquidation_review_queue', JSON.stringify(liquidationReviewQueue));
+    } catch (error) {
+      console.warn('[TradeEdge] Failed to persist liquidation review queue:', error);
+    }
+  }, [liquidationReviewQueue]);
+
   const pushTradeEvent = React.useCallback((event: TradeEvent) => {
     const normalized = { ...event, status: event.status || 'FILLED' };
     setTradeHistory(prev => [normalized, ...prev]);
@@ -1215,6 +1242,35 @@ export default function App() {
       cycleId,
     });
   }, [pushTradeEvent]);
+
+  const queueLiquidationReview = React.useCallback((symbols: string[], liquidatedAt: number) => {
+    const reviewEligibleAt = liquidatedAt + (hardReentryCooldownMinutes * 60 * 1000);
+    setLiquidationReviewQueue((prev) => {
+      const next = new Map<string, LiquidationReviewEntry>();
+
+      prev.forEach((entry) => {
+        next.set(normalizeLiveFuturesSymbol(entry.symbol), entry);
+      });
+
+      symbols.forEach((rawSymbol) => {
+        const symbol = String(rawSymbol || '').toUpperCase();
+        const normalized = normalizeLiveFuturesSymbol(symbol);
+        if (!normalized) return;
+        next.set(normalized, {
+          symbol,
+          liquidatedAt,
+          reviewEligibleAt,
+          lastReviewedAt: 0,
+          matchedFoundAt: null,
+          pick: null,
+        });
+      });
+
+      return Array.from(next.values())
+        .sort((a, b) => b.liquidatedAt - a.liquidatedAt)
+        .slice(0, 12);
+    });
+  }, [hardReentryCooldownMinutes]);
 
   const markPendingCloseSync = React.useCallback((pending: PendingCloseSyncConfirmation) => {
     const normalizedSymbol = normalizeLiveFuturesSymbol(pending.symbol);
@@ -2475,6 +2531,8 @@ export default function App() {
     addLog(`LIQUIDATION START: Closing ${holdings.length} vectors...`, 'warning');
     
     const currentPositions = [...holdings];
+    const liquidationStartedAt = Date.now();
+    queueLiquidationReview(currentPositions.map((holding) => holding.symbol), liquidationStartedAt);
     let attempted = 0;
     for (const h of currentPositions) {
       const price = holdingPrices[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice);
@@ -2492,7 +2550,7 @@ export default function App() {
     } else {
       addLog(`LIQUIDATION COMPLETE. All positions closed.`, 'success');
     }
-  }, [holdings, holdingPrices, symbol, currentPrice, executeTrade, addLog]);
+  }, [holdings, holdingPrices, symbol, currentPrice, executeTrade, addLog, queueLiquidationReview]);
 
   const confirmAndClosePosition = React.useCallback((holding: Holding, markPrice: number) => {
     const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
@@ -3310,6 +3368,20 @@ export default function App() {
       if (results.length > 0) {
         const foundAt = Date.now();
         setPersistedRankedSignals(results.slice(0, visibleSignalTableLimit).map((pick) => ({ pick, foundAt })));
+        setLiquidationReviewQueue((prev) => {
+          if (prev.length === 0) return prev;
+          const rankedBySymbol = new Map(results.map((pick) => [normalizeLiveFuturesSymbol(pick.symbol), pick]));
+          return prev.map((entry) => {
+            if (entry.reviewEligibleAt > foundAt) return entry;
+            const matchedPick = rankedBySymbol.get(normalizeLiveFuturesSymbol(entry.symbol)) || null;
+            return {
+              ...entry,
+              lastReviewedAt: foundAt,
+              matchedFoundAt: matchedPick ? foundAt : null,
+              pick: matchedPick,
+            };
+          });
+        });
       }
       const unavailableCount = unavailableSummary.insufficientHistory + unavailableSummary.otherUnavailable;
       const signalCounts = results.reduce((acc, row) => {
@@ -4386,7 +4458,7 @@ export default function App() {
   }, [marketPicks, persistedRankedSignals, scanSignalSummary.updatedAt]);
   const visibleSignalTablePicks = visibleSignalTableEntries.map((entry) => entry.pick);
   const usingPersistedRankedSignals = marketPicks.length === 0 && persistedRankedSignals.length > 0;
-  const rankedSignalStatuses = React.useMemo(() => {
+  const getPickEligibility = React.useCallback((pick: MarketScanResult) => {
     const normalizedLiveExchange = String(serverConfig?.exchange || '').toLowerCase();
     const isLiveBinance = isRealMode && normalizedLiveExchange === 'binance';
     const scanNow = Date.now();
@@ -4400,67 +4472,81 @@ export default function App() {
     };
     const isLiveTradableFuturesSymbol = (value: string) => liveTradableSymbolsRef.current.has(normalizeLiveFuturesSymbol(value));
 
-    return Object.fromEntries(visibleSignalTablePicks.map((pick) => {
-      if (pick.signal.overall === 'HOLD') {
-        return [pick.symbol, {
-          label: 'HOLD',
-          detail: describeHoldReason(pick.signal.holdReason),
-          className: 'bg-gray-100 text-gray-600',
-        }];
-      }
+    if (pick.signal.overall === 'HOLD') {
+      return {
+        label: 'HOLD',
+        detail: describeHoldReason(pick.signal.holdReason),
+        className: 'bg-gray-100 text-gray-600',
+      };
+    }
 
-      let reason: string | null = null;
-      if (isLiveBinance && !isLikelyBinanceFuturesSymbol(pick.symbol)) {
-        reason = 'invalid futures symbol format';
-      } else if (isLiveBinance && !fullUniverseMode && !hasAllowedQuote(pick.symbol)) {
-        reason = `outside focused quotes`;
-      } else if (isLiveBinance && !isLiveTradableFuturesSymbol(pick.symbol)) {
-        reason = 'not in Binance futures set';
-      } else if (holdings.some((holding) => holding.symbol === pick.symbol)) {
-        reason = 'already held';
+    let reason: string | null = null;
+    if (isLiveBinance && !isLikelyBinanceFuturesSymbol(pick.symbol)) {
+      reason = 'invalid futures symbol format';
+    } else if (isLiveBinance && !fullUniverseMode && !hasAllowedQuote(pick.symbol)) {
+      reason = `outside focused quotes`;
+    } else if (isLiveBinance && !isLiveTradableFuturesSymbol(pick.symbol)) {
+      reason = 'not in Binance futures set';
+    } else if (holdings.some((holding) => holding.symbol === pick.symbol)) {
+      reason = 'already held';
+    } else {
+      const cooldownUntil = cooldowns[pick.symbol] || 0;
+      if (cooldownUntil > scanNow) {
+        const minutesRemaining = Math.max(1, Math.ceil((cooldownUntil - scanNow) / 60000));
+        reason = `cooldown ${minutesRemaining}m`;
       } else {
-        const cooldownUntil = cooldowns[pick.symbol] || 0;
-        if (cooldownUntil > scanNow) {
-          const minutesRemaining = Math.max(1, Math.ceil((cooldownUntil - scanNow) / 60000));
-          reason = `cooldown ${minutesRemaining}m`;
+        const symbolRiskBlock = getSymbolRiskBlock(pick.symbol, scanNow);
+        if (symbolRiskBlock) {
+          reason = symbolRiskBlock.reason;
         } else {
-          const symbolRiskBlock = getSymbolRiskBlock(pick.symbol, scanNow);
-          if (symbolRiskBlock) {
-            reason = symbolRiskBlock.reason;
+          const directionalSide = pick.signal.overall === 'SELL' ? 'SELL' : 'BUY';
+          const directionalConfidence = getDirectionalEntryScore(directionalSide, pick.signal.score);
+          if (isRealMode && directionalConfidence < autoEntryMinScore) {
+            reason = `confidence ${directionalConfidence.toFixed(1)} below ${autoEntryMinScore.toFixed(1)}`;
           } else {
-            const directionalSide = pick.signal.overall === 'SELL' ? 'SELL' : 'BUY';
-            const directionalConfidence = getDirectionalEntryScore(directionalSide, pick.signal.score);
-            if (isRealMode && directionalConfidence < autoEntryMinScore) {
-              reason = `confidence ${directionalConfidence.toFixed(1)} below ${autoEntryMinScore.toFixed(1)}`;
-            } else {
-              const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(directionalSide, pick.lastPrice, pick.signal.tradePlan, estimatedRoundTripFrictionBps);
-              if (isRealMode && edgeAfterFrictionPct !== null && edgeAfterFrictionPct < minEdgeAfterFrictionPct) {
-                reason = `edge ${edgeAfterFrictionPct.toFixed(2)}% below ${minEdgeAfterFrictionPct.toFixed(2)}%`;
-              } else if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
-                reason = 'quote asset treated as cash';
-              } else if (isLiveBinance && isUnsupportedLiveScanSymbol(pick.symbol)) {
-                reason = 'unsupported market';
-              }
+            const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(directionalSide, pick.lastPrice, pick.signal.tradePlan, estimatedRoundTripFrictionBps);
+            if (isRealMode && edgeAfterFrictionPct !== null && edgeAfterFrictionPct < minEdgeAfterFrictionPct) {
+              reason = `edge ${edgeAfterFrictionPct.toFixed(2)}% below ${minEdgeAfterFrictionPct.toFixed(2)}%`;
+            } else if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
+              reason = 'quote asset treated as cash';
+            } else if (isLiveBinance && isUnsupportedLiveScanSymbol(pick.symbol)) {
+              reason = 'unsupported market';
             }
           }
         }
       }
+    }
 
-      if (reason) {
-        return [pick.symbol, {
-          label: 'BLOCKED',
-          detail: reason,
-          className: 'bg-rose-100 text-rose-700',
-        }];
-      }
+    if (reason) {
+      return {
+        label: 'BLOCKED',
+        detail: reason,
+        className: 'bg-rose-100 text-rose-700',
+      };
+    }
 
-      return [pick.symbol, {
-        label: 'ELIGIBLE',
-        detail: `${pick.signal.overall} ready`,
-        className: 'bg-emerald-100 text-emerald-700',
-      }];
-    }));
-  }, [visibleSignalTablePicks, serverConfig?.exchange, isRealMode, liveQuoteAllowlist, fullUniverseMode, holdings, cooldowns, isUnsupportedLiveScanSymbol, autoEntryMinScore, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock]);
+    return {
+      label: 'ELIGIBLE',
+      detail: `${pick.signal.overall} ready`,
+      className: 'bg-emerald-100 text-emerald-700',
+    };
+  }, [serverConfig?.exchange, isRealMode, liveQuoteAllowlist, fullUniverseMode, holdings, cooldowns, isUnsupportedLiveScanSymbol, autoEntryMinScore, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock]);
+
+  const rankedSignalStatuses = React.useMemo(() => {
+    return Object.fromEntries(visibleSignalTablePicks.map((pick) => [pick.symbol, getPickEligibility(pick)]));
+  }, [visibleSignalTablePicks, getPickEligibility]);
+
+  const visibleLiquidationReviewEntries = React.useMemo(() => {
+    const now = Date.now();
+    return [...liquidationReviewQueue]
+      .sort((a, b) => {
+        const aReady = a.pick && a.reviewEligibleAt <= now ? 1 : 0;
+        const bReady = b.pick && b.reviewEligibleAt <= now ? 1 : 0;
+        if (bReady !== aReady) return bReady - aReady;
+        return b.liquidatedAt - a.liquidatedAt;
+      })
+      .slice(0, 8);
+  }, [liquidationReviewQueue]);
   
   const requestRankedSignalTrade = React.useCallback((pick: MarketScanResult, eligibility: { label: string; detail: string; className: string }) => {
     const tradeType: 'BUY' | 'SELL' = pick.signal.overall === 'SELL' ? 'SELL' : 'BUY';
@@ -5139,6 +5225,108 @@ export default function App() {
                       )}
                     </div>
                   ))}
+                </div>
+              )}
+            </div>
+          </section>
+
+          <section className="bg-white border-2 border-[#141414] p-4 shadow-[8px_8px_0px_0px_#141414]">
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <h3 className="font-mono text-[12px] uppercase tracking-[0.2em] opacity-75">Post-Liquidation Review</h3>
+                <span className="text-[10px] font-mono uppercase opacity-50">{visibleLiquidationReviewEntries.length} tracked</span>
+              </div>
+              <p className="text-[9px] font-mono uppercase tracking-wide opacity-45 px-2">
+                Symbols closed by emergency liquidation stay here until cooldown expires and a later scan shows whether they still earn a ranked re-entry.
+              </p>
+              {visibleLiquidationReviewEntries.length === 0 ? (
+                <p className="px-2 text-[10px] font-mono normal-case opacity-60">
+                  No emergency-liquidated symbols are waiting for review.
+                </p>
+              ) : (
+                <div className="space-y-2 max-h-[280px] overflow-y-auto custom-scrollbar pr-2">
+                  {visibleLiquidationReviewEntries.map((entry) => {
+                    const reviewReady = entry.reviewEligibleAt <= Date.now();
+                    const minutesRemaining = Math.max(1, Math.ceil((entry.reviewEligibleAt - Date.now()) / 60000));
+                    const eligibility = entry.pick
+                      ? getPickEligibility(entry.pick)
+                      : { label: 'WAITING', detail: 'awaiting post-cooldown scan', className: 'bg-gray-100 text-gray-600' };
+                    const isHeld = entry.pick ? holdings.some((holding) => holding.symbol === entry.pick?.symbol) : false;
+                    const isBlocked = eligibility.label === 'BLOCKED';
+                    const actionLabel = entry.pick?.signal.overall === 'SELL'
+                      ? (isBlocked ? 'Force Short' : 'Short')
+                      : entry.pick?.signal.overall === 'BUY'
+                        ? (isBlocked ? 'Force Long' : 'Long')
+                        : 'Hold';
+
+                    return (
+                      <div key={`liq-review-${entry.symbol}`} className="border border-slate-200 bg-slate-50/70 px-3 py-2">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <button
+                              type="button"
+                              onClick={() => setSymbol(entry.symbol)}
+                              className="text-left text-[13px] font-black hover:text-[#F27D26] transition-colors"
+                            >
+                              {entry.symbol}
+                            </button>
+                            <div className="mt-1 text-[8px] font-mono uppercase opacity-45">
+                              liquidated {formatSignalAge(entry.liquidatedAt).replace('found ', '')}
+                            </div>
+                          </div>
+                          <span className={`rounded-sm px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wide ${reviewReady ? 'bg-sky-100 text-sky-800' : 'bg-amber-100 text-amber-800'}`}>
+                            {reviewReady ? 'Review Open' : `Cooldown ${minutesRemaining}m`}
+                          </span>
+                        </div>
+
+                        {!reviewReady ? (
+                          <p className="mt-2 text-[9px] font-mono normal-case text-slate-600">
+                            Re-check will start after the hard re-entry cooldown expires.
+                          </p>
+                        ) : entry.pick ? (
+                          <div className="mt-2 flex items-center justify-between gap-3">
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2">
+                                <span className={`rounded-sm px-1.5 py-0.5 text-[9px] font-black uppercase ${entry.pick.signal.overall === 'BUY' ? 'bg-emerald-100 text-emerald-800' : entry.pick.signal.overall === 'SELL' ? 'bg-rose-100 text-rose-800' : 'bg-gray-100 text-gray-500'}`}>
+                                  {entry.pick.signal.overall}
+                                </span>
+                                <span className="text-[9px] font-mono text-slate-600">
+                                  score {entry.pick.signal.score.toFixed(1)} | rank {(entry.pick.priorityRank || 0).toFixed(2)}
+                                </span>
+                              </div>
+                              <div className="mt-1 text-[8px] font-mono uppercase opacity-45">
+                                {entry.matchedFoundAt ? formatSignalAge(entry.matchedFoundAt) : 'ready for review'}
+                              </div>
+                              <div className="mt-1 text-[8px] font-mono normal-case text-slate-600">
+                                {eligibility.detail}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-1">
+                              <button
+                                onClick={() => entry.pick && requestRankedSignalTrade(entry.pick, eligibility)}
+                                disabled={!entry.pick || entry.pick.signal.overall === 'HOLD' || isHeld}
+                                title={entry.pick ? `${actionLabel} ${entry.pick.symbol}` : 'No ranked signal available'}
+                                className={`border text-[10px] px-2 py-0.5 font-bold uppercase transition-all disabled:opacity-0 ${isBlocked ? 'border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-600 hover:text-white' : 'border-[#141414]/10 text-[#141414] hover:bg-[#F27D26] hover:text-white'}`}
+                              >
+                                {actionLabel}
+                              </button>
+                              <button
+                                onClick={() => entry.pick && requestRankedSignalBuy(entry.pick, eligibility)}
+                                disabled={!entry.pick}
+                                className="border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-[10px] font-bold uppercase text-emerald-700 transition-all hover:bg-emerald-600 hover:text-white disabled:opacity-40"
+                              >
+                                {isHeld ? 'Buy More' : 'Buy'}
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="mt-2 text-[9px] font-mono normal-case text-slate-600">
+                            Cooldown has cleared, but the latest ranked scan did not bring this symbol back as a buy or sell candidate.
+                          </p>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>
