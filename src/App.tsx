@@ -4502,11 +4502,30 @@ export default function App() {
   }, [rejectReasonGroups, selectedRejectReason]);
 
   const visibleSignalTableEntries = React.useMemo(() => {
+    const latestFoundAt = scanSignalSummary.updatedAt || Date.now();
+    const latestPickBySymbol = new Map(
+      marketPicks.map((pick) => [normalizeLiveFuturesSymbol(pick.symbol), pick]),
+    );
+
+    const mergedEntries = new Map<string, { pick: MarketScanResult; foundAt: number }>();
+    const pushEntry = (pick: MarketScanResult, foundAt: number) => {
+      const key = normalizeLiveFuturesSymbol(pick.symbol);
+      if (!mergedEntries.has(key)) {
+        mergedEntries.set(key, { pick, foundAt });
+      }
+    };
+
     if (marketPicks.length > 0) {
-      const foundAt = scanSignalSummary.updatedAt || Date.now();
-      return marketPicks
+      marketPicks
         .slice(0, visibleSignalTableLimit)
-        .map((pick) => ({ pick, foundAt }));
+        .forEach((pick) => pushEntry(pick, latestFoundAt));
+
+      persistedRankedSignals.forEach((entry) => {
+        const latestPick = latestPickBySymbol.get(normalizeLiveFuturesSymbol(entry.pick.symbol));
+        pushEntry(latestPick || entry.pick, latestPick ? latestFoundAt : entry.foundAt);
+      });
+
+      return Array.from(mergedEntries.values()).slice(0, visibleSignalTableLimit);
     }
     return persistedRankedSignals.slice(0, visibleSignalTableLimit);
   }, [marketPicks, persistedRankedSignals, scanSignalSummary.updatedAt]);
