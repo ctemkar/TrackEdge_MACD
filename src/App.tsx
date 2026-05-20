@@ -1397,9 +1397,6 @@ export default function App() {
       const retryTime = new Date(entryLockUntilRef.current).toLocaleTimeString();
       const message = `Live trading disabled until ${retryTime}`;
       reportSyncError(message);
-      setExecutionFeedback({ type: 'warning', message });
-      addLog(message, 'warning');
-      return false;
     }
     isSyncingRef.current = true;
     setIsSyncing(true);
