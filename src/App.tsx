@@ -318,6 +318,16 @@ const CriteriaInfoLabel = ({ text, detail }: { text: string; detail: string }) =
 };
 
 export default function App() {
+  const readStoredJson = <T,>(key: string, fallback: T): T => {
+    const saved = localStorage.getItem(key);
+    if (!saved) return fallback;
+    try {
+      return JSON.parse(saved) as T;
+    } catch {
+      return fallback;
+    }
+  };
+
   const [activeTab, setActiveTab] = useState<'LIVE' | 'BACKTEST'>('LIVE');
   const [data, setData] = useState<Candle[]>([]);
   const [indicators, setIndicators] = useState<IndicatorResult | null>(null);
@@ -328,7 +338,7 @@ export default function App() {
   const [syncDetails, setSyncDetails] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
-  const [marketPicks, setMarketPicks] = useState<MarketScanResult[]>([]);
+  const [marketPicks, setMarketPicks] = useState<MarketScanResult[]>(() => readStoredJson<MarketScanResult[]>('te_last_completed_market_picks', []));
   const [persistedRankedSignals, setPersistedRankedSignals] = useState<RankedSignalSnapshotEntry[]>(() => {
     const saved = localStorage.getItem('te_persisted_ranked_signals');
     if (!saved) return [];
@@ -694,6 +704,46 @@ export default function App() {
   type ScanPreFilterEntry = {
     symbol: string;
     reason: string;
+  };
+
+  const DEFAULT_SCAN_SIGNAL_SUMMARY = {
+    analyzed: 0,
+    shortlisted: 0,
+    total: 0,
+    buy: 0,
+    sell: 0,
+    hold: 0,
+    notShortlisted: 0,
+    unavailable: 0,
+    insufficientHistoryUnavailable: 0,
+    otherUnavailable: 0,
+    updatedAt: 0,
+  };
+
+  const DEFAULT_SCAN_BLOCKED_SUMMARY = {
+    updatedAt: 0,
+    filteredSignals: 0,
+    reasonCounts: {} as Record<string, number>,
+    topBlocked: [] as ScanBlockedSignal[],
+  };
+
+  const DEFAULT_SCAN_DEFERRED_SUMMARY = {
+    updatedAt: 0,
+    deferredSignals: 0,
+    topDeferred: [] as ScanDeferredSignal[],
+  };
+
+  const DEFAULT_SCAN_PREFILTER_SUMMARY = {
+    updatedAt: 0,
+    excludedSymbols: 0,
+    analyzedSymbols: 0,
+    reasonCounts: {} as Record<string, number>,
+    topExcluded: [] as ScanPreFilterEntry[],
+  };
+
+  const DEFAULT_SCAN_UNIVERSE_COUNTS = {
+    discovery: 0,
+    liveTradableFutures: 0,
   };
 
   type RejectReasonGroup = {
@@ -2672,56 +2722,43 @@ export default function App() {
     : 0;
 
   const [scanProgress, setScanProgress] = useState({ current: 0, total: 0 });
-  const [scanSignalSummary, setScanSignalSummary] = useState({
-    analyzed: 0,
-    shortlisted: 0,
-    total: 0,
-    buy: 0,
-    sell: 0,
-    hold: 0,
-    notShortlisted: 0,
-    unavailable: 0,
-    insufficientHistoryUnavailable: 0,
-    otherUnavailable: 0,
-    updatedAt: 0,
-  });
+  const [scanSignalSummary, setScanSignalSummary] = useState(() => readStoredJson('te_scan_signal_summary', DEFAULT_SCAN_SIGNAL_SUMMARY));
   const [scanBlockedSummary, setScanBlockedSummary] = useState<{
     updatedAt: number;
     filteredSignals: number;
     reasonCounts: Record<string, number>;
     topBlocked: ScanBlockedSignal[];
-  }>({
-    updatedAt: 0,
-    filteredSignals: 0,
-    reasonCounts: {},
-    topBlocked: [],
-  });
+  }>(() => readStoredJson('te_scan_blocked_summary', DEFAULT_SCAN_BLOCKED_SUMMARY));
   const [scanDeferredSummary, setScanDeferredSummary] = useState<{
     updatedAt: number;
     deferredSignals: number;
     topDeferred: ScanDeferredSignal[];
-  }>({
-    updatedAt: 0,
-    deferredSignals: 0,
-    topDeferred: [],
-  });
+  }>(() => readStoredJson('te_scan_deferred_summary', DEFAULT_SCAN_DEFERRED_SUMMARY));
   const [scanPreFilterSummary, setScanPreFilterSummary] = useState<{
     updatedAt: number;
     excludedSymbols: number;
     analyzedSymbols: number;
     reasonCounts: Record<string, number>;
     topExcluded: ScanPreFilterEntry[];
-  }>({
-    updatedAt: 0,
-    excludedSymbols: 0,
-    analyzedSymbols: 0,
-    reasonCounts: {},
-    topExcluded: [],
-  });
+  }>(() => readStoredJson('te_scan_prefilter_summary', DEFAULT_SCAN_PREFILTER_SUMMARY));
   const [filteredSyncSymbols, setFilteredSyncSymbols] = useState<Array<{ symbol: string; reason: string }>>([]);
-  const [scanDataSource, setScanDataSource] = useState('BINANCE PUBLIC');
-  const [scanUniverseCounts, setScanUniverseCounts] = useState({ discovery: 0, liveTradableFutures: 0 });
+  const [scanDataSource, setScanDataSource] = useState(() => localStorage.getItem('te_scan_data_source') || 'BINANCE PUBLIC');
+  const [scanUniverseCounts, setScanUniverseCounts] = useState(() => readStoredJson('te_scan_universe_counts', DEFAULT_SCAN_UNIVERSE_COUNTS));
   const [selectedRejectReason, setSelectedRejectReason] = useState<string | null>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('te_last_completed_market_picks', JSON.stringify(marketPicks));
+      localStorage.setItem('te_scan_signal_summary', JSON.stringify(scanSignalSummary));
+      localStorage.setItem('te_scan_blocked_summary', JSON.stringify(scanBlockedSummary));
+      localStorage.setItem('te_scan_deferred_summary', JSON.stringify(scanDeferredSummary));
+      localStorage.setItem('te_scan_prefilter_summary', JSON.stringify(scanPreFilterSummary));
+      localStorage.setItem('te_scan_data_source', scanDataSource);
+      localStorage.setItem('te_scan_universe_counts', JSON.stringify(scanUniverseCounts));
+    } catch (error) {
+      console.warn('[TradeEdge] Failed to persist last completed scan state:', error);
+    }
+  }, [marketPicks, scanSignalSummary, scanBlockedSummary, scanDeferredSummary, scanPreFilterSummary, scanDataSource, scanUniverseCounts]);
 
   const formatPrice = (price: number) => {
     if (price === 0) return '0.00';
