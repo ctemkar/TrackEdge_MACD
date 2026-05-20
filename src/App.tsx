@@ -328,6 +328,26 @@ export default function App() {
     }
   };
 
+  const normalizeArchiveSignal = (signal: Partial<ScanArchiveEntry['topSignals'][number]> | null | undefined): ScanArchiveEntry['topSignals'][number] => ({
+    symbol: signal?.symbol || 'UNKNOWN',
+    signal: signal?.signal === 'BUY' || signal?.signal === 'SELL' || signal?.signal === 'HOLD' ? signal.signal : 'HOLD',
+    score: Number.isFinite(signal?.score) ? Number(signal?.score) : 0,
+    priorityRank: Number.isFinite(signal?.priorityRank) ? Number(signal?.priorityRank) : 0,
+  });
+
+  const normalizeScanArchiveEntry = (entry: Partial<ScanArchiveEntry> | null | undefined): ScanArchiveEntry => ({
+    id: entry?.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    completedAt: Number.isFinite(entry?.completedAt) ? Number(entry?.completedAt) : Date.now(),
+    summary: entry?.summary || 'SCAN SUMMARY UNAVAILABLE',
+    decision: entry?.decision,
+    analyzed: Number.isFinite(entry?.analyzed) ? Number(entry?.analyzed) : 0,
+    total: Number.isFinite(entry?.total) ? Number(entry?.total) : 0,
+    buy: Number.isFinite(entry?.buy) ? Number(entry?.buy) : 0,
+    sell: Number.isFinite(entry?.sell) ? Number(entry?.sell) : 0,
+    hold: Number.isFinite(entry?.hold) ? Number(entry?.hold) : 0,
+    topSignals: Array.isArray(entry?.topSignals) ? entry.topSignals.map((signal) => normalizeArchiveSignal(signal)) : [],
+  });
+
   const [activeTab, setActiveTab] = useState<'LIVE' | 'BACKTEST'>('LIVE');
   const [data, setData] = useState<Candle[]>([]);
   const [indicators, setIndicators] = useState<IndicatorResult | null>(null);
@@ -813,7 +833,7 @@ export default function App() {
     if (!saved) return [];
     try {
       const parsed = JSON.parse(saved);
-      return Array.isArray(parsed) ? parsed as ScanArchiveEntry[] : [];
+      return Array.isArray(parsed) ? parsed.map((entry) => normalizeScanArchiveEntry(entry)) : [];
     } catch {
       return [];
     }
@@ -1210,10 +1230,10 @@ export default function App() {
   }, []);
 
   const appendScanArchiveEntry = React.useCallback((entry: Omit<ScanArchiveEntry, 'id'>) => {
-    const archiveEntry: ScanArchiveEntry = {
+    const archiveEntry: ScanArchiveEntry = normalizeScanArchiveEntry({
       id: `${entry.completedAt}-${Math.random().toString(36).slice(2, 8)}`,
       ...entry,
-    };
+    });
     setScanArchive((prev) => [archiveEntry, ...prev]);
   }, []);
 
@@ -6510,7 +6530,7 @@ export default function App() {
                                 onClick={() => setSymbol(signal.symbol)}
                                 className={`border px-1.5 py-0.5 text-[8px] font-mono uppercase ${signal.signal === 'BUY' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : signal.signal === 'SELL' ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-gray-200 bg-gray-50 text-gray-600'}`}
                               >
-                                {signal.symbol} {signal.signal} {signal.score.toFixed(1)} | {signal.priorityRank.toFixed(2)}
+                                {signal.symbol} {signal.signal} {(signal.score ?? 0).toFixed(1)} | {(signal.priorityRank ?? 0).toFixed(2)}
                               </button>
                             ))}
                           </div>
