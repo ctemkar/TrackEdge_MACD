@@ -2843,6 +2843,24 @@ export default function App() {
     }
   }, [holdings, holdingPrices, symbol, currentPrice, executeTrade, addLog, queueLiquidationReview]);
 
+  const forceLiquidateAll = React.useCallback(async (reason: string) => {
+    if (holdings.length === 0) return;
+
+    addLog(`FORCED LIQUIDATION: ${reason}. Closing ${holdings.length} active positions...`, 'warning');
+
+    const currentPositions = [...holdings];
+    const liquidationStartedAt = Date.now();
+    queueLiquidationReview(currentPositions.map((holding) => holding.symbol), liquidationStartedAt);
+
+    for (const h of currentPositions) {
+      const price = holdingPrices[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice);
+      if (!price) continue;
+      const closeSide: 'BUY' | 'SELL' = h.side === 'SHORT' ? 'BUY' : 'SELL';
+      await executeTrade(closeSide, h.symbol, price, reason, h.id);
+      await new Promise(r => setTimeout(r, 600));
+    }
+  }, [holdings, holdingPrices, symbol, currentPrice, executeTrade, addLog, queueLiquidationReview]);
+
   const confirmAndClosePosition = React.useCallback((holding: Holding, markPrice: number) => {
     const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
     const confirmed = window.confirm(
@@ -2892,6 +2910,9 @@ export default function App() {
     localStorage.setItem('te_estimated_round_trip_friction_bps', estimatedRoundTripFrictionBps.toString());
     localStorage.setItem('te_symbol_daily_loss_limit', symbolDailyLossLimit.toString());
     localStorage.setItem('te_symbol_daily_flip_limit', symbolDailyFlipLimit.toString());
+    localStorage.setItem('te_account_daily_loss_limit', accountDailyLossLimit.toString());
+    localStorage.setItem('te_daily_equity_anchor_date', dailyEquityAnchorDate);
+    localStorage.setItem('te_daily_equity_anchor', dailyEquityAnchor.toString());
     localStorage.setItem('te_live_quote_allowlist', liveQuoteAllowlistInput);
     localStorage.setItem('te_scan_interval_sec', scanIntervalSec.toString());
     localStorage.setItem('te_holding_poll_interval_sec', holdingPollIntervalSec.toString());
@@ -2907,7 +2928,23 @@ export default function App() {
     localStorage.setItem('te_close_failure_lock_minutes', closeFailureLockMinutes.toString());
     localStorage.setItem('te_hard_failure_lock_minutes', hardFailureLockMinutes.toString());
     localStorage.setItem('te_strategy_config', JSON.stringify(strategyConfig));
-  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, benchmarkSetAt, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, liveMarginBufferPct, hardReentryCooldownMinutes, minEdgeAfterFrictionPct, estimatedRoundTripFrictionBps, symbolDailyLossLimit, symbolDailyFlipLimit, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
+  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, benchmarkSetAt, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, liveMarginBufferPct, hardReentryCooldownMinutes, minEdgeAfterFrictionPct, estimatedRoundTripFrictionBps, symbolDailyLossLimit, symbolDailyFlipLimit, accountDailyLossLimit, dailyEquityAnchorDate, dailyEquityAnchor, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
+
+  useEffect(() => {
+    if (!isRealMode || !Number.isFinite(balance) || balance <= 0) return;
+
+    const todayKey = getLocalDayKey();
+    if (dailyEquityAnchorDate !== todayKey) {
+      setDailyEquityAnchorDate(todayKey);
+      setDailyEquityAnchor(balance);
+      accountLossGuardTriggerRef.current = null;
+      return;
+    }
+
+    if (!(dailyEquityAnchor > 0)) {
+      setDailyEquityAnchor(balance);
+    }
+  }, [isRealMode, balance, dailyEquityAnchorDate, dailyEquityAnchor]);
 
   useEffect(() => {
     localStorage.setItem('te_show_extra_criteria', showExtraCriteria ? '1' : '0');
@@ -3113,6 +3150,7 @@ export default function App() {
     estimatedRoundTripFrictionBps: number;
     symbolDailyLossLimit: number;
     symbolDailyFlipLimit: number;
+    accountDailyLossLimit: number;
     scanIntervalSec: number;
     holdingPollIntervalSec: number;
     maxSymbolsPerScan: number;
@@ -3157,6 +3195,7 @@ export default function App() {
     setEstimatedRoundTripFrictionBps(aiCriteriaSnapshot.estimatedRoundTripFrictionBps);
     setSymbolDailyLossLimit(aiCriteriaSnapshot.symbolDailyLossLimit);
     setSymbolDailyFlipLimit(aiCriteriaSnapshot.symbolDailyFlipLimit);
+    setAccountDailyLossLimit(aiCriteriaSnapshot.accountDailyLossLimit ?? PARAMETER_DEFAULTS.accountDailyLossLimit);
     setScanIntervalSec(aiCriteriaSnapshot.scanIntervalSec);
     setHoldingPollIntervalSec(aiCriteriaSnapshot.holdingPollIntervalSec);
     setMaxSymbolsPerScan(aiCriteriaSnapshot.maxSymbolsPerScan);
@@ -3197,6 +3236,7 @@ export default function App() {
     setEstimatedRoundTripFrictionBps(PARAMETER_DEFAULTS.estimatedRoundTripFrictionBps);
     setSymbolDailyLossLimit(PARAMETER_DEFAULTS.symbolDailyLossLimit);
     setSymbolDailyFlipLimit(PARAMETER_DEFAULTS.symbolDailyFlipLimit);
+    setAccountDailyLossLimit(PARAMETER_DEFAULTS.accountDailyLossLimit);
     setLiveQuoteAllowlistInput(PARAMETER_DEFAULTS.liveQuoteAllowlistInput);
     setScanIntervalSec(PARAMETER_DEFAULTS.scanIntervalSec);
     setHoldingPollIntervalSec(PARAMETER_DEFAULTS.holdingPollIntervalSec);
@@ -3253,6 +3293,7 @@ export default function App() {
       estimatedRoundTripFrictionBps,
       symbolDailyLossLimit,
       symbolDailyFlipLimit,
+      accountDailyLossLimit,
       scanIntervalSec,
       holdingPollIntervalSec,
       maxSymbolsPerScan,
@@ -3295,6 +3336,9 @@ export default function App() {
       } else if ((part.includes('symbol daily flip') || part.includes('daily flip limit')) && val !== null) {
         setSymbolDailyFlipLimit(Math.max(1, Math.round(val)));
         touched.push('Symbol Daily Flip Limit');
+      } else if ((part.includes('account daily loss') || part.includes('portfolio daily loss') || part.includes('daily account loss')) && val !== null) {
+        setAccountDailyLossLimit(Math.max(1, val));
+        touched.push('Account Daily Loss Limit');
       } else if ((part.includes('max live notional') || part.includes('max notional')) && val !== null) {
         setMaxLiveOrderNotional(Math.max(liveMinOrderNotional, val));
         touched.push('Max Live Notional');
@@ -4595,6 +4639,9 @@ export default function App() {
   const pnlPercent = benchmarkCapital > 0 ? (pnl / benchmarkCapital) * 100 : 0;
   const basisDelta = pnl;
   const openPnl = displayedUnrealizedRisk;
+  const currentDailyEquityLoss = isRealMode && dailyEquityAnchorDate === getLocalDayKey() && dailyEquityAnchor > 0
+    ? Math.max(0, dailyEquityAnchor - equity)
+    : 0;
   const trackedRealizedPnl = React.useMemo(() => {
     return tradeHistory.reduce((sum, trade) => {
       const status = trade.status || 'FILLED';
@@ -4610,6 +4657,32 @@ export default function App() {
   const liveAuditSummary = liveAccountAudit?.summary;
   const liveAuditReconciledDelta = isRealMode ? ((liveAuditSummary?.netIncome || 0) + openPnl) : 0;
   const liveAuditResidualDelta = isRealMode ? (basisDelta - liveAuditReconciledDelta) : 0;
+  useEffect(() => {
+    if (!isRealMode || holdings.length === 0 || dailyEquityAnchorDate !== getLocalDayKey()) {
+      return;
+    }
+
+    const guardLimit = Math.max(1, Math.abs(accountDailyLossLimit));
+    if (currentDailyEquityLoss < guardLimit) {
+      accountLossGuardTriggerRef.current = null;
+      return;
+    }
+
+    const triggerKey = `${dailyEquityAnchorDate}:${guardLimit}`;
+    if (accountLossGuardTriggerRef.current === triggerKey) {
+      return;
+    }
+    accountLossGuardTriggerRef.current = triggerKey;
+
+    autoTradeRef.current = false;
+    setAutoTrade(false);
+
+    const guardMessage = `ACCOUNT LOSS GUARD: Today's equity is down $${currentDailyEquityLoss.toFixed(2)} from the ${dailyEquityAnchorDate} open, breaching the $${guardLimit.toFixed(2)} daily cap. Flattening all live positions.`;
+    addLog(guardMessage, 'warning');
+    setExecutionFeedback({ type: 'warning', message: guardMessage });
+    void forceLiquidateAll('ACCOUNT_DAILY_LOSS_GUARD');
+  }, [isRealMode, holdings.length, dailyEquityAnchorDate, accountDailyLossLimit, currentDailyEquityLoss, addLog, forceLiquidateAll]);
+
   const liveAuditLedgerEntries = React.useMemo<LiveLedgerEntry[]>(() => {
     if (!liveAccountAudit) return [];
 
@@ -6263,6 +6336,9 @@ export default function App() {
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Symbol Daily Flip Limit" detail={CRITERIA_HELP.symbolDailyFlipLimit} />
                       <input type="number" min="1" step="1" value={symbolDailyFlipLimit} onChange={(e) => setSymbolDailyFlipLimit(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
+                    </label>
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Account Daily Loss Limit" detail={CRITERIA_HELP.accountDailyLossLimit} />
+                      <input type="number" min="1" step="1" value={accountDailyLossLimit} onChange={(e) => setAccountDailyLossLimit(Math.max(1, parseFloat(e.target.value) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="MACD Fast" detail={CRITERIA_HELP.macdFastPeriod} />
                       <input type="number" min="1" step="1" value={strategyConfig.macdFastPeriod} onChange={(e) => updateStrategyConfig({ macdFastPeriod: Math.max(1, parseInt(e.target.value, 10) || 1) })} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
