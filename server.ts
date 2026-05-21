@@ -531,21 +531,55 @@ async function startServer() {
     tradeRoute: string;
     incomeRoute: string;
   }> => {
+    const client = getExchange();
     const commonParams = {
       startTime: String(options.startTime),
       endTime: String(options.endTime),
       limit: String(options.limit),
     };
 
-    const tradeResponse = await fetchBinanceSignedJson(apiKey, apiSecret, [
+    const fetchFromCcxtOrHttp = async (
+      ccxtFetchers: Array<{ label: string; fn: () => Promise<any> }>,
+      httpEndpoints: BinanceSignedEndpoint[],
+    ) => {
+      let lastError: any = null;
+
+      for (const fetcher of ccxtFetchers) {
+        try {
+          const data = await fetcher.fn();
+          if (Array.isArray(data)) {
+            return { label: fetcher.label, data };
+          }
+        } catch (error: any) {
+          lastError = error;
+        }
+      }
+
+      try {
+        return await fetchBinanceSignedJson(apiKey, apiSecret, httpEndpoints, commonParams);
+      } catch (error: any) {
+        if (lastError && !error?.message) {
+          throw lastError;
+        }
+        throw error;
+      }
+    };
+
+    const tradeResponse = await fetchFromCcxtOrHttp([
+      { label: 'ccxt-papiGetUmUserTrades', fn: async () => await (client as any).papiGetUmUserTrades?.(commonParams) },
+      { label: 'ccxt-fapiPrivateGetUserTrades', fn: async () => await (client as any).fapiPrivateGetUserTrades?.(commonParams) },
+    ], [
       { label: 'papi-um-userTrades', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/userTrades' },
       { label: 'fapi-userTrades', baseUrl: 'https://fapi.binance.com', endpoint: '/fapi/v1/userTrades' },
-    ], commonParams);
+    ]);
 
-    const incomeResponse = await fetchBinanceSignedJson(apiKey, apiSecret, [
+    const incomeResponse = await fetchFromCcxtOrHttp([
+      { label: 'ccxt-papiGetUmIncome', fn: async () => await (client as any).papiGetUmIncome?.(commonParams) },
+      { label: 'ccxt-fapiPrivateGetIncome', fn: async () => await (client as any).fapiPrivateGetIncome?.(commonParams) },
+    ], [
       { label: 'papi-um-income', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/income' },
       { label: 'fapi-income', baseUrl: 'https://fapi.binance.com', endpoint: '/fapi/v1/income' },
-    ], commonParams);
+    ]);
 
     const trades = (Array.isArray(tradeResponse.data) ? tradeResponse.data : []).map((row: any): BinanceAuditTrade => ({
       symbol: String(row?.symbol || '').toUpperCase(),
