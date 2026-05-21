@@ -436,6 +436,149 @@ async function startServer() {
     }
   };
 
+  type BinanceSignedEndpoint = {
+    label: string;
+    baseUrl: string;
+    endpoint: string;
+  };
+
+  type BinanceAuditTrade = {
+    symbol: string;
+    side: 'BUY' | 'SELL';
+    price: number;
+    qty: number;
+    quoteQty: number;
+    realizedPnl: number;
+    commission: number;
+    commissionAsset: string;
+    time: number;
+    orderId: string;
+  };
+
+  type BinanceAuditIncome = {
+    symbol: string;
+    asset: string;
+    incomeType: string;
+    income: number;
+    info: string;
+    time: number;
+    tranId: string;
+    tradeId: string;
+  };
+
+  const fetchBinanceSignedJson = async (
+    apiKey: string,
+    apiSecret: string,
+    endpoints: BinanceSignedEndpoint[],
+    params: Record<string, string>,
+  ) => {
+    let lastMessage = 'unknown Binance signed request error';
+    let sawAuthError = false;
+
+    for (const candidate of endpoints) {
+      const query = new URLSearchParams({
+        ...params,
+        recvWindow: params.recvWindow || '5000',
+        timestamp: String(Date.now()),
+      });
+      const queryString = query.toString();
+      const signature = crypto
+        .createHmac('sha256', apiSecret)
+        .update(queryString)
+        .digest('hex');
+
+      const response = await fetch(`${candidate.baseUrl}${candidate.endpoint}?${queryString}&signature=${signature}`, {
+        headers: {
+          'X-MBX-APIKEY': apiKey,
+          'Content-Type': 'application/json',
+        },
+      });
+
+      const text = await response.text();
+      let parsed: any = null;
+      try {
+        parsed = text ? JSON.parse(text) : null;
+      } catch {
+        parsed = null;
+      }
+
+      if (response.ok) {
+        return {
+          label: candidate.label,
+          data: parsed,
+        };
+      }
+
+      const errorMessage = String(parsed?.msg || parsed?.message || text || response.statusText || 'unknown error');
+      lastMessage = errorMessage;
+      if (isBinanceAuthErrorMessage(errorMessage)) {
+        sawAuthError = true;
+      }
+    }
+
+    const error: any = new Error(lastMessage);
+    error.authError = sawAuthError;
+    throw error;
+  };
+
+  const fetchBinanceAccountAuditViaHttp = async (
+    apiKey: string,
+    apiSecret: string,
+    options: { startTime: number; endTime: number; limit: number },
+  ): Promise<{
+    trades: BinanceAuditTrade[];
+    incomes: BinanceAuditIncome[];
+    tradeRoute: string;
+    incomeRoute: string;
+  }> => {
+    const commonParams = {
+      startTime: String(options.startTime),
+      endTime: String(options.endTime),
+      limit: String(options.limit),
+    };
+
+    const tradeResponse = await fetchBinanceSignedJson(apiKey, apiSecret, [
+      { label: 'papi-um-userTrades', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/userTrades' },
+      { label: 'fapi-userTrades', baseUrl: 'https://fapi.binance.com', endpoint: '/fapi/v1/userTrades' },
+    ], commonParams);
+
+    const incomeResponse = await fetchBinanceSignedJson(apiKey, apiSecret, [
+      { label: 'papi-um-income', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/income' },
+      { label: 'fapi-income', baseUrl: 'https://fapi.binance.com', endpoint: '/fapi/v1/income' },
+    ], commonParams);
+
+    const trades = (Array.isArray(tradeResponse.data) ? tradeResponse.data : []).map((row: any): BinanceAuditTrade => ({
+      symbol: String(row?.symbol || '').toUpperCase(),
+      side: String(row?.side || '').toUpperCase() === 'SELL' ? 'SELL' : 'BUY',
+      price: Number(row?.price || 0),
+      qty: Number(row?.qty || row?.executedQty || 0),
+      quoteQty: Number(row?.quoteQty || 0),
+      realizedPnl: Number(row?.realizedPnl || 0),
+      commission: Number(row?.commission || 0),
+      commissionAsset: String(row?.commissionAsset || '').toUpperCase(),
+      time: Number(row?.time || 0),
+      orderId: String(row?.orderId || row?.id || ''),
+    })).filter((row: BinanceAuditTrade) => row.time > 0);
+
+    const incomes = (Array.isArray(incomeResponse.data) ? incomeResponse.data : []).map((row: any): BinanceAuditIncome => ({
+      symbol: String(row?.symbol || '').toUpperCase(),
+      asset: String(row?.asset || '').toUpperCase(),
+      incomeType: String(row?.incomeType || '').toUpperCase(),
+      income: Number(row?.income || 0),
+      info: String(row?.info || ''),
+      time: Number(row?.time || 0),
+      tranId: String(row?.tranId || ''),
+      tradeId: String(row?.tradeId || ''),
+    })).filter((row: BinanceAuditIncome) => row.time > 0);
+
+    return {
+      trades,
+      incomes,
+      tradeRoute: tradeResponse.label,
+      incomeRoute: incomeResponse.label,
+    };
+  };
+
   // Exchange Client (Lazy Init)
   let exchangeInstance: ccxt.Exchange | null = null;
   const hasConfiguredKeys = () => !!(
@@ -1446,6 +1589,106 @@ async function startServer() {
         console.error(`[TradeEdge Sync Error] ${msg}`);
         res.status(500).json({ status: 'error', message: msg });
       }
+    }
+  });
+
+  app.get('/api/binance/account-audit', async (req, res) => {
+    try {
+      const client = getExchange();
+      if (client.id !== 'binance') {
+        return res.status(400).json({
+          status: 'unsupported_exchange',
+          message: 'Account audit is only available for Binance futures accounts.',
+        });
+      }
+
+      const preferredBinance = getPreferredBinanceCredentials();
+      const binanceKey = preferredBinance.key;
+      const binanceSecret = preferredBinance.secret;
+      if (!binanceKey || !binanceSecret) {
+        return res.status(401).json({
+          status: 'auth_failed',
+          message: 'Binance API keys are required for account audit.',
+        });
+      }
+
+      const now = Date.now();
+      const requestedStart = Number(req.query.startTime || 0);
+      const requestedEnd = Number(req.query.endTime || 0);
+      const requestedDays = Number(req.query.days || 30);
+      const requestedLimit = Number(req.query.limit || 500);
+      const endTime = Number.isFinite(requestedEnd) && requestedEnd > 0 ? requestedEnd : now;
+      const days = Math.max(1, Math.min(90, Number.isFinite(requestedDays) ? requestedDays : 30));
+      const startTime = Number.isFinite(requestedStart) && requestedStart > 0
+        ? requestedStart
+        : (endTime - (days * 24 * 60 * 60 * 1000));
+      const limit = Math.max(10, Math.min(1000, Number.isFinite(requestedLimit) ? requestedLimit : 500));
+
+      const audit = await fetchBinanceAccountAuditViaHttp(binanceKey, binanceSecret, {
+        startTime,
+        endTime,
+        limit,
+      });
+
+      const summary = audit.incomes.reduce((acc, entry) => {
+        const amount = Number.isFinite(entry.income) ? entry.income : 0;
+        acc.netIncome += amount;
+
+        switch (entry.incomeType) {
+          case 'REALIZED_PNL':
+            acc.realizedPnl += amount;
+            break;
+          case 'COMMISSION':
+            acc.commission += amount;
+            break;
+          case 'FUNDING_FEE':
+            acc.funding += amount;
+            break;
+          case 'TRANSFER':
+            acc.transfer += amount;
+            break;
+          default:
+            acc.other += amount;
+            break;
+        }
+
+        acc.byType[entry.incomeType] = (acc.byType[entry.incomeType] || 0) + amount;
+        return acc;
+      }, {
+        realizedPnl: 0,
+        commission: 0,
+        funding: 0,
+        transfer: 0,
+        other: 0,
+        netIncome: 0,
+        byType: {} as Record<string, number>,
+      });
+
+      return res.json({
+        status: 'success',
+        exchange: 'binance',
+        startTime,
+        endTime,
+        routeHealth: {
+          trades: audit.tradeRoute,
+          incomes: audit.incomeRoute,
+        },
+        trades: audit.trades.sort((a, b) => b.time - a.time),
+        incomes: audit.incomes.sort((a, b) => b.time - a.time),
+        summary,
+      });
+    } catch (error: any) {
+      const msg = String(error?.message || 'unknown Binance account audit error');
+      if (error?.authError || isBinanceAuthErrorMessage(msg)) {
+        return res.status(401).json({
+          status: 'auth_failed',
+          message: msg,
+        });
+      }
+      return res.status(500).json({
+        status: 'error',
+        message: msg,
+      });
     }
   });
 
