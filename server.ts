@@ -532,15 +532,12 @@ async function startServer() {
     incomeRoute: string;
   }> => {
     const client = getExchange();
-    const commonParams = {
-      startTime: String(options.startTime),
-      endTime: String(options.endTime),
-      limit: String(options.limit),
-    };
+    const maxWindowMs = (7 * 24 * 60 * 60 * 1000) - 1;
 
     const fetchFromCcxtOrHttp = async (
       ccxtFetchers: Array<{ label: string; fn: () => Promise<any> }>,
       httpEndpoints: BinanceSignedEndpoint[],
+      params: Record<string, string>,
     ) => {
       let lastError: any = null;
 
@@ -556,7 +553,7 @@ async function startServer() {
       }
 
       try {
-        return await fetchBinanceSignedJson(apiKey, apiSecret, httpEndpoints, commonParams);
+        return await fetchBinanceSignedJson(apiKey, apiSecret, httpEndpoints, params);
       } catch (error: any) {
         if (lastError && !error?.message) {
           throw lastError;
@@ -565,51 +562,86 @@ async function startServer() {
       }
     };
 
-    const tradeResponse = await fetchFromCcxtOrHttp([
-      { label: 'ccxt-papiGetUmUserTrades', fn: async () => await (client as any).papiGetUmUserTrades?.(commonParams) },
-      { label: 'ccxt-fapiPrivateGetUserTrades', fn: async () => await (client as any).fapiPrivateGetUserTrades?.(commonParams) },
-    ], [
-      { label: 'papi-um-userTrades', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/userTrades' },
-      { label: 'fapi-userTrades', baseUrl: 'https://fapi.binance.com', endpoint: '/fapi/v1/userTrades' },
-    ]);
+    const tradeRouteLabels = new Set<string>();
+    const incomeRouteLabels = new Set<string>();
+    const tradeDedup = new Set<string>();
+    const incomeDedup = new Set<string>();
+    const trades: BinanceAuditTrade[] = [];
+    const incomes: BinanceAuditIncome[] = [];
 
-    const incomeResponse = await fetchFromCcxtOrHttp([
-      { label: 'ccxt-papiGetUmIncome', fn: async () => await (client as any).papiGetUmIncome?.(commonParams) },
-      { label: 'ccxt-fapiPrivateGetIncome', fn: async () => await (client as any).fapiPrivateGetIncome?.(commonParams) },
-    ], [
-      { label: 'papi-um-income', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/income' },
-      { label: 'fapi-income', baseUrl: 'https://fapi.binance.com', endpoint: '/fapi/v1/income' },
-    ]);
+    const normalizedStartTime = Math.max(0, options.startTime);
+    const normalizedEndTime = Math.max(normalizedStartTime, options.endTime);
 
-    const trades = (Array.isArray(tradeResponse.data) ? tradeResponse.data : []).map((row: any): BinanceAuditTrade => ({
-      symbol: String(row?.symbol || '').toUpperCase(),
-      side: String(row?.side || '').toUpperCase() === 'SELL' ? 'SELL' : 'BUY',
-      price: Number(row?.price || 0),
-      qty: Number(row?.qty || row?.executedQty || 0),
-      quoteQty: Number(row?.quoteQty || 0),
-      realizedPnl: Number(row?.realizedPnl || 0),
-      commission: Number(row?.commission || 0),
-      commissionAsset: String(row?.commissionAsset || '').toUpperCase(),
-      time: Number(row?.time || 0),
-      orderId: String(row?.orderId || row?.id || ''),
-    })).filter((row: BinanceAuditTrade) => row.time > 0);
+    for (let windowStart = normalizedStartTime; windowStart <= normalizedEndTime; windowStart += (maxWindowMs + 1)) {
+      const windowEnd = Math.min(normalizedEndTime, windowStart + maxWindowMs);
+      const params = {
+        startTime: String(windowStart),
+        endTime: String(windowEnd),
+        limit: String(options.limit),
+      };
 
-    const incomes = (Array.isArray(incomeResponse.data) ? incomeResponse.data : []).map((row: any): BinanceAuditIncome => ({
-      symbol: String(row?.symbol || '').toUpperCase(),
-      asset: String(row?.asset || '').toUpperCase(),
-      incomeType: String(row?.incomeType || '').toUpperCase(),
-      income: Number(row?.income || 0),
-      info: String(row?.info || ''),
-      time: Number(row?.time || 0),
-      tranId: String(row?.tranId || ''),
-      tradeId: String(row?.tradeId || ''),
-    })).filter((row: BinanceAuditIncome) => row.time > 0);
+      const tradeResponse = await fetchFromCcxtOrHttp([
+        { label: 'ccxt-papiGetUmUserTrades', fn: async () => await (client as any).papiGetUmUserTrades?.(params) },
+        { label: 'ccxt-fapiPrivateGetUserTrades', fn: async () => await (client as any).fapiPrivateGetUserTrades?.(params) },
+      ], [
+        { label: 'papi-um-userTrades', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/userTrades' },
+        { label: 'fapi-userTrades', baseUrl: 'https://fapi.binance.com', endpoint: '/fapi/v1/userTrades' },
+      ], params);
+      tradeRouteLabels.add(tradeResponse.label);
+
+      const incomeResponse = await fetchFromCcxtOrHttp([
+        { label: 'ccxt-papiGetUmIncome', fn: async () => await (client as any).papiGetUmIncome?.(params) },
+        { label: 'ccxt-fapiPrivateGetIncome', fn: async () => await (client as any).fapiPrivateGetIncome?.(params) },
+      ], [
+        { label: 'papi-um-income', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/income' },
+        { label: 'fapi-income', baseUrl: 'https://fapi.binance.com', endpoint: '/fapi/v1/income' },
+      ], params);
+      incomeRouteLabels.add(incomeResponse.label);
+
+      (Array.isArray(tradeResponse.data) ? tradeResponse.data : []).forEach((row: any) => {
+        const normalized: BinanceAuditTrade = {
+          symbol: String(row?.symbol || '').toUpperCase(),
+          side: String(row?.side || '').toUpperCase() === 'SELL' ? 'SELL' : 'BUY',
+          price: Number(row?.price || 0),
+          qty: Number(row?.qty || row?.executedQty || 0),
+          quoteQty: Number(row?.quoteQty || 0),
+          realizedPnl: Number(row?.realizedPnl || 0),
+          commission: Number(row?.commission || 0),
+          commissionAsset: String(row?.commissionAsset || '').toUpperCase(),
+          time: Number(row?.time || 0),
+          orderId: String(row?.orderId || row?.id || ''),
+        };
+        if (!(normalized.time > 0)) return;
+        const dedupKey = `${normalized.orderId}:${normalized.time}:${normalized.symbol}:${normalized.side}:${normalized.qty}`;
+        if (tradeDedup.has(dedupKey)) return;
+        tradeDedup.add(dedupKey);
+        trades.push(normalized);
+      });
+
+      (Array.isArray(incomeResponse.data) ? incomeResponse.data : []).forEach((row: any) => {
+        const normalized: BinanceAuditIncome = {
+          symbol: String(row?.symbol || '').toUpperCase(),
+          asset: String(row?.asset || '').toUpperCase(),
+          incomeType: String(row?.incomeType || '').toUpperCase(),
+          income: Number(row?.income || 0),
+          info: String(row?.info || ''),
+          time: Number(row?.time || 0),
+          tranId: String(row?.tranId || ''),
+          tradeId: String(row?.tradeId || ''),
+        };
+        if (!(normalized.time > 0)) return;
+        const dedupKey = `${normalized.tranId}:${normalized.tradeId}:${normalized.time}:${normalized.incomeType}:${normalized.income}`;
+        if (incomeDedup.has(dedupKey)) return;
+        incomeDedup.add(dedupKey);
+        incomes.push(normalized);
+      });
+    }
 
     return {
       trades,
       incomes,
-      tradeRoute: tradeResponse.label,
-      incomeRoute: incomeResponse.label,
+      tradeRoute: Array.from(tradeRouteLabels).join(',') || 'UNKNOWN',
+      incomeRoute: Array.from(incomeRouteLabels).join(',') || 'UNKNOWN',
     };
   };
 
