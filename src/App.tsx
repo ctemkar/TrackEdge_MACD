@@ -2,7 +2,7 @@ import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { TrendingUp, Activity, ShieldAlert, ShieldCheck, Info, Wallet, DollarSign, ArrowUpRight, ArrowDownRight, Search, Zap, Loader2, History, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { fetchBinanceData, fetchLatestPrice, subscribeToTicker, fetchAllSymbols, fetchTopSymbolsByVolume, fetchTicker24hStats, getPublicDataSourceSnapshot } from './services/binance';
+import { fetchBinanceData, fetchLatestPrice, subscribeToTicker, fetchAllSymbols, fetchTopSymbolsByVolume, fetchTicker24hStats, getPublicDataSourceSnapshot, fetchLiveAccountAudit, LiveAccountAuditSnapshot } from './services/binance';
 import { calculateIndicators, evaluateStrategy, Candle, DEFAULT_STRATEGY_CONFIG, IndicatorResult, StrategyConfig, StrategySignal } from './services/indicators';
 import { scanMarket, MarketScanResult, getLowHistorySnapshot } from './services/scanner';
 import { BacktestModule } from './components/BacktestModule';
@@ -747,6 +747,15 @@ export default function App() {
     pick: MarketScanResult | null;
   }
 
+  type LiveLedgerEntry = {
+    kind: 'income' | 'trade';
+    time: number;
+    label: string;
+    detail: string;
+    amount: number | null;
+    tone: 'emerald' | 'rose' | 'slate';
+  };
+
   type MarketPickLifecycle = {
     label: 'Signal Found' | 'Order Submitted' | 'Exchange Confirmed' | 'Watching';
     className: string;
@@ -1336,6 +1345,10 @@ export default function App() {
     const saved = localStorage.getItem('te_benchmark_capital');
     return saved ? (parseFloat(saved) || 800) : 800;
   });
+  const [benchmarkSetAt, setBenchmarkSetAt] = useState(() => {
+    const saved = localStorage.getItem('te_benchmark_set_at');
+    return saved ? (parseInt(saved, 10) || 0) : 0;
+  });
 
   // --- CORE SYSTEM FUNCTIONS (ORDER CRITICAL) ---
   const addLog = React.useCallback((message: string, type: 'info' | 'success' | 'warning' = 'info') => {
@@ -1367,6 +1380,11 @@ export default function App() {
       };
       return [nextEntry, ...prev].slice(0, 30);
     });
+  }, []);
+
+  const applyBenchmarkCapital = React.useCallback((nextValue: number, nextTimestamp: number = Date.now()) => {
+    setBenchmarkCapital(nextValue);
+    setBenchmarkSetAt(nextTimestamp);
   }, []);
 
   React.useEffect(() => {
@@ -1820,14 +1838,14 @@ export default function App() {
         // Auto-initialize baseline if placeholder or first sync in real mode
         const defaults = [0, 600, 800, 1000];
         if (currentEquity > 0 && (defaults.includes(benchmarkCapital) || (!isRealMode && !holdings.length))) {
-          setBenchmarkCapital(currentEquity);
+          applyBenchmarkCapital(currentEquity);
           addLog(`BASIS LOCKED: Tracking performance from $${currentEquity.toFixed(2)} baseline.`, 'info');
         }
 
         // GHOST BASIS RESET: If baseline is huge but equity is 0/small on first real sync, auto-correct
         if (isRealMode && benchmarkCapital > 2000 && currentEquity < 100 && usdt === 0) {
            addLog(`GHOST BASIS REJECTED: Resetting anomalous $${benchmarkCapital.toFixed(2)} baseline to reality.`, 'warning');
-           setBenchmarkCapital(currentEquity);
+            applyBenchmarkCapital(currentEquity);
         }
         
         reportSyncError(null);
@@ -1853,7 +1871,7 @@ export default function App() {
       isSyncingRef.current = false;
       setIsSyncing(false);
     }
-  }, [addLog, reportSyncError, serverConfig?.outboundIp, benchmarkCapital, holdings.length, isRealMode, marketPicks, holdingPrices, pushTradeEvent]);
+  }, [addLog, applyBenchmarkCapital, reportSyncError, serverConfig?.outboundIp, benchmarkCapital, holdings.length, isRealMode, marketPicks, holdingPrices, pushTradeEvent]);
 
   React.useEffect(() => {
     syncRealBalanceRef.current = syncRealBalance;
@@ -2845,6 +2863,7 @@ export default function App() {
     localStorage.setItem('te_history', JSON.stringify(tradeHistory));
     localStorage.setItem('te_seed', seedCapital.toString());
     localStorage.setItem('te_benchmark_capital', benchmarkCapital.toString());
+    localStorage.setItem('te_benchmark_set_at', benchmarkSetAt > 0 ? String(benchmarkSetAt) : '');
     localStorage.setItem('te_auto_trade', autoTrade.toString());
     localStorage.setItem('te_real_mode', isRealMode.toString());
     localStorage.setItem('te_stop_loss_percent', stopLossPercent.toString());
@@ -2877,7 +2896,7 @@ export default function App() {
     localStorage.setItem('te_close_failure_lock_minutes', closeFailureLockMinutes.toString());
     localStorage.setItem('te_hard_failure_lock_minutes', hardFailureLockMinutes.toString());
     localStorage.setItem('te_strategy_config', JSON.stringify(strategyConfig));
-  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, liveMarginBufferPct, hardReentryCooldownMinutes, minEdgeAfterFrictionPct, estimatedRoundTripFrictionBps, symbolDailyLossLimit, symbolDailyFlipLimit, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
+  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, benchmarkSetAt, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, liveMarginBufferPct, hardReentryCooldownMinutes, minEdgeAfterFrictionPct, estimatedRoundTripFrictionBps, symbolDailyLossLimit, symbolDailyFlipLimit, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
 
   useEffect(() => {
     localStorage.setItem('te_show_extra_criteria', showExtraCriteria ? '1' : '0');
@@ -2891,15 +2910,54 @@ export default function App() {
   useEffect(() => {
     if (!isRealMode && holdings.length === 0 && benchmarkCapital > (balance * 2) && balance === 800) {
       addLog("GHOST BASIS PURGED: Recalibrating laboratory benchmark.", 'info');
-      setBenchmarkCapital(balance);
+      applyBenchmarkCapital(balance);
     }
-  }, [isRealMode, balance, holdings.length, benchmarkCapital, addLog]);
+  }, [isRealMode, balance, holdings.length, benchmarkCapital, addLog, applyBenchmarkCapital]);
 
   useEffect(() => {
     if (!isRealMode) {
       setAvailableFunds(balance);
     }
   }, [isRealMode, balance]);
+
+  const [liveAccountAudit, setLiveAccountAudit] = useState<LiveAccountAuditSnapshot | null>(null);
+  const [isLiveAccountAuditLoading, setIsLiveAccountAuditLoading] = useState(false);
+  const [liveAccountAuditError, setLiveAccountAuditError] = useState<string | null>(null);
+
+  const loadLiveAccountAudit = React.useCallback(async (silent = false) => {
+    if (!isRealMode) return;
+    if (!silent) setIsLiveAccountAuditLoading(true);
+    try {
+      const auditWindowStart = benchmarkSetAt > 0 ? benchmarkSetAt : undefined;
+      const snapshot = await fetchLiveAccountAudit({
+        startTime: auditWindowStart,
+        days: auditWindowStart ? undefined : 30,
+        limit: 250,
+      });
+      setLiveAccountAudit(snapshot);
+      setLiveAccountAuditError(null);
+    } catch (error: any) {
+      setLiveAccountAuditError(String(error?.message || 'Failed to load live account audit'));
+    } finally {
+      if (!silent) setIsLiveAccountAuditLoading(false);
+    }
+  }, [benchmarkSetAt, isRealMode]);
+
+  useEffect(() => {
+    if (!isRealMode) {
+      setLiveAccountAudit(null);
+      setLiveAccountAuditError(null);
+      setIsLiveAccountAuditLoading(false);
+      return;
+    }
+
+    void loadLiveAccountAudit();
+    const timer = setInterval(() => {
+      void loadLiveAccountAudit(true);
+    }, 60000);
+
+    return () => clearInterval(timer);
+  }, [isRealMode, loadLiveAccountAudit]);
 
   const shouldMaintainLiveAccountSync = isRealMode && (autoTrade || holdings.length > 0);
 
@@ -4173,7 +4231,7 @@ export default function App() {
     const persistedRankedSignalSnapshot = localStorage.getItem('te_persisted_ranked_signals');
     setBalance(seedCapital);
     setAvailableFunds(seedCapital);
-    setBenchmarkCapital(seedCapital);
+    applyBenchmarkCapital(seedCapital);
     setHoldings([]);
     setTradeHistory([]);
     setSystemLogs([]);
@@ -4186,6 +4244,7 @@ export default function App() {
     }
     localStorage.setItem('te_seed', seedCapital.toString());
     localStorage.setItem('te_benchmark_capital', seedCapital.toString());
+    localStorage.setItem('te_benchmark_set_at', String(Date.now()));
     localStorage.setItem('te_available_funds', seedCapital.toString());
     addLog(`Laboratory reset: Initializing with $${seedCapital} capital.`, 'info');
   }, [seedCapital, addLog]);
@@ -4537,6 +4596,34 @@ export default function App() {
   const totalPnl = isRealMode ? (trackedRealizedPnl + openPnl) : basisDelta;
   const realizedPnl = isRealMode ? trackedRealizedPnl : (totalPnl - openPnl);
   const exchangeFreeMargin = isRealMode ? availableFunds : balance;
+  const liveAuditSummary = liveAccountAudit?.summary;
+  const liveAuditReconciledDelta = isRealMode ? ((liveAuditSummary?.netIncome || 0) + openPnl) : 0;
+  const liveAuditResidualDelta = isRealMode ? (basisDelta - liveAuditReconciledDelta) : 0;
+  const liveAuditLedgerEntries = React.useMemo<LiveLedgerEntry[]>(() => {
+    if (!liveAccountAudit) return [];
+
+    const incomeEntries = liveAccountAudit.incomes.map((entry) => ({
+      kind: 'income' as const,
+      time: entry.time,
+      label: entry.incomeType.replace(/_/g, ' '),
+      detail: [entry.symbol, entry.asset, entry.info].filter(Boolean).join(' | '),
+      amount: entry.income,
+      tone: entry.income > 0 ? 'emerald' as const : entry.income < 0 ? 'rose' as const : 'slate' as const,
+    }));
+
+    const tradeEntries = liveAccountAudit.trades.map((entry) => ({
+      kind: 'trade' as const,
+      time: entry.time,
+      label: `${entry.side} FILL`,
+      detail: `${entry.symbol} | qty ${entry.qty.toFixed(4)} @ ${entry.price.toFixed(6)} | fee ${entry.commission.toFixed(4)} ${entry.commissionAsset || 'USDT'}`,
+      amount: entry.realizedPnl,
+      tone: entry.realizedPnl > 0 ? 'emerald' as const : entry.realizedPnl < 0 ? 'rose' as const : 'slate' as const,
+    }));
+
+    return [...incomeEntries, ...tradeEntries]
+      .sort((a, b) => b.time - a.time)
+      .slice(0, 30);
+  }, [liveAccountAudit]);
   const remainingLiveSlots = Math.max(0, maxConcurrentTrades - holdings.length);
   const deployableLiveMargin = isRealMode
     ? Math.max(0, Math.min(getBufferedLiveCapital(exchangeFreeMargin), remainingLiveSlots * Math.max(1, maxLiveOrderNotional)))
@@ -6903,6 +6990,100 @@ export default function App() {
                       </div>
                     ))
                   )}
+                </div>
+             </section>
+
+             <section className="bg-white border-2 border-[#141414] shadow-[8px_8px_0px_0px_#141414] overflow-hidden flex flex-col h-[320px] lg:col-span-2">
+                <div className="bg-gray-50 border-b border-[#141414]/10 p-4 flex items-center justify-between">
+                   <div className="flex items-center gap-2">
+                     <Wallet size={14} className="opacity-40" />
+                     <h3 className="font-mono text-[10px] uppercase tracking-widest font-bold">Live Account Audit</h3>
+                   </div>
+                   <div className="flex items-center gap-3">
+                     {liveAccountAudit && (
+                       <span className="text-[9px] font-mono uppercase opacity-50">{new Date(liveAccountAudit.startTime).toLocaleDateString()} to {new Date(liveAccountAudit.endTime).toLocaleDateString()}</span>
+                     )}
+                     <button onClick={() => void loadLiveAccountAudit()} className="text-[9px] font-bold opacity-30 hover:opacity-100 uppercase transition-opacity">Refresh</button>
+                   </div>
+                </div>
+                <div className="flex-grow overflow-y-auto custom-scrollbar p-3 space-y-3">
+                  {!isRealMode ? (
+                    <div className="h-full flex items-center justify-center text-[10px] opacity-30 italic">Live account audit is available only in live mode.</div>
+                  ) : liveAccountAuditError ? (
+                    <div className="border border-amber-200 bg-amber-50 px-3 py-2 text-[10px] font-mono text-amber-900">{liveAccountAuditError}</div>
+                  ) : isLiveAccountAuditLoading && !liveAccountAudit ? (
+                    <div className="h-full flex items-center justify-center text-[10px] opacity-30 italic">Loading live Binance audit...</div>
+                  ) : liveAccountAudit ? (
+                    <>
+                      <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
+                        {[
+                          { label: 'Realized', value: liveAuditSummary?.realizedPnl || 0 },
+                          { label: 'Fees', value: liveAuditSummary?.commission || 0 },
+                          { label: 'Funding', value: liveAuditSummary?.funding || 0 },
+                          { label: 'Transfers', value: liveAuditSummary?.transfer || 0 },
+                          { label: 'Other', value: liveAuditSummary?.other || 0 },
+                          { label: 'Net Ledger', value: liveAuditSummary?.netIncome || 0 },
+                        ].map((entry) => (
+                          <div key={entry.label} className="border border-slate-200 bg-slate-50 px-2 py-2">
+                            <div className="text-[8px] font-mono uppercase opacity-50">{entry.label}</div>
+                            <div className={`mt-1 text-[12px] font-black ${entry.value >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
+                              {entry.value >= 0 ? '+' : '-'}${Math.abs(entry.value).toFixed(2)}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="border border-slate-200 bg-slate-50 px-3 py-2 text-[9px] font-mono uppercase leading-relaxed">
+                        <span>Basis {basisDelta >= 0 ? '+' : '-'}${Math.abs(basisDelta).toFixed(2)}</span>
+                        <span className="mx-2 opacity-40">|</span>
+                        <span>Ledger+Open {liveAuditReconciledDelta >= 0 ? '+' : '-'}${Math.abs(liveAuditReconciledDelta).toFixed(2)}</span>
+                        <span className="mx-2 opacity-40">|</span>
+                        <span>Residual {liveAuditResidualDelta >= 0 ? '+' : '-'}${Math.abs(liveAuditResidualDelta).toFixed(2)}</span>
+                        <div className="mt-1 normal-case opacity-60">
+                          Routes: trades {liveAccountAudit.routeHealth.trades} | incomes {liveAccountAudit.routeHealth.incomes}
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+                        <div className="border border-slate-200">
+                          <div className="border-b bg-gray-50 px-3 py-2 text-[9px] font-mono uppercase opacity-60">Ledger Entries</div>
+                          <div className="max-h-[200px] overflow-y-auto custom-scrollbar divide-y divide-gray-100">
+                            {liveAuditLedgerEntries.length === 0 ? (
+                              <div className="px-3 py-6 text-[10px] opacity-30 italic">No ledger entries returned for this window.</div>
+                            ) : liveAuditLedgerEntries.map((entry, index) => (
+                              <div key={`${entry.kind}-${entry.time}-${index}`} className="px-3 py-2 text-[9px] font-mono">
+                                <div className="flex items-center justify-between gap-3">
+                                  <span className="font-black uppercase">{entry.label}</span>
+                                  <span className={`font-black ${entry.tone === 'emerald' ? 'text-emerald-700' : entry.tone === 'rose' ? 'text-rose-700' : 'text-slate-700'}`}>
+                                    {entry.amount === null ? '--' : `${entry.amount >= 0 ? '+' : '-'}$${Math.abs(entry.amount).toFixed(2)}`}
+                                  </span>
+                                </div>
+                                <div className="mt-1 opacity-60">{entry.detail || 'no extra detail'}</div>
+                                <div className="mt-1 opacity-40">{new Date(entry.time).toLocaleString()}</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                        <div className="border border-slate-200">
+                          <div className="border-b bg-gray-50 px-3 py-2 text-[9px] font-mono uppercase opacity-60">Recent Fills</div>
+                          <div className="max-h-[200px] overflow-y-auto custom-scrollbar divide-y divide-gray-100">
+                            {liveAccountAudit.trades.length === 0 ? (
+                              <div className="px-3 py-6 text-[10px] opacity-30 italic">No fill history returned for this window.</div>
+                            ) : liveAccountAudit.trades.slice(0, 20).map((trade, index) => (
+                              <div key={`${trade.orderId}-${trade.time}-${index}`} className="px-3 py-2 text-[9px] font-mono">
+                                <div className="flex items-center justify-between gap-3">
+                                  <span className={`font-black uppercase ${trade.side === 'BUY' ? 'text-emerald-700' : 'text-rose-700'}`}>{trade.side} {trade.symbol}</span>
+                                  <span className={`${trade.realizedPnl >= 0 ? 'text-emerald-700' : 'text-rose-700'} font-black`}>
+                                    {trade.realizedPnl >= 0 ? '+' : '-'}${Math.abs(trade.realizedPnl).toFixed(2)}
+                                  </span>
+                                </div>
+                                <div className="mt-1 opacity-60">qty {trade.qty.toFixed(4)} @ ${trade.price.toFixed(6)} | fee {trade.commission.toFixed(4)} {trade.commissionAsset || 'USDT'}</div>
+                                <div className="mt-1 opacity-40">{new Date(trade.time).toLocaleString()}</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    </>
+                  ) : null}
                 </div>
              </section>
 

@@ -202,6 +202,88 @@ export async function fetchTicker24hStats(options?: { forceBinancePublic?: boole
   }
 }
 
+export type LiveAccountAuditTrade = {
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  price: number;
+  qty: number;
+  quoteQty: number;
+  realizedPnl: number;
+  commission: number;
+  commissionAsset: string;
+  time: number;
+  orderId: string;
+};
+
+export type LiveAccountAuditIncome = {
+  symbol: string;
+  asset: string;
+  incomeType: string;
+  income: number;
+  info: string;
+  time: number;
+  tranId: string;
+  tradeId: string;
+};
+
+export type LiveAccountAuditSummary = {
+  realizedPnl: number;
+  commission: number;
+  funding: number;
+  transfer: number;
+  other: number;
+  netIncome: number;
+  byType: Record<string, number>;
+};
+
+export type LiveAccountAuditSnapshot = {
+  exchange: string;
+  startTime: number;
+  endTime: number;
+  routeHealth: {
+    trades: string;
+    incomes: string;
+  };
+  trades: LiveAccountAuditTrade[];
+  incomes: LiveAccountAuditIncome[];
+  summary: LiveAccountAuditSummary;
+};
+
+export async function fetchLiveAccountAudit(options?: { startTime?: number; endTime?: number; days?: number; limit?: number }): Promise<LiveAccountAuditSnapshot> {
+  const params = new URLSearchParams();
+  if (Number.isFinite(options?.startTime)) params.set('startTime', String(options?.startTime));
+  if (Number.isFinite(options?.endTime)) params.set('endTime', String(options?.endTime));
+  if (Number.isFinite(options?.days)) params.set('days', String(options?.days));
+  if (Number.isFinite(options?.limit)) params.set('limit', String(options?.limit));
+
+  const response = await fetch(`/api/binance/account-audit?${params.toString()}`);
+  const data = await response.json();
+  if (!response.ok || data?.status !== 'success') {
+    throw new Error(String(data?.message || `Account audit failed with ${response.status}`));
+  }
+
+  return {
+    exchange: String(data.exchange || 'binance'),
+    startTime: Number(data.startTime || 0),
+    endTime: Number(data.endTime || 0),
+    routeHealth: {
+      trades: String(data?.routeHealth?.trades || 'UNKNOWN'),
+      incomes: String(data?.routeHealth?.incomes || 'UNKNOWN'),
+    },
+    trades: Array.isArray(data.trades) ? data.trades : [],
+    incomes: Array.isArray(data.incomes) ? data.incomes : [],
+    summary: {
+      realizedPnl: Number(data?.summary?.realizedPnl || 0),
+      commission: Number(data?.summary?.commission || 0),
+      funding: Number(data?.summary?.funding || 0),
+      transfer: Number(data?.summary?.transfer || 0),
+      other: Number(data?.summary?.other || 0),
+      netIncome: Number(data?.summary?.netIncome || 0),
+      byType: typeof data?.summary?.byType === 'object' && data.summary.byType ? data.summary.byType : {},
+    },
+  };
+}
+
 export function subscribeToTicker(
   symbol: string,
   onUpdate: (price: number) => void,
