@@ -155,6 +155,33 @@ const compareExecutionPriority = (
   return (b.pick.signal.macdScore || 0) - (a.pick.signal.macdScore || 0);
 };
 
+const getTopSignalDisplayBucket = (overall: StrategySignal['overall']) => {
+  if (overall === 'BUY') return 0;
+  if (overall === 'SELL') return 1;
+  return 2;
+};
+
+const compareTopSignalDisplayPriority = (
+  a: Pick<MarketScanResult, 'priorityRank' | 'signal'>,
+  b: Pick<MarketScanResult, 'priorityRank' | 'signal'>,
+) => {
+  const bucketDelta = getTopSignalDisplayBucket(a.signal.overall) - getTopSignalDisplayBucket(b.signal.overall);
+  if (bucketDelta !== 0) return bucketDelta;
+
+  const priorityRankDelta = (b.priorityRank || 0) - (a.priorityRank || 0);
+  if (priorityRankDelta !== 0) return priorityRankDelta;
+
+  const aDirectionalScore = a.signal.overall === 'SELL'
+    ? 10 - (a.signal.score || 0)
+    : (a.signal.score || 0);
+  const bDirectionalScore = b.signal.overall === 'SELL'
+    ? 10 - (b.signal.score || 0)
+    : (b.signal.score || 0);
+  if (bDirectionalScore !== aDirectionalScore) return bDirectionalScore - aDirectionalScore;
+
+  return (b.signal.macdScore || 0) - (a.signal.macdScore || 0);
+};
+
 const describeMacdHistogram = (state?: string) => {
   switch (state) {
     case 'BULLISH_ACCELERATION':
@@ -1222,13 +1249,6 @@ export default function App() {
   }, [loading]);
 
   React.useEffect(() => {
-    // On boot: restore autonomous mode preference from localStorage
-    const savedAutoTrade = localStorage.getItem('te_auto_trade') === 'true';
-    autoTradeRef.current = savedAutoTrade;
-    setAutoTrade(savedAutoTrade);
-  }, []);
-
-  React.useEffect(() => {
     entryLockUntilRef.current = entryLockUntil;
   }, [entryLockUntil]);
 
@@ -1348,6 +1368,23 @@ export default function App() {
       return [nextEntry, ...prev].slice(0, 30);
     });
   }, []);
+
+  React.useEffect(() => {
+    const savedAutoTrade = localStorage.getItem('te_auto_trade') === 'true';
+    const shouldResumeAutoTrade = savedAutoTrade && !isRealMode;
+
+    autoTradeRef.current = shouldResumeAutoTrade;
+    setAutoTrade(shouldResumeAutoTrade);
+
+    if (savedAutoTrade && isRealMode) {
+      localStorage.setItem('te_auto_trade', 'false');
+      addLog('LIVE AUTONOMY SAFETY: autonomous live trading stays OFF on startup until you re-enable it manually.', 'warning');
+      setExecutionFeedback({
+        type: 'warning',
+        message: 'Live autonomous trading was not resumed automatically. Re-enable it manually if intended.',
+      });
+    }
+  }, [addLog, isRealMode]);
 
   const appendScanArchiveEntry = React.useCallback((entry: Omit<ScanArchiveEntry, 'id'>) => {
     const archiveEntry: ScanArchiveEntry = normalizeScanArchiveEntry({
@@ -4486,9 +4523,19 @@ export default function App() {
   
   const pnl = equity - benchmarkCapital;
   const pnlPercent = benchmarkCapital > 0 ? (pnl / benchmarkCapital) * 100 : 0;
-  const totalPnl = pnl;
+  const basisDelta = pnl;
   const openPnl = displayedUnrealizedRisk;
-  const realizedPnl = totalPnl - openPnl;
+  const trackedRealizedPnl = React.useMemo(() => {
+    return tradeHistory.reduce((sum, trade) => {
+      const status = trade.status || 'FILLED';
+      if ((status !== 'FILLED' && status !== 'SYNC_REMOVED') || typeof trade.pnl !== 'number') {
+        return sum;
+      }
+      return sum + trade.pnl;
+    }, 0);
+  }, [tradeHistory]);
+  const totalPnl = isRealMode ? (trackedRealizedPnl + openPnl) : basisDelta;
+  const realizedPnl = isRealMode ? trackedRealizedPnl : (totalPnl - openPnl);
   const exchangeFreeMargin = isRealMode ? availableFunds : balance;
   const remainingLiveSlots = Math.max(0, maxConcurrentTrades - holdings.length);
   const deployableLiveMargin = isRealMode
@@ -4837,6 +4884,8 @@ export default function App() {
 
     if (marketPicks.length > 0) {
       marketPicks
+        .slice()
+        .sort((a, b) => compareTopSignalDisplayPriority(a, b))
         .slice(0, visibleSignalTableLimit)
         .forEach((pick) => pushEntry(pick, latestFoundAt));
 
@@ -4845,9 +4894,14 @@ export default function App() {
         pushEntry(latestPick || entry.pick, latestPick ? latestFoundAt : entry.foundAt);
       });
 
-      return Array.from(mergedEntries.values()).slice(0, visibleSignalTableLimit);
+      return Array.from(mergedEntries.values())
+        .sort((a, b) => compareTopSignalDisplayPriority(a.pick, b.pick))
+        .slice(0, visibleSignalTableLimit);
     }
-    return persistedRankedSignals.slice(0, visibleSignalTableLimit);
+    return persistedRankedSignals
+      .slice()
+      .sort((a, b) => compareTopSignalDisplayPriority(a.pick, b.pick))
+      .slice(0, visibleSignalTableLimit);
   }, [marketPicks, persistedRankedSignals, scanSignalSummary.updatedAt]);
   const visibleSignalTablePicks = visibleSignalTableEntries.map((entry) => entry.pick);
   const usingPersistedRankedSignals = marketPicks.length === 0 && persistedRankedSignals.length > 0;
@@ -6528,10 +6582,12 @@ export default function App() {
             />
             <MetricBox 
               icon={<DollarSign className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
-              label="Total P&L"
+              label={isRealMode ? 'Tracked P&L' : 'Total P&L'}
               value={`${totalPnl >= 0 ? '+' : '-'}$${Math.abs(totalPnl).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
               trend={totalPnl >= 0 ? 'up' : 'down'}
-              subValue={`Realized ${realizedPnl >= 0 ? '+' : '-'}$${Math.abs(realizedPnl).toFixed(2)} | Open ${openPnl >= 0 ? '+' : '-'}$${Math.abs(openPnl).toFixed(2)}`}
+              subValue={isRealMode
+                ? `Realized ${realizedPnl >= 0 ? '+' : '-'}$${Math.abs(realizedPnl).toFixed(2)} | Open ${openPnl >= 0 ? '+' : '-'}$${Math.abs(openPnl).toFixed(2)} | Basis ${basisDelta >= 0 ? '+' : '-'}$${Math.abs(basisDelta).toFixed(2)}`
+                : `Realized ${realizedPnl >= 0 ? '+' : '-'}$${Math.abs(realizedPnl).toFixed(2)} | Open ${openPnl >= 0 ? '+' : '-'}$${Math.abs(openPnl).toFixed(2)}`}
             />
             <MetricBox 
               icon={<Zap className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
