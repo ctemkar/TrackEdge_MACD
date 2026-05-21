@@ -222,11 +222,15 @@ type SymbolRiskSummary = {
   closedTrades: number;
   lastExitAt: number;
   hardReentryUntil: number;
+  lastExitReason: string | null;
+  lastExitPnl: number;
+  lastExitReentrySide: 'BUY' | 'SELL' | null;
   dailyStopUntil: number;
   dailyStopReason: string | null;
 };
 
 const TRADING_DAY_MS = 24 * 60 * 60 * 1000;
+const CLEAN_TP_REENTRY_COOLDOWN_MINUTES = 15;
 
 const getTradingDayStart = (timestamp: number) => {
   const next = new Date(timestamp);
@@ -920,12 +924,25 @@ export default function App() {
     return normalizedReason.includes('EMERGENCY_LIQUIDATION') || normalizedReason.includes('MANUAL_DOCK_CONTROL');
   }, []);
 
+  const getExitCooldownMinutes = React.useCallback((reason: string | undefined, pnl: number) => {
+    const normalizedReason = String(reason || '');
+    if (/EMERGENCY_LIQUIDATION/i.test(normalizedReason) || pnl < 0) {
+      return Math.max(hardReentryCooldownMinutes, paperLossCooldownMinutes);
+    }
+    if (pnl > 0 && /AUTO_EXIT: TP1|AUTO_EXIT: TP2|TAKE PROFIT/i.test(normalizedReason)) {
+      return Math.min(hardReentryCooldownMinutes, CLEAN_TP_REENTRY_COOLDOWN_MINUTES);
+    }
+    if (pnl > 0) {
+      return Math.min(hardReentryCooldownMinutes, Math.max(15, successCooldownMinutes));
+    }
+    return hardReentryCooldownMinutes;
+  }, [hardReentryCooldownMinutes, paperLossCooldownMinutes, successCooldownMinutes]);
+
   const symbolRiskSummary = React.useMemo(() => {
     const now = Date.now();
     const tradingDayStart = getTradingDayStart(now);
     const tradingDayEnd = tradingDayStart + TRADING_DAY_MS;
     const summaries = new Map<string, SymbolRiskSummary>();
-
     const ensureSummary = (symbol: string) => {
       const { key, symbol: displaySymbol } = getSymbolRiskIdentity(symbol);
       if (!key) return null;
@@ -944,6 +961,9 @@ export default function App() {
         closedTrades: 0,
         lastExitAt: 0,
         hardReentryUntil: 0,
+        lastExitReason: null,
+        lastExitPnl: 0,
+        lastExitReentrySide: null,
         dailyStopUntil: 0,
         dailyStopReason: null,
       };
@@ -966,13 +986,18 @@ export default function App() {
       summary.realizedPnl += trade.pnl;
       summary.entryNotional += Math.max(0, Number(trade.entryPrice || trade.price || 0) * Math.abs(Number(trade.amount || 0)));
       summary.closedTrades += 1;
-      summary.lastExitAt = Math.max(summary.lastExitAt, tradeTs);
+      if (tradeTs >= summary.lastExitAt) {
+        summary.lastExitAt = tradeTs;
+        summary.lastExitReason = String(trade.reason || '');
+        summary.lastExitPnl = trade.pnl;
+        summary.lastExitReentrySide = trade.type === 'SELL' ? 'BUY' : trade.type === 'BUY' ? 'SELL' : null;
+      }
     }
 
     for (const summary of summaries.values()) {
       summary.realizedPnlPct = summary.entryNotional > 0 ? (summary.realizedPnl / summary.entryNotional) * 100 : 0;
       summary.hardReentryUntil = summary.lastExitAt > 0
-        ? summary.lastExitAt + (hardReentryCooldownMinutes * 60 * 1000)
+        ? summary.lastExitAt + (getExitCooldownMinutes(summary.lastExitReason || '', summary.lastExitPnl) * 60 * 1000)
         : 0;
       if (summary.realizedPnl <= -Math.abs(symbolDailyLossLimit)) {
         summary.dailyStopUntil = tradingDayEnd;
@@ -984,7 +1009,7 @@ export default function App() {
     }
 
     return summaries;
-  }, [tradeHistory, hardReentryCooldownMinutes, symbolDailyFlipLimit, symbolDailyLossLimit, isManualLiquidationReason]);
+  }, [tradeHistory, getExitCooldownMinutes, symbolDailyFlipLimit, symbolDailyLossLimit, isManualLiquidationReason]);
 
   const getSymbolRiskBlock = React.useCallback((rawSymbol: string, at: number = Date.now()) => {
     const { key } = getSymbolRiskIdentity(rawSymbol);
@@ -2872,6 +2897,15 @@ export default function App() {
       ? currentHolding.entryPrice - (currentHoldingRiskPerUnit * 2.4)
       : currentHolding.entryPrice + (currentHoldingRiskPerUnit * 2.4)))
     : 0;
+  const currentHoldingStopPctFromEntry = currentHolding?.entryPrice
+    ? (Math.abs(stopLossPrice - currentHolding.entryPrice) / currentHolding.entryPrice) * 100
+    : 0;
+  const currentHoldingTp1PctFromEntry = currentHolding?.entryPrice
+    ? (Math.abs(currentHoldingTp1Price - currentHolding.entryPrice) / currentHolding.entryPrice) * 100
+    : 0;
+  const currentHoldingTp2PctFromEntry = currentHolding?.entryPrice
+    ? (Math.abs(currentHoldingTp2Price - currentHolding.entryPrice) / currentHolding.entryPrice) * 100
+    : 0;
 
   const [scanProgress, setScanProgress] = useState({ current: 0, total: 0 });
   const [scanSignalSummary, setScanSignalSummary] = useState(() => readStoredJson('te_scan_signal_summary', DEFAULT_SCAN_SIGNAL_SUMMARY));
@@ -3680,6 +3714,22 @@ export default function App() {
         return positiveDay || risingHistogram || bullishHistogram || bullishEma;
       };
 
+      const isLongContinuationMomentum = (pick: MarketScanResult) => {
+        const positiveDay = (pick.change24h || 0) > 0.75;
+        const risingHistogram = (pick.macdHistogramDelta || 0) > 0;
+        const bullishHistogram = pick.signal.confluence.macdHistogram === 'BULLISH_ACCELERATION';
+        const bullishTrend = pick.signal.confluence.macd === 'BULLISH' || pick.signal.confluence.emaCrossover === 'BULLISH';
+        return positiveDay || risingHistogram || bullishHistogram || bullishTrend;
+      };
+
+      const isShortContinuationMomentum = (pick: MarketScanResult) => {
+        const negativeDay = (pick.change24h || 0) < -0.75;
+        const fallingHistogram = (pick.macdHistogramDelta || 0) < 0;
+        const bearishHistogram = pick.signal.confluence.macdHistogram === 'BEARISH_ACCELERATION';
+        const bearishTrend = pick.signal.confluence.macd === 'BEARISH' || pick.signal.confluence.emaCrossover === 'BEARISH';
+        return negativeDay || fallingHistogram || bearishHistogram || bearishTrend;
+      };
+
       const getEntryCohortKey = ({ side, pick }: { side: 'BUY' | 'SELL'; pick: MarketScanResult }) => {
         const parts = getCompactUsdSymbolParts(pick.symbol);
         const quote = parts?.quote || 'OTHER';
@@ -3718,8 +3768,22 @@ export default function App() {
           return `cooldown ${minutesRemaining}m remaining`;
         }
         const symbolRiskBlock = getSymbolRiskBlock(pick.symbol, scanNow);
+        const directionalConfidence = getDirectionalEntryScore(side, pick.signal.score);
         if (symbolRiskBlock) {
-          return symbolRiskBlock.reason;
+          const symbolRiskKey = getSymbolRiskIdentity(pick.symbol).key;
+          const summary = symbolRiskKey ? symbolRiskSummary.get(symbolRiskKey) : null;
+          const profitableTpReentry = Boolean(
+            summary &&
+            summary.hardReentryUntil > scanNow &&
+            summary.lastExitPnl > 0 &&
+            /AUTO_EXIT: TP1|AUTO_EXIT: TP2|TAKE PROFIT/i.test(summary.lastExitReason || '') &&
+            summary.lastExitReentrySide === side &&
+            directionalConfidence >= (relaxedAutoEntryMinScore + 0.8) &&
+            (side === 'BUY' ? isLongContinuationMomentum(pick) : isShortContinuationMomentum(pick))
+          );
+          if (!profitableTpReentry) {
+            return symbolRiskBlock.reason;
+          }
         }
         if (isRealMode) {
           const retryLock = getEntryRetryLock(pick.symbol, scanNow);
@@ -3727,7 +3791,6 @@ export default function App() {
             const minutesRemaining = Math.max(1, Math.ceil((retryLock.until - scanNow) / 60000));
             return `retry lock ${minutesRemaining}m remaining (${retryLock.reason})`;
           }
-          const directionalConfidence = getDirectionalEntryScore(side, pick.signal.score);
           if (directionalConfidence < relaxedAutoEntryMinScore) {
             return `confidence ${directionalConfidence.toFixed(1)} below ${relaxedAutoEntryMinScore.toFixed(1)}`;
           }
@@ -6299,21 +6362,21 @@ export default function App() {
                       <p className="text-sm font-black text-rose-400 tabular-nums">
                         ${formatPrice(stopLossPrice)}
                       </p>
-                      <p className="mt-1 text-[8px] font-mono uppercase opacity-45">{Math.abs(stopLossPercent).toFixed(2)}% from entry</p>
+                      <p className="mt-1 text-[8px] font-mono uppercase opacity-45">{currentHoldingStopPctFromEntry.toFixed(1)}% | 1.0R risk</p>
                     </div>
                     <div className="bg-white/5 p-3 border border-white/10">
                       <p className="text-[8px] uppercase font-bold opacity-40 mb-1">Take Profit 1</p>
                       <p className="text-sm font-black text-emerald-400 tabular-nums">
                         ${formatPrice(currentHoldingTp1Price)}
                       </p>
-                      <p className="mt-1 text-[8px] font-mono uppercase opacity-45">1.25R target</p>
+                      <p className="mt-1 text-[8px] font-mono uppercase opacity-45">{currentHoldingTp1PctFromEntry.toFixed(1)}% | 1.25R</p>
                     </div>
                     <div className="bg-white/5 p-3 border border-white/10">
                       <p className="text-[8px] uppercase font-bold opacity-40 mb-1">Take Profit 2</p>
                       <p className="text-sm font-black text-emerald-300 tabular-nums">
                         ${formatPrice(currentHoldingTp2Price)}
                       </p>
-                      <p className="mt-1 text-[8px] font-mono uppercase opacity-45">2.4R target</p>
+                      <p className="mt-1 text-[8px] font-mono uppercase opacity-45">{currentHoldingTp2PctFromEntry.toFixed(1)}% | 2.4R</p>
                     </div>
                   </div>
                 )}
@@ -6579,7 +6642,7 @@ export default function App() {
                          {row.exchange}
                           </td>
                           <td className="px-1 py-1.5">
-                              <span className={`text-[8px] font-black px-1 py-0.5 rounded-sm ${h.side === 'SHORT' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{h.side}</span>
+                              <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-sm ${h.side === 'SHORT' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{h.side === 'SHORT' ? '↓' : '↑'}</span>
                           </td>
                         <td className="px-1 py-1.5 font-mono text-[10px] font-black uppercase tracking-tight">
                           {displaySymbol}
