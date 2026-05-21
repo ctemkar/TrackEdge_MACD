@@ -2331,6 +2331,8 @@ export default function App() {
               status: 'FILLED',
               cycleId: eventCycleId,
             });
+            const exitCooldownMinutes = getExitCooldownMinutes(reason, realized);
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * exitCooldownMinutes) }));
           } else {
             applyOptimisticLiveFill(type, tradeSymbol, amount, price, time);
             pushTradeEvent({
@@ -2347,7 +2349,9 @@ export default function App() {
 
           addLog(`REAL ${type} SUCCESS: ${tradeSymbol}`, 'success');
           setExecutionFeedback({ type: 'success', message: `${type} confirmed on exchange for ${tradeSymbol}.` });
-          setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * Math.max(successCooldownMinutes, hardReentryCooldownMinutes)) }));
+          if (!(closingLong || closingShort)) {
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * Math.max(successCooldownMinutes, hardReentryCooldownMinutes)) }));
+          }
           setTimeout(syncRealBalance, 1500); 
         } else {
           throw new Error(result.message || 'Order failed');
@@ -2576,11 +2580,12 @@ export default function App() {
             setHoldings(prev => prev.filter(h => h.symbol !== tradeSymbol));
           }
 
-          if (pnlPct < 0) {
-             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * Math.max(paperLossCooldownMinutes, hardReentryCooldownMinutes)) }));
+           const exitCooldownMinutes = getExitCooldownMinutes(reason, pnl);
+           if (pnlPct < 0) {
+             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * exitCooldownMinutes) }));
              addLog(`TRADE EXIT [${tradeSymbol}]: Loss of $${Math.abs(pnl).toFixed(2)} (${pnlPct.toFixed(2)}%)`, 'warning');
           } else {
-             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * hardReentryCooldownMinutes) }));
+             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * exitCooldownMinutes) }));
              addLog(`TRADE EXIT [${tradeSymbol}]: Profit of $${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)`, 'success');
           }
 
