@@ -11,6 +11,11 @@ const STRATEGY_SIGNAL_INTERVAL = '1d';
 const SCAN_SHORTLIST_SAFE_CAP = 2000;
 const DEFAULT_BROAD_SCAN_LIMIT = 1500;
 const DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT = 'USDT,USDC,FDUSD,BUSD,TUSD';
+const LIVE_CONTROL_TAB_KEY = 'te_live_controller_tab';
+const LIVE_CONTROL_FOCUS_REQUEST_KEY = 'te_live_controller_focus_request';
+const LIVE_CONTROL_CLOSE_OTHERS_KEY = 'te_live_close_other_tabs_request';
+const DEFAULT_MARGIN_STOP_LOSS_PCT = 12;
+const DEFAULT_FAST_ADVERSE_MOVE_EXIT_PCT = 1.2;
 
 const getLocalDayKey = () => {
   const now = new Date();
@@ -31,6 +36,8 @@ const CRITERIA_HELP: Record<string, string> = {
   symbolDailyLossLimit: 'Maximum realized loss per symbol per trading day before that symbol is disabled for the rest of the day.',
   symbolDailyFlipLimit: 'Maximum number of realized round trips per symbol per trading day before the symbol is kill-switched until the next day.',
   accountDailyLossLimit: 'Maximum account-level equity loss allowed for the current local day before autonomous trading is disabled and all live positions are force-closed.',
+  marginStopLossPct: 'Maximum loss allowed on a position as a percent of its margin before it is force-closed, even if the normal price stop has not been hit.',
+  fastAdverseMoveExitPct: 'Maximum sudden adverse price move allowed between holding-price polls before a position is force-closed as a crash guard.',
   macdFastPeriod: 'Fast EMA period used by MACD. Lower values react faster to price changes but can create more noise.',
   macdSlowPeriod: 'Slow EMA period used by MACD. Higher values smooth trend detection but react slower to reversals.',
   macdSignalPeriod: 'Signal-line EMA period for MACD cross detection. Larger values filter noise but delay entry/exit confirmation.',
@@ -85,6 +92,8 @@ const PARAMETER_DEFAULTS = {
   symbolDailyLossLimit: 20,
   symbolDailyFlipLimit: 12,
   accountDailyLossLimit: 25,
+  marginStopLossPct: DEFAULT_MARGIN_STOP_LOSS_PCT,
+  fastAdverseMoveExitPct: DEFAULT_FAST_ADVERSE_MOVE_EXIT_PCT,
   liveQuoteAllowlistInput: DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT,
   scanIntervalSec: 40,
   holdingPollIntervalSec: 10,
@@ -491,6 +500,14 @@ export default function App() {
     const saved = localStorage.getItem('te_account_daily_loss_limit');
     return saved ? Math.max(1, parseFloat(saved) || PARAMETER_DEFAULTS.accountDailyLossLimit) : PARAMETER_DEFAULTS.accountDailyLossLimit;
   });
+  const [marginStopLossPct, setMarginStopLossPct] = useState(() => {
+    const saved = localStorage.getItem('te_margin_stop_loss_pct');
+    return saved ? Math.max(1, parseFloat(saved) || PARAMETER_DEFAULTS.marginStopLossPct) : PARAMETER_DEFAULTS.marginStopLossPct;
+  });
+  const [fastAdverseMoveExitPct, setFastAdverseMoveExitPct] = useState(() => {
+    const saved = localStorage.getItem('te_fast_adverse_move_exit_pct');
+    return saved ? Math.max(0.1, parseFloat(saved) || PARAMETER_DEFAULTS.fastAdverseMoveExitPct) : PARAMETER_DEFAULTS.fastAdverseMoveExitPct;
+  });
   const [dailyEquityAnchorDate, setDailyEquityAnchorDate] = useState(() => localStorage.getItem('te_daily_equity_anchor_date') || '');
   const [dailyEquityAnchor, setDailyEquityAnchor] = useState(() => {
     const saved = localStorage.getItem('te_daily_equity_anchor');
@@ -661,6 +678,13 @@ export default function App() {
     time: string;
   }
 
+  interface RecentHoldingMove {
+    previousPrice: number;
+    currentPrice: number;
+    previousAt: number;
+    updatedAt: number;
+  }
+
   type ActivePositionSortKey =
     | 'exchange'
     | 'side'
@@ -668,10 +692,12 @@ export default function App() {
     | 'contracts'
     | 'entryPrice'
     | 'markPrice'
+    | 'stopPrice'
     | 'margin'
     | 'notional'
     | 'unrealizedPnl'
     | 'pnlPct'
+    | 'riskGuard'
     | 'action';
 
   type ActivePositionSortDirection = 'asc' | 'desc';
@@ -884,6 +910,7 @@ export default function App() {
   });
   
   const [autoTrade, setAutoTrade] = useState(false);
+  const [liveControllerTabId, setLiveControllerTabId] = useState(() => localStorage.getItem(LIVE_CONTROL_TAB_KEY) || '');
   const [useBNBFees, setUseBNBFees] = useState(() => {
     const saved = localStorage.getItem('te_use_bnb_fees');
     return saved !== null ? saved === 'true' : true;
@@ -938,6 +965,8 @@ export default function App() {
   const [scanExecutionTotals, setScanExecutionTotals] = useState({ attempted: 0, filled: 0, failed: 0, skipped: 0 });
   const [executionFeedback, setExecutionFeedback] = useState<{ type: 'info' | 'success' | 'warning', message: string } | null>(null);
   const [pendingManualOverrideTrade, setPendingManualOverrideTrade] = useState<PendingManualOverrideTrade | null>(null);
+  const [showLiveControlLockPrompt, setShowLiveControlLockPrompt] = useState(false);
+  const [controllerTabAttentionUntil, setControllerTabAttentionUntil] = useState(0);
   const [entryLockUntil, setEntryLockUntil] = useState(0);
   const lastRateLimitWarnAtRef = React.useRef(0);
   const dismissedSyncErrorRef = React.useRef<{ message: string; until: number } | null>(null);
@@ -960,6 +989,17 @@ export default function App() {
     document.addEventListener('keydown', handleEscape);
     return () => document.removeEventListener('keydown', handleEscape);
   }, [pendingManualOverrideTrade]);
+
+  React.useEffect(() => {
+    if (!showLiveControlLockPrompt) return;
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setShowLiveControlLockPrompt(false);
+      }
+    };
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [showLiveControlLockPrompt]);
   const tradeLockout = React.useRef<Set<string>>(new Set());
   const isSyncingRef = React.useRef(false);
   const loadingRef = React.useRef(loading);
@@ -1107,11 +1147,28 @@ export default function App() {
   // Refs for scan logic to avoid dependency loops
   const holdingsRef = React.useRef(holdings);
   const autoTradeRef = React.useRef(autoTrade);
+  const appTabIdRef = React.useRef(`te-tab-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
   const accountLossGuardTriggerRef = React.useRef<string | null>(null);
+  const recentHoldingMovesRef = React.useRef<Record<string, RecentHoldingMove>>({});
   const maxConcurrentTradesRef = React.useRef(maxConcurrentTrades);
   const strategyConfigRef = React.useRef(strategyConfig);
   const performScanRef = React.useRef<() => Promise<void>>(async () => {});
   const perSymbolEntryRetryLockRef = React.useRef<Record<string, { until: number; reason: string }>>({});
+
+  const claimLiveControl = React.useCallback(() => {
+    const tabId = appTabIdRef.current;
+    localStorage.setItem(LIVE_CONTROL_TAB_KEY, tabId);
+    setLiveControllerTabId(tabId);
+    return tabId;
+  }, []);
+
+  const releaseLiveControl = React.useCallback(() => {
+    const tabId = appTabIdRef.current;
+    if (localStorage.getItem(LIVE_CONTROL_TAB_KEY) === tabId) {
+      localStorage.removeItem(LIVE_CONTROL_TAB_KEY);
+    }
+    setLiveControllerTabId((current) => (current === tabId ? '' : current));
+  }, []);
 
   const getHoldingActiveNotional = React.useCallback((
     holding: Pick<Holding, 'amount' | 'contracts' | 'notional' | 'markPrice' | 'entryPrice'> | undefined,
@@ -1402,6 +1459,34 @@ export default function App() {
     });
   }, []);
 
+  const requestControllerTabFocus = React.useCallback(() => {
+    if (!liveControllerTabId) return;
+
+    localStorage.setItem(LIVE_CONTROL_FOCUS_REQUEST_KEY, JSON.stringify({
+      targetTabId: liveControllerTabId,
+      requesterTabId: appTabIdRef.current,
+      requestedAt: Date.now(),
+    }));
+    setShowLiveControlLockPrompt(false);
+    setExecutionFeedback({ type: 'info', message: 'Controller tab pinged. Switch to the tab showing the controller highlight.' });
+    addLog('CONTROLLER TAB PINGED: the active live-control tab should highlight itself now.', 'info');
+  }, [addLog, liveControllerTabId]);
+
+  const takeOverAndCloseOtherTabs = React.useCallback(() => {
+    const claimedTabId = claimLiveControl();
+    autoTradeRef.current = true;
+    setAutoTrade(true);
+    setShowLiveControlLockPrompt(false);
+
+    localStorage.setItem(LIVE_CONTROL_CLOSE_OTHERS_KEY, JSON.stringify({
+      requesterTabId: claimedTabId,
+      requestedAt: Date.now(),
+    }));
+
+    setExecutionFeedback({ type: 'success', message: 'This tab took live control and asked the other tabs to close.' });
+    addLog('LIVE CONTROL TAKEOVER: this tab is now the controller and the other tabs were asked to close.', 'warning');
+  }, [addLog, claimLiveControl]);
+
   const applyBenchmarkCapital = React.useCallback((nextValue: number, nextTimestamp: number = Date.now()) => {
     setBenchmarkCapital(nextValue);
     setBenchmarkSetAt(nextTimestamp);
@@ -1411,8 +1496,88 @@ export default function App() {
     const savedAutoTrade = localStorage.getItem('te_auto_trade') === 'true';
     const shouldResumeAutoTrade = savedAutoTrade;
 
+    if (shouldResumeAutoTrade && isRealMode) {
+      claimLiveControl();
+    }
+
     autoTradeRef.current = shouldResumeAutoTrade;
     setAutoTrade(shouldResumeAutoTrade);
+  }, [claimLiveControl, isRealMode]);
+
+  React.useEffect(() => {
+    const handleStorage = (event: StorageEvent) => {
+      if (!event.key) return;
+
+      if (event.key === 'te_auto_trade') {
+        const nextAutoTrade = event.newValue === 'true';
+        autoTradeRef.current = nextAutoTrade;
+        setAutoTrade(nextAutoTrade);
+      }
+
+      if (event.key === 'te_real_mode') {
+        setIsRealMode(event.newValue === 'true');
+      }
+
+      if (event.key === LIVE_CONTROL_TAB_KEY) {
+        const nextController = event.newValue || '';
+        setLiveControllerTabId(nextController);
+        setShowLiveControlLockPrompt(false);
+        if (nextController && nextController !== appTabIdRef.current && autoTradeRef.current) {
+          autoTradeRef.current = false;
+          setAutoTrade(false);
+          setExecutionFeedback({ type: 'warning', message: 'Autonomous control moved to another tab. This tab is now read-only.' });
+          addLog('AUTONOMOUS CONTROL TRANSFERRED: another tab is now the live controller.', 'warning');
+        }
+      }
+
+      if (event.key === LIVE_CONTROL_FOCUS_REQUEST_KEY && event.newValue) {
+        try {
+          const payload = JSON.parse(event.newValue) as { targetTabId?: string; requesterTabId?: string; requestedAt?: number };
+          if (payload.targetTabId === appTabIdRef.current && localStorage.getItem(LIVE_CONTROL_TAB_KEY) === appTabIdRef.current) {
+            setControllerTabAttentionUntil(Date.now() + 12000);
+            setExecutionFeedback({ type: 'info', message: 'This is the controller tab. Another tab asked to switch here.' });
+            addLog('CONTROLLER TAB REQUESTED: another tab asked to switch to this live-control tab.', 'info');
+            window.focus();
+          }
+        } catch {
+          // Ignore malformed cross-tab payloads.
+        }
+      }
+
+      if (event.key === LIVE_CONTROL_CLOSE_OTHERS_KEY && event.newValue) {
+        try {
+          const payload = JSON.parse(event.newValue) as { requesterTabId?: string; requestedAt?: number };
+          if (payload.requesterTabId && payload.requesterTabId !== appTabIdRef.current) {
+            autoTradeRef.current = false;
+            setAutoTrade(false);
+            releaseLiveControl();
+            setShowLiveControlLockPrompt(false);
+            setExecutionFeedback({ type: 'warning', message: 'Another tab took live control and asked this tab to close.' });
+            addLog('LIVE CONTROL RELEASED: another tab requested this tab to close.', 'warning');
+            setTimeout(() => {
+              window.close();
+              setExecutionFeedback({ type: 'warning', message: 'Another tab took control. Close this tab manually if it stayed open.' });
+            }, 80);
+          }
+        } catch {
+          // Ignore malformed cross-tab payloads.
+        }
+      }
+    };
+
+    window.addEventListener('storage', handleStorage);
+    return () => window.removeEventListener('storage', handleStorage);
+  }, [addLog, releaseLiveControl]);
+
+  React.useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (localStorage.getItem(LIVE_CONTROL_TAB_KEY) === appTabIdRef.current) {
+        localStorage.removeItem(LIVE_CONTROL_TAB_KEY);
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, []);
 
   const appendScanArchiveEntry = React.useCallback((entry: Omit<ScanArchiveEntry, 'id'>) => {
@@ -2682,6 +2847,8 @@ export default function App() {
       ? holding.entryPrice * (1 + stopLossPercent / 100)
       : holding.entryPrice * (1 - stopLossPercent / 100);
     const stopPrice = holding.stopPrice || fallbackStop;
+    const marginStopLossPct = DEFAULT_MARGIN_STOP_LOSS_PCT;
+    const fastAdverseMoveExitPct = DEFAULT_FAST_ADVERSE_MOVE_EXIT_PCT;
     const riskPerUnit = Math.max(Math.abs(holding.entryPrice - stopPrice), holding.entryPrice * 0.005);
     const tp1Price = holding.tp1Price || (holding.side === 'SHORT' ? holding.entryPrice - (riskPerUnit * 1.25) : holding.entryPrice + (riskPerUnit * 1.25));
     const tp2Price = holding.tp2Price || (holding.side === 'SHORT' ? holding.entryPrice - (riskPerUnit * 2.4) : holding.entryPrice + (riskPerUnit * 2.4));
@@ -2697,6 +2864,19 @@ export default function App() {
       ? (holding.entryPrice - price)
       : (price - holding.entryPrice)) * contracts;
     const currentMarginPnlPct = margin > 0 ? (currentUnrealizedPnl / margin) * 100 : 0;
+    const recentMove = recentHoldingMovesRef.current[holding.symbol];
+    const adverseMovePct = recentMove && recentMove.previousPrice > 0
+      ? (holding.side === 'LONG'
+          ? ((recentMove.previousPrice - recentMove.currentPrice) / recentMove.previousPrice) * 100
+          : ((recentMove.currentPrice - recentMove.previousPrice) / recentMove.previousPrice) * 100)
+      : 0;
+    const recentMoveWindowMs = recentMove ? Math.max(0, recentMove.updatedAt - recentMove.previousAt) : 0;
+    const fastAdverseMoveDetected = Boolean(
+      recentMove
+      && recentMoveWindowMs > 0
+      && recentMoveWindowMs <= (Math.max(10, holdingPollIntervalSec) * 2000)
+      && adverseMovePct >= fastAdverseMoveExitPct
+    );
     const histogramExpanding = holding.side === 'LONG'
       ? signal?.confluence.macdHistogram === 'BULLISH_ACCELERATION'
       : signal?.confluence.macdHistogram === 'BEARISH_ACCELERATION';
@@ -2755,6 +2935,34 @@ export default function App() {
     const trailingBroken = runnerStage && (holding.side === 'LONG' ? price <= trailingStopPrice : price >= trailingStopPrice);
     const weaknessConfirmed = runnerStage && momentumWeakening && (holding.side === 'LONG' ? price < trailingStopPrice : price > trailingStopPrice);
 
+    if (margin > 0 && currentMarginPnlPct <= -marginStopLossPct) {
+      executeTrade(
+        closeSide,
+        holding.symbol,
+        price,
+        `AUTO_EXIT: MARGIN STOP ${currentMarginPnlPct.toFixed(2)}% <= -${marginStopLossPct.toFixed(2)}%`,
+        holding.id,
+        cycleId,
+        undefined,
+        holding.amount,
+      );
+      return;
+    }
+
+    if (fastAdverseMoveDetected) {
+      executeTrade(
+        closeSide,
+        holding.symbol,
+        price,
+        `AUTO_EXIT: FAST ADVERSE MOVE ${adverseMovePct.toFixed(2)}% in ${(recentMoveWindowMs / 1000).toFixed(0)}s`,
+        holding.id,
+        cycleId,
+        undefined,
+        holding.amount,
+      );
+      return;
+    }
+
     if (technicalInvalidation) {
       executeTrade(
         closeSide,
@@ -2809,7 +3017,7 @@ export default function App() {
     if (weaknessConfirmed) {
       executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: MOMENTUM WEAKNESS CONFIRMED', holding.id, cycleId, undefined, holding.amount);
     }
-  }, [executeTrade, stopLossPercent, takeProfitPercent]);
+  }, [executeTrade, stopLossPercent, takeProfitPercent, holdingPollIntervalSec]);
 
 
 
@@ -2911,6 +3119,8 @@ export default function App() {
     localStorage.setItem('te_symbol_daily_loss_limit', symbolDailyLossLimit.toString());
     localStorage.setItem('te_symbol_daily_flip_limit', symbolDailyFlipLimit.toString());
     localStorage.setItem('te_account_daily_loss_limit', accountDailyLossLimit.toString());
+    localStorage.setItem('te_margin_stop_loss_pct', marginStopLossPct.toString());
+    localStorage.setItem('te_fast_adverse_move_exit_pct', fastAdverseMoveExitPct.toString());
     localStorage.setItem('te_daily_equity_anchor_date', dailyEquityAnchorDate);
     localStorage.setItem('te_daily_equity_anchor', dailyEquityAnchor.toString());
     localStorage.setItem('te_live_quote_allowlist', liveQuoteAllowlistInput);
@@ -2928,7 +3138,7 @@ export default function App() {
     localStorage.setItem('te_close_failure_lock_minutes', closeFailureLockMinutes.toString());
     localStorage.setItem('te_hard_failure_lock_minutes', hardFailureLockMinutes.toString());
     localStorage.setItem('te_strategy_config', JSON.stringify(strategyConfig));
-  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, benchmarkSetAt, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, liveMarginBufferPct, hardReentryCooldownMinutes, minEdgeAfterFrictionPct, estimatedRoundTripFrictionBps, symbolDailyLossLimit, symbolDailyFlipLimit, accountDailyLossLimit, dailyEquityAnchorDate, dailyEquityAnchor, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
+  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, benchmarkSetAt, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, liveMarginBufferPct, hardReentryCooldownMinutes, minEdgeAfterFrictionPct, estimatedRoundTripFrictionBps, symbolDailyLossLimit, symbolDailyFlipLimit, accountDailyLossLimit, marginStopLossPct, fastAdverseMoveExitPct, dailyEquityAnchorDate, dailyEquityAnchor, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
 
   useEffect(() => {
     if (!isRealMode || !Number.isFinite(balance) || balance <= 0) return;
@@ -4430,10 +4640,18 @@ export default function App() {
           const lastPrice = await fetchLatestPrice(h.symbol);
           if (lastPrice) {
             const prevPrice = holdingPrices[h.symbol] || h.entryPrice;
+            const now = Date.now();
+            const priorMove = recentHoldingMovesRef.current[h.symbol];
             
             const priceDelta = prevPrice > 1 ? Math.abs((lastPrice - prevPrice) / prevPrice) : 0;
             
             if (lastPrice > 0 && isFinite(lastPrice) && (priceDelta < 3.0 || prevPrice <= 1)) {
+                recentHoldingMovesRef.current[h.symbol] = {
+                  previousPrice: prevPrice,
+                  currentPrice: lastPrice,
+                  previousAt: priorMove?.updatedAt || (now - (Math.max(10, holdingPollIntervalSec) * 1000)),
+                  updatedAt: now,
+                };
                 updates[h.symbol] = lastPrice;
             } else if (priceDelta >= 3.0) {
                 addLog(`DATA GUARD: Suppressed erratic move for ${h.symbol} ($${lastPrice} vs $${prevPrice})`, 'warning');
@@ -4630,6 +4848,7 @@ export default function App() {
         return null;
       })()
     : null;
+  const isControlledByAnotherTab = isRealMode && Boolean(liveControllerTabId) && liveControllerTabId !== appTabIdRef.current;
   
   // Anti-Glitich: If equity is non-finite or impossible, it's a data core issue
   // We cap at $100,000,000 to allow "Whale" mode while still blocking glitches
@@ -4778,6 +4997,16 @@ export default function App() {
       const notional = Number(h.notional || (contracts * h.entryPrice) || 0);
       const margin = Number(h.initialMargin || (notional > 0 ? notional / 5 : 0) || 0);
       const pnlPctVal = margin > 0 ? (pnlVal / margin) * 100 : 0;
+      const fallbackStopPrice = h.side === 'SHORT'
+        ? h.entryPrice * (1 + stopLossPercent / 100)
+        : h.entryPrice * (1 - stopLossPercent / 100);
+      const stopPrice = Number(h.stopPrice || fallbackStopPrice || 0);
+      const recentMove = recentHoldingMovesRef.current[h.symbol];
+      const recentAdverseMovePct = recentMove && recentMove.previousPrice > 0
+        ? (h.side === 'LONG'
+            ? ((recentMove.previousPrice - recentMove.currentPrice) / recentMove.previousPrice) * 100
+            : ((recentMove.currentPrice - recentMove.previousPrice) / recentMove.previousPrice) * 100)
+        : 0;
       const closeSide: 'BUY' | 'SELL' = h.side === 'SHORT' ? 'BUY' : 'SELL';
       const displaySymbol = h.displaySymbol || (h.symbol.endsWith('USDT')
         ? `${h.symbol.slice(0, -4)}/USDT:USDT`
@@ -4794,14 +5023,17 @@ export default function App() {
         contracts,
         entryPrice: Number(h.entryPrice || 0),
         mark,
+        stopPrice,
         margin,
         notional,
         unrealizedPnl: pnlVal,
         pnlPct: pnlPctVal,
+        riskGuardText: `-${DEFAULT_MARGIN_STOP_LOSS_PCT.toFixed(0)}% M | ${DEFAULT_FAST_ADVERSE_MOVE_EXIT_PCT.toFixed(1)}% V`,
+        recentAdverseMovePct,
         closeSide,
       };
     });
-  }, [holdings, resolveHoldingPnl]);
+  }, [holdings, resolveHoldingPnl, stopLossPercent, holdingPrices]);
 
   const sortedActivePositionRows = React.useMemo(() => {
     if (activePositionSortRules.length === 0) return activePositionRows;
@@ -4832,6 +5064,9 @@ export default function App() {
           case 'markPrice':
             cmp = a.mark - b.mark;
             break;
+          case 'stopPrice':
+            cmp = a.stopPrice - b.stopPrice;
+            break;
           case 'margin':
             cmp = a.margin - b.margin;
             break;
@@ -4843,6 +5078,9 @@ export default function App() {
             break;
           case 'pnlPct':
             cmp = a.pnlPct - b.pnlPct;
+            break;
+          case 'riskGuard':
+            cmp = a.recentAdverseMovePct - b.recentAdverseMovePct;
             break;
           case 'action':
             cmp = collator.compare(a.closeSide, b.closeSide);
@@ -4868,18 +5106,24 @@ export default function App() {
     label: string;
     rightAlign?: boolean;
   }> = [
-    { key: 'exchange', label: 'Exchange' },
     { key: 'side', label: 'Side' },
     { key: 'symbol', label: 'Symbol' },
     { key: 'contracts', label: 'Contracts' },
     { key: 'entryPrice', label: 'Entry Price' },
     { key: 'markPrice', label: 'Mark Price' },
+    { key: 'stopPrice', label: 'Stop Price' },
     { key: 'margin', label: 'Margin' },
     { key: 'notional', label: 'Notional' },
     { key: 'unrealizedPnl', label: 'Unrealized P&L' },
     { key: 'pnlPct', label: 'P&L %' },
+    { key: 'riskGuard', label: 'Risk Guard' },
     { key: 'action', label: 'Action Control', rightAlign: true },
   ];
+
+  const activePositionExchangeLabel = React.useMemo(() => {
+    const exchanges = Array.from(new Set(activePositionRows.map((row) => row.exchange).filter(Boolean)));
+    return exchanges.join(' | ');
+  }, [activePositionRows]);
 
   const heldSymbols = React.useMemo(() => {
     return new Set(holdings.map(h => String(h.symbol || '').toUpperCase()));
@@ -5316,6 +5560,53 @@ export default function App() {
         document.body
       )}
 
+      {showLiveControlLockPrompt && createPortal(
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-[#141414]/55 px-4 backdrop-blur-[2px]" onClick={() => setShowLiveControlLockPrompt(false)}>
+          <div className="w-full max-w-lg border-2 border-[#141414] bg-[#EDE9E1] p-5 shadow-[10px_10px_0px_0px_#141414]" onClick={(event) => event.stopPropagation()}>
+            <p className="text-[10px] font-mono uppercase tracking-[0.25em] text-amber-700">Autonomous Control Locked</p>
+            <h3 className="mt-2 text-[20px] font-black uppercase tracking-tight text-[#141414]">
+              Another tab already owns live control
+            </h3>
+            <p className="mt-3 text-[11px] font-mono uppercase tracking-wide text-[#141414]/65">
+              Choose whether to jump back to that controller tab or take over here and clear the others out.
+            </p>
+            <div className="mt-4 border border-amber-300 bg-amber-50 px-3 py-3">
+              <p className="text-[9px] font-mono uppercase tracking-[0.2em] text-amber-800/75">Live Control Status</p>
+              <p className="mt-1 text-[12px] font-semibold leading-relaxed text-amber-950">
+                Autonomous trading cannot be enabled here until the current controller tab releases ownership.
+              </p>
+            </div>
+            <p className="mt-4 text-[10px] font-mono uppercase tracking-wide text-[#141414]/55">
+              Go To Controller Tab will highlight the tab that already owns live control. Close Other Tabs will move control here and ask the other app tabs to close themselves.
+            </p>
+            <div className="mt-5 flex flex-wrap items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setShowLiveControlLockPrompt(false)}
+                className="border border-[#141414]/20 px-3 py-2 text-[10px] font-black uppercase tracking-wide text-[#141414] transition-colors hover:bg-white"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={requestControllerTabFocus}
+                className="border border-sky-300 bg-sky-50 px-3 py-2 text-[10px] font-black uppercase tracking-wide text-sky-900 transition-colors hover:bg-sky-100"
+              >
+                Go To Controller Tab
+              </button>
+              <button
+                type="button"
+                onClick={takeOverAndCloseOtherTabs}
+                className="bg-amber-600 px-3 py-2 text-[10px] font-black uppercase tracking-wide text-white transition-colors hover:bg-amber-700"
+              >
+                Close Other Tabs
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
       {isAuthDisabledBannerVisible && (
         <div className="max-w-7xl mx-auto mb-4 border-2 border-rose-700 bg-rose-50 px-4 py-3 shadow-[6px_6px_0px_0px_#881337]">
           <div className="flex items-start justify-between gap-3">
@@ -5360,7 +5651,10 @@ export default function App() {
           <div className="mt-4 flex flex-wrap items-center gap-3">
              <div className="flex items-center bg-[#141414] p-0.5 rounded-sm overflow-hidden">
                 <button 
-                  onClick={() => setIsRealMode(false)}
+                  onClick={() => {
+                    releaseLiveControl();
+                    setIsRealMode(false);
+                  }}
                   className={`w-32 px-4 py-1.5 text-[10px] font-black uppercase tracking-tighter transition-all ${!isRealMode ? 'bg-[#F27D26] text-white shadow-lg' : 'text-white/40 hover:text-white'}`}
                 >
                   Paper Trading
@@ -5373,7 +5667,10 @@ export default function App() {
                         addLog('Retrying live Binance handshake despite prior auth lock.', 'info');
                       }
                       const success = await syncRealBalance({ ignoreEntryLock: true });
-                      if (success) setIsRealMode(true);
+                      if (success) {
+                        claimLiveControl();
+                        setIsRealMode(true);
+                      }
                     }
                     else {
                       const message = serverStatus !== 'OK'
@@ -5414,7 +5711,23 @@ export default function App() {
                       addLog(lockMessage, 'warning');
                       return;
                     }
+
+                    if (!autoTrade && isRealMode && liveControllerTabId && liveControllerTabId !== appTabIdRef.current) {
+                      const message = 'AUTONOMOUS CONTROL LOCKED: another open tab already owns live control. Disable it there first or close that tab.';
+                      setExecutionFeedback({ type: 'warning', message });
+                      setShowLiveControlLockPrompt(true);
+                      addLog(message, 'warning');
+                      return;
+                    }
+
                     const newState = !autoTrade;
+                    if (newState && isRealMode) {
+                      claimLiveControl();
+                    }
+                    if (!newState) {
+                      releaseLiveControl();
+                    }
+                    autoTradeRef.current = newState;
                     setAutoTrade(newState);
                     addLog(`SYSTEM UPDATE: Autonomous Execution ${newState ? 'ENGAGED' : 'SUSPENDED'}`, newState ? 'success' : 'warning');
                   }}
@@ -5449,8 +5762,14 @@ export default function App() {
                 </button>
              </div>
 
-             {isRealMode && !serverConfig?.realTradingEnabled && (
+             {isRealMode && (!serverConfig?.realTradingEnabled || isControlledByAnotherTab) && (
                <span className="text-[11px] font-black text-rose-600 bg-rose-50 px-2 py-0.5 border border-rose-200">READ-ONLY MODE</span>
+             )}
+             {liveControllerTabId === appTabIdRef.current && controllerTabAttentionUntil > Date.now() && (
+               <span className="text-[11px] font-black text-sky-700 bg-sky-50 px-2 py-0.5 border border-sky-200 animate-pulse">CONTROLLER TAB HERE</span>
+             )}
+             {isControlledByAnotherTab && (
+               <span className="text-[11px] font-black text-amber-700 bg-amber-50 px-2 py-0.5 border border-amber-200">CONTROLLED BY ANOTHER TAB</span>
              )}
           </div>
         </div>
@@ -6824,6 +7143,11 @@ export default function App() {
                 </div>
               </div>
             )}
+            {activePositionExchangeLabel && (
+              <div className="border-b border-[#141414]/10 bg-gray-50/70 px-3 py-2 text-[10px] font-mono uppercase tracking-wide text-[#141414]/70">
+                Exchange: <span className="font-black text-[#141414]">{activePositionExchangeLabel}</span>
+              </div>
+            )}
             
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
@@ -6856,7 +7180,7 @@ export default function App() {
                 <tbody className="divide-y divide-gray-100">
                   {holdings.length === 0 ? (
                     <tr>
-                      <td colSpan={11} className="px-2 py-10 text-center">
+                      <td colSpan={12} className="px-2 py-10 text-center">
                         <div className="flex flex-col items-center gap-2 opacity-30">
                           <Zap size={24} />
                           <p className="text-xs font-mono uppercase tracking-[0.2em]">Awaiting signal confluence. No open vectors.</p>
@@ -6870,12 +7194,9 @@ export default function App() {
                   ) : (
                     sortedActivePositionRows.map((row) => {
                       const h = row.holding;
-                      const { mark, contracts, margin, notional, unrealizedPnl: pnlVal, pnlPct: pnlPctVal, closeSide, displaySymbol } = row;
+                      const { mark, contracts, stopPrice, margin, notional, unrealizedPnl: pnlVal, pnlPct: pnlPctVal, closeSide, displaySymbol, riskGuardText, recentAdverseMovePct } = row;
                       return (
                         <tr key={h.id} className="hover:bg-gray-50/50 transition-colors group cursor-pointer" onClick={() => setSymbol(h.symbol)}>
-                        <td className="px-1 py-1.5 font-mono text-[10px] opacity-70">
-                         {row.exchange}
-                          </td>
                           <td className="px-1 py-1.5">
                               <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-sm ${h.side === 'SHORT' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{h.side === 'SHORT' ? '↓' : '↑'}</span>
                           </td>
@@ -6891,6 +7212,9 @@ export default function App() {
                           <td className={`px-1 py-1.5 font-mono text-[10px] font-bold ${pnlVal > 0 ? 'text-emerald-600' : pnlVal < 0 ? 'text-rose-600' : 'text-[#141414]'}`}>
                           ${formatPrice(mark)}
                           </td>
+                          <td className="px-1 py-1.5 font-mono text-[10px] font-bold text-[#141414]">
+                          ${formatPrice(stopPrice)}
+                        </td>
                           <td className="px-1 py-1.5 font-mono text-[10px] font-bold">
                           ${margin.toFixed(2)}
                         </td>
@@ -6902,6 +7226,12 @@ export default function App() {
                         </td>
                         <td className={`px-1 py-1.5 font-black text-[11px] ${pnlPctVal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                           {pnlPctVal >= 0 ? '+' : ''}{pnlPctVal.toFixed(2)}%
+                          </td>
+                          <td className="px-1 py-1.5 font-mono text-[9px] font-bold uppercase leading-tight text-[#141414]">
+                            <div>{riskGuardText}</div>
+                            <div className={`text-[8px] ${recentAdverseMovePct >= DEFAULT_FAST_ADVERSE_MOVE_EXIT_PCT ? 'text-rose-600' : 'opacity-50'}`}>
+                              {recentAdverseMovePct > 0 ? `${recentAdverseMovePct.toFixed(2)}% adverse` : 'stable'}
+                            </div>
                           </td>
                           <td className="px-1 py-1.5 text-right">
                              <button 
