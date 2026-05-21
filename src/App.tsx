@@ -7168,13 +7168,13 @@ const MetricBox = ({ icon, label, value, trend, subValue, action }: { icon: Reac
         </div>
         <div className="min-w-0">
           <div className="flex items-center justify-between gap-2">
-            <p className="truncate text-[9px] uppercase font-bold opacity-40 tracking-tight group-hover:opacity-60 md:text-[10px]">{label}</p>
+            <p className="truncate text-[10px] uppercase font-bold opacity-40 tracking-tight group-hover:opacity-60 md:text-[11px]">{label}</p>
             {action && <div className="shrink-0">{action}</div>}
           </div>
           <div className="flex flex-col">
             <p className="whitespace-nowrap text-[17px] font-black tabular-nums tracking-tight leading-none md:text-[18px]">{value}</p>
             {subValue && (
-              <div className="mt-0.5 font-mono text-[8px] font-bold opacity-60 break-words leading-[1.35] uppercase md:text-[9px]">
+              <div className="mt-0.5 font-mono text-[9px] font-bold opacity-70 break-words leading-[1.4] uppercase md:text-[10px]">
                 {subValue}
               </div>
             )}
