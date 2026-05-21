@@ -1573,7 +1573,7 @@ export default function App() {
       }
       
       const data = await resp.json();
-      if (data.status === 'success') {
+      if (data.status === 'success' || data.status === 'cached') {
         setPrivateSyncBlockedUntil(0);
         const liveEquity = Number(data.equity);
         const usdt = Number(data?.balance?.USDT || 0);
