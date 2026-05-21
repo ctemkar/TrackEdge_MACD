@@ -12,6 +12,14 @@ const SCAN_SHORTLIST_SAFE_CAP = 2000;
 const DEFAULT_BROAD_SCAN_LIMIT = 1500;
 const DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT = 'USDT,USDC,FDUSD,BUSD,TUSD';
 
+const getLocalDayKey = () => {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
 const CRITERIA_HELP: Record<string, string> = {
   autoEntryMinScore: 'Minimum strategy confidence required before opening a new position. Higher values reduce trade frequency and prioritize stronger setups.',
   liveMinOrderNotional: 'Minimum USDT notional value allowed per live order. Helps avoid exchange min-notional rejects and tiny low-quality entries.',
@@ -22,6 +30,7 @@ const CRITERIA_HELP: Record<string, string> = {
   estimatedRoundTripFrictionBps: 'Estimated round-trip fees plus slippage in basis points. Used to reject setups where expected edge is mostly consumed by execution costs.',
   symbolDailyLossLimit: 'Maximum realized loss per symbol per trading day before that symbol is disabled for the rest of the day.',
   symbolDailyFlipLimit: 'Maximum number of realized round trips per symbol per trading day before the symbol is kill-switched until the next day.',
+  accountDailyLossLimit: 'Maximum account-level equity loss allowed for the current local day before autonomous trading is disabled and all live positions are force-closed.',
   macdFastPeriod: 'Fast EMA period used by MACD. Lower values react faster to price changes but can create more noise.',
   macdSlowPeriod: 'Slow EMA period used by MACD. Higher values smooth trend detection but react slower to reversals.',
   macdSignalPeriod: 'Signal-line EMA period for MACD cross detection. Larger values filter noise but delay entry/exit confirmation.',
@@ -75,6 +84,7 @@ const PARAMETER_DEFAULTS = {
   estimatedRoundTripFrictionBps: 18,
   symbolDailyLossLimit: 20,
   symbolDailyFlipLimit: 12,
+  accountDailyLossLimit: 25,
   liveQuoteAllowlistInput: DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT,
   scanIntervalSec: 40,
   holdingPollIntervalSec: 10,
@@ -476,6 +486,15 @@ export default function App() {
   const [symbolDailyFlipLimit, setSymbolDailyFlipLimit] = useState(() => {
     const saved = localStorage.getItem('te_symbol_daily_flip_limit');
     return saved ? (parseInt(saved, 10) || PARAMETER_DEFAULTS.symbolDailyFlipLimit) : PARAMETER_DEFAULTS.symbolDailyFlipLimit;
+  });
+  const [accountDailyLossLimit, setAccountDailyLossLimit] = useState(() => {
+    const saved = localStorage.getItem('te_account_daily_loss_limit');
+    return saved ? Math.max(1, parseFloat(saved) || PARAMETER_DEFAULTS.accountDailyLossLimit) : PARAMETER_DEFAULTS.accountDailyLossLimit;
+  });
+  const [dailyEquityAnchorDate, setDailyEquityAnchorDate] = useState(() => localStorage.getItem('te_daily_equity_anchor_date') || '');
+  const [dailyEquityAnchor, setDailyEquityAnchor] = useState(() => {
+    const saved = localStorage.getItem('te_daily_equity_anchor');
+    return saved ? (parseFloat(saved) || 0) : 0;
   });
   const [liveQuoteAllowlistInput, setLiveQuoteAllowlistInput] = useState(() => {
     const saved = localStorage.getItem('te_live_quote_allowlist');
@@ -1088,6 +1107,7 @@ export default function App() {
   // Refs for scan logic to avoid dependency loops
   const holdingsRef = React.useRef(holdings);
   const autoTradeRef = React.useRef(autoTrade);
+  const accountLossGuardTriggerRef = React.useRef<string | null>(null);
   const maxConcurrentTradesRef = React.useRef(maxConcurrentTrades);
   const strategyConfigRef = React.useRef(strategyConfig);
   const performScanRef = React.useRef<() => Promise<void>>(async () => {});
@@ -1389,20 +1409,11 @@ export default function App() {
 
   React.useEffect(() => {
     const savedAutoTrade = localStorage.getItem('te_auto_trade') === 'true';
-    const shouldResumeAutoTrade = savedAutoTrade && !isRealMode;
+    const shouldResumeAutoTrade = savedAutoTrade;
 
     autoTradeRef.current = shouldResumeAutoTrade;
     setAutoTrade(shouldResumeAutoTrade);
-
-    if (savedAutoTrade && isRealMode) {
-      localStorage.setItem('te_auto_trade', 'false');
-      addLog('LIVE AUTONOMY SAFETY: autonomous live trading stays OFF on startup until you re-enable it manually.', 'warning');
-      setExecutionFeedback({
-        type: 'warning',
-        message: 'Live autonomous trading was not resumed automatically. Re-enable it manually if intended.',
-      });
-    }
-  }, [addLog, isRealMode]);
+  }, []);
 
   const appendScanArchiveEntry = React.useCallback((entry: Omit<ScanArchiveEntry, 'id'>) => {
     const archiveEntry: ScanArchiveEntry = normalizeScanArchiveEntry({
@@ -6656,7 +6667,7 @@ export default function App() {
               }
               subValue={
                 isRealMode
-                  ? `Free $${exchangeFreeMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | Deploy $${deployableLiveMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                  ? `Exchange Free $${exchangeFreeMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | Safe To Deploy $${deployableLiveMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
                   : `Available $${displayedAvailableFunds.toLocaleString(undefined, { minimumFractionDigits: 2 })}`
               }
             />
@@ -6689,7 +6700,7 @@ export default function App() {
               label={isRealMode ? "Deployable Now" : "Available Margin"}
               value={`$${(isRealMode ? deployableLiveMargin : displayedAvailableFunds).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
               subValue={isRealMode
-                ? `Free $${exchangeFreeMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | ${remainingLiveSlots} slots @ $${maxLiveOrderNotional.toFixed(0)}`
+                ? `Exchange Free $${exchangeFreeMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | ${remainingLiveSlots} slots @ $${maxLiveOrderNotional.toFixed(0)}`
                 : "Simulated Capital"}
             />
             <MetricBox 
