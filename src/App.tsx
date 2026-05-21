@@ -66,15 +66,15 @@ const PARAMETER_DEFAULTS = {
   stopLossPercent: 3.5,
   maxDrawdownPercent: 10,
   isDefensiveMode: false,
-  autoEntryMinScore: 6.8,
+  autoEntryMinScore: 6.0,
   liveMinOrderNotional: 10,
   maxLiveOrderNotional: 500,
   liveMarginBufferPct: 5,
   hardReentryCooldownMinutes: 120,
-  minEdgeAfterFrictionPct: 0.35,
+  minEdgeAfterFrictionPct: 0.15,
   estimatedRoundTripFrictionBps: 18,
-  symbolDailyLossLimit: 12,
-  symbolDailyFlipLimit: 8,
+  symbolDailyLossLimit: 20,
+  symbolDailyFlipLimit: 12,
   liveQuoteAllowlistInput: DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT,
   scanIntervalSec: 40,
   holdingPollIntervalSec: 10,
@@ -135,7 +135,7 @@ const getDirectionalEntryScore = (side: 'BUY' | 'SELL', score: number) => {
 
 const STRONG_LIVE_SIGNAL_SCORE_BUFFER = 0.2;
 const STRONG_LIVE_SIGNAL_NOTIONAL_MULTIPLIER = 1.5;
-const STRONG_LIVE_SIGNAL_EXTRA_SLOTS = 2;
+const STRONG_LIVE_SIGNAL_EXTRA_SLOTS = 4;
 
 const isStrongLiveSignal = (directionalScore: number, minScore: number) => {
   return directionalScore >= Math.min(10, Math.max(0, minScore) + STRONG_LIVE_SIGNAL_SCORE_BUFFER);
@@ -180,6 +180,19 @@ const describeHoldReason = (reason?: string) => {
     default:
       return '';
   }
+};
+
+const getHoldSignalDistance = (score: number) => {
+  return Math.min(
+    Math.abs(score - 7.2),
+    Math.abs(score - 2.8),
+  );
+};
+
+const getHoldFallbackSide = (score: number): 'BUY' | 'SELL' => {
+  const buyDistance = Math.abs(score - 7.2);
+  const sellDistance = Math.abs(score - 2.8);
+  return buyDistance <= sellDistance ? 'BUY' : 'SELL';
 };
 
 const summarizeRejectReasons = (reasons?: string[], limit: number = 2) => {
@@ -761,6 +774,9 @@ export default function App() {
     topExcluded: [] as ScanPreFilterEntry[],
   };
 
+  const SCAN_DIAGNOSTICS_SCHEMA_VERSION = 2;
+  const SCAN_DIAGNOSTICS_SCHEMA_KEY = 'te_scan_diagnostics_schema_version';
+
   const DEFAULT_SCAN_UNIVERSE_COUNTS = {
     discovery: 0,
     liveTradableFutures: 0,
@@ -972,6 +988,13 @@ export default function App() {
     const summary = key ? symbolRiskSummary.get(key) : null;
     if (!summary) return null;
     if (summary.dailyStopUntil > at && summary.dailyStopReason) {
+      const softenedDailyLossLimit = Math.abs(symbolDailyLossLimit) * 1.5;
+      const softenedDailyFlipLimit = Math.max(1, symbolDailyFlipLimit + 4);
+      const hardDailyLossBreach = summary.realizedPnl <= -softenedDailyLossLimit;
+      const hardFlipBreach = summary.closedTrades >= softenedDailyFlipLimit;
+      if (!hardDailyLossBreach && !hardFlipBreach) {
+        return null;
+      }
       const hoursRemaining = Math.max(1, Math.ceil((summary.dailyStopUntil - at) / (60 * 60 * 1000)));
       return {
         reason: `${summary.dailyStopReason} (${hoursRemaining}h remaining)`,
@@ -986,7 +1009,7 @@ export default function App() {
       };
     }
     return null;
-  }, [symbolRiskSummary]);
+  }, [symbolDailyFlipLimit, symbolDailyLossLimit, symbolRiskSummary]);
   const currentScanCycleRef = React.useRef(0);
   const entryLockUntilRef = React.useRef(0);
   const lastScanSkipLogRef = React.useRef<Record<string, number>>({});
@@ -2763,6 +2786,26 @@ export default function App() {
   const [scanUniverseCounts, setScanUniverseCounts] = useState(() => readStoredJson('te_scan_universe_counts', DEFAULT_SCAN_UNIVERSE_COUNTS));
   const [selectedRejectReason, setSelectedRejectReason] = useState<string | null>(null);
 
+  React.useEffect(() => {
+    try {
+      const storedVersion = Number(localStorage.getItem(SCAN_DIAGNOSTICS_SCHEMA_KEY) || 0);
+      if (storedVersion >= SCAN_DIAGNOSTICS_SCHEMA_VERSION) return;
+
+      localStorage.setItem(SCAN_DIAGNOSTICS_SCHEMA_KEY, String(SCAN_DIAGNOSTICS_SCHEMA_VERSION));
+      localStorage.removeItem('te_scan_signal_summary');
+      localStorage.removeItem('te_scan_blocked_summary');
+      localStorage.removeItem('te_scan_deferred_summary');
+      localStorage.removeItem('te_scan_prefilter_summary');
+
+      setScanSignalSummary(DEFAULT_SCAN_SIGNAL_SUMMARY);
+      setScanBlockedSummary(DEFAULT_SCAN_BLOCKED_SUMMARY);
+      setScanDeferredSummary(DEFAULT_SCAN_DEFERRED_SUMMARY);
+      setScanPreFilterSummary(DEFAULT_SCAN_PREFILTER_SUMMARY);
+    } catch (error) {
+      console.warn('[TradeEdge] Failed to reset stale scan diagnostics:', error);
+    }
+  }, []);
+
   useEffect(() => {
     try {
       localStorage.setItem('te_last_completed_market_picks', JSON.stringify(marketPicks));
@@ -3489,11 +3532,32 @@ export default function App() {
       const entryLockActive = entryLockUntilRef.current > Date.now();
       const scanNow = Date.now();
 
-      const signalCandidates = results
+      const primarySignalCandidates = results
         .filter(r => r.signal.overall === 'BUY' || (isRealMode && r.signal.overall === 'SELL'))
         .map(pick => ({ side: pick.signal.overall === 'SELL' ? 'SELL' as const : 'BUY' as const, pick }));
 
-      const MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE = 1;
+      const holdFallbackCandidates = results
+        .filter((pick) => pick.signal.overall === 'HOLD')
+        .map((pick) => ({
+          pick,
+          side: getHoldFallbackSide(pick.signal.score || 0),
+          signalDistance: getHoldSignalDistance(pick.signal.score || 0),
+        }))
+        .filter((entry) => entry.signalDistance <= nearMissSignalThreshold)
+        .filter((entry) => isRealMode || entry.side === 'BUY')
+        .sort((a, b) => {
+          if (a.signalDistance !== b.signalDistance) return a.signalDistance - b.signalDistance;
+          return compareExecutionPriority(a, b);
+        })
+        .map(({ side, pick }) => ({ side, pick }));
+
+      const signalCandidates = primarySignalCandidates.length > 0
+        ? primarySignalCandidates
+        : holdFallbackCandidates;
+
+      const MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE = 0;
+      const relaxedAutoEntryMinScore = isRealMode ? Math.max(0, autoEntryMinScore - 0.8) : autoEntryMinScore;
+      const relaxedMinEdgeAfterFrictionPct = isRealMode ? Math.max(0, minEdgeAfterFrictionPct - 0.2) : minEdgeAfterFrictionPct;
 
       const isShortFacingLocalUpwardMomentum = (pick: MarketScanResult) => {
         const positiveDay = (pick.change24h || 0) > 0.75;
@@ -3520,9 +3584,10 @@ export default function App() {
       };
 
       const getEntryBlockReason = ({ side, pick }: { side: 'BUY' | 'SELL'; pick: MarketScanResult }) => {
+        const pickRiskKey = getSymbolRiskIdentity(pick.symbol).key;
         const desiredHoldingSide: 'LONG' | 'SHORT' = side === 'SELL' ? 'SHORT' : 'LONG';
-        const matchingHolding = currentHoldings.find(h => h.symbol === pick.symbol && h.side === desiredHoldingSide);
-        const opposingHolding = currentHoldings.find(h => h.symbol === pick.symbol && h.side !== desiredHoldingSide);
+        const matchingHolding = currentHoldings.find((h) => getSymbolRiskIdentity(h.symbol).key === pickRiskKey && h.side === desiredHoldingSide);
+        const opposingHolding = currentHoldings.find((h) => getSymbolRiskIdentity(h.symbol).key === pickRiskKey && h.side !== desiredHoldingSide);
         if (isLiveBinance && !isLikelyBinanceFuturesSymbol(pick.symbol)) {
           return 'invalid futures symbol format';
         }
@@ -3546,25 +3611,26 @@ export default function App() {
         }
         if (isRealMode) {
           const directionalConfidence = getDirectionalEntryScore(side, pick.signal.score);
-          if (directionalConfidence < autoEntryMinScore) {
-            return `confidence ${directionalConfidence.toFixed(1)} below ${autoEntryMinScore.toFixed(1)}`;
+          if (directionalConfidence < relaxedAutoEntryMinScore) {
+            return `confidence ${directionalConfidence.toFixed(1)} below ${relaxedAutoEntryMinScore.toFixed(1)}`;
           }
           if (side === 'SELL' && isShortFacingLocalUpwardMomentum(pick)) {
-            const strongerShortThreshold = Math.min(10, autoEntryMinScore + 0.8);
-            if (directionalConfidence < strongerShortThreshold || pick.signal.macdScore < 8) {
-              return `short faces local upward momentum; need score ${strongerShortThreshold.toFixed(1)}+ and MACD 8.0+`;
+            const strongerShortThreshold = Math.min(10, relaxedAutoEntryMinScore + 0.4);
+            if (directionalConfidence < strongerShortThreshold || pick.signal.macdScore < 7) {
+              return `short faces local upward momentum; need score ${strongerShortThreshold.toFixed(1)}+ and MACD 7.0+`;
             }
           }
           if (matchingHolding) {
             const desiredNotional = getDesiredLiveEntryNotional(directionalConfidence, getBufferedLiveCapital(availableFunds));
             const currentNotional = getHoldingActiveNotional(matchingHolding, pick.lastPrice);
             if ((desiredNotional - currentNotional) < liveMinOrderNotional) {
-              return 'already sized';
+              const sameSymbol = matchingHolding.symbol === pick.symbol;
+              return sameSymbol ? 'already sized' : `already sized via ${matchingHolding.symbol}`;
             }
           }
           const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(side, pick.lastPrice, pick.signal.tradePlan, estimatedRoundTripFrictionBps);
-          if (edgeAfterFrictionPct !== null && edgeAfterFrictionPct < minEdgeAfterFrictionPct) {
-            return `edge ${edgeAfterFrictionPct.toFixed(2)}% below ${minEdgeAfterFrictionPct.toFixed(2)}%`;
+          if (edgeAfterFrictionPct !== null && edgeAfterFrictionPct < relaxedMinEdgeAfterFrictionPct) {
+            return `edge ${edgeAfterFrictionPct.toFixed(2)}% below ${relaxedMinEdgeAfterFrictionPct.toFixed(2)}%`;
           }
         }
         if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
@@ -3627,9 +3693,28 @@ export default function App() {
           return;
         }
 
-        const entries = signalCandidates
+        const primaryEntries = primarySignalCandidates
           .filter(entry => !getEntryBlockReason(entry))
           .sort(compareExecutionPriority);
+        const eligibleHoldFallbackEntries = holdFallbackCandidates
+          .filter(entry => !getEntryBlockReason(entry))
+          .sort(compareExecutionPriority);
+        const mergedEntries = new Map<string, { side: 'BUY' | 'SELL'; pick: MarketScanResult }>();
+        primaryEntries.forEach((entry) => {
+          mergedEntries.set(`${entry.side}:${normalizeLiveFuturesSymbol(entry.pick.symbol)}`, entry);
+        });
+        eligibleHoldFallbackEntries.forEach((entry) => {
+          const key = `${entry.side}:${normalizeLiveFuturesSymbol(entry.pick.symbol)}`;
+          if (!mergedEntries.has(key)) {
+            mergedEntries.set(key, entry);
+          }
+        });
+        const entries = Array.from(mergedEntries.values()).sort(compareExecutionPriority);
+        const usingHoldFallbackEntries = eligibleHoldFallbackEntries.length > 0 && entries.length > primaryEntries.length;
+        if (usingHoldFallbackEntries) {
+          const fallbackCount = entries.length - primaryEntries.length;
+          addLog(`HOLD FALLBACK: adding ${fallbackCount} near-miss HOLD setup${fallbackCount === 1 ? '' : 's'} to fill remaining entry capacity.`, 'info');
+        }
         const eligibleBuyCount = entries.filter(entry => entry.side === 'BUY').length;
         const eligibleSellCount = entries.filter(entry => entry.side === 'SELL').length;
         const baseAvailableSlots = Math.max(0, currentMaxTrades - currentHoldings.length);
@@ -3637,10 +3722,10 @@ export default function App() {
         const totalLiveCapacity = Math.max(1, currentMaxTrades + STRONG_LIVE_SIGNAL_EXTRA_SLOTS);
         const sideSelectionCap = boostedAvailableSlots <= 1
           ? 1
-          : Math.min(3, Math.max(2, Math.ceil(boostedAvailableSlots / 2)));
+          : Math.min(5, Math.max(3, Math.ceil(boostedAvailableSlots * 0.8)));
         const portfolioSideCap = totalLiveCapacity <= 2
           ? 1
-          : Math.max(2, Math.ceil(totalLiveCapacity * 0.6));
+          : Math.max(3, Math.ceil(totalLiveCapacity * 0.85));
 
         if (boostedAvailableSlots > 0) {
           const openSideCounts = currentHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
@@ -3656,9 +3741,9 @@ export default function App() {
           const totalOpenPositions = currentHoldings.length;
           const shortCountShare = totalOpenPositions > 0 ? openSideCounts.SELL / totalOpenPositions : 0;
           const shortNotionalShare = totalOpenNotional > 0 ? openSideNotional.SELL / totalOpenNotional : 0;
-          const shortBookDominant = totalOpenPositions >= 3
-            && openSideCounts.SELL >= (openSideCounts.BUY + 2)
-            && (shortCountShare >= 0.6 || shortNotionalShare >= 0.6);
+          const shortBookDominant = totalOpenPositions >= 4
+            && openSideCounts.SELL >= (openSideCounts.BUY + 3)
+            && (shortCountShare >= 0.75 || shortNotionalShare >= 0.75);
           const realFreeCapital = getBufferedLiveCapital(availableFunds);
           const realTradableCapital = realFreeCapital;
           if (isRealMode && realTradableCapital < liveMinOrderNotional) {
@@ -3670,6 +3755,7 @@ export default function App() {
           const selectedTrades: typeof entries = [];
           const deferredTrades: ScanDeferredSignal[] = [];
           const selectedThisCycleBySide: Record<'BUY' | 'SELL', number> = { BUY: 0, SELL: 0 };
+          const selectedUnderlyingKeys = new Set<string>();
           const selectedPortfolioBySide: Record<'BUY' | 'SELL', number> = {
             BUY: openSideCounts.BUY,
             SELL: openSideCounts.SELL,
@@ -3677,8 +3763,9 @@ export default function App() {
           const selectedCohorts = new Map<string, number>();
 
           entries.forEach((entry) => {
+            const underlyingKey = getSymbolRiskIdentity(entry.pick.symbol).key;
             const directionalScore = getDirectionalEntryScore(entry.side, entry.pick.signal.score);
-            const strongSignal = isStrongLiveSignal(directionalScore, autoEntryMinScore);
+            const strongSignal = isStrongLiveSignal(directionalScore, relaxedAutoEntryMinScore);
             const cohortKey = getEntryCohortKey(entry);
 
             if (selectedTrades.length >= boostedAvailableSlots) {
@@ -3711,6 +3798,16 @@ export default function App() {
               });
               return;
             }
+            if (selectedUnderlyingKeys.has(underlyingKey)) {
+              deferredTrades.push({
+                symbol: entry.pick.symbol,
+                side: entry.side,
+                score: entry.pick.signal.score,
+                priorityRank: entry.pick.priorityRank || 0,
+                reason: `underlying already selected this cycle (${underlyingKey})`,
+              });
+              return;
+            }
             if (selectedPortfolioBySide[entry.side] >= portfolioSideCap) {
               deferredTrades.push({
                 symbol: entry.pick.symbol,
@@ -3731,7 +3828,7 @@ export default function App() {
               });
               return;
             }
-            if ((selectedCohorts.get(cohortKey) || 0) >= MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE) {
+            if (MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 && (selectedCohorts.get(cohortKey) || 0) >= MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE) {
               deferredTrades.push({
                 symbol: entry.pick.symbol,
                 side: entry.side,
@@ -3743,6 +3840,7 @@ export default function App() {
             }
 
             selectedTrades.push(entry);
+            selectedUnderlyingKeys.add(underlyingKey);
             selectedThisCycleBySide[entry.side] += 1;
             selectedPortfolioBySide[entry.side] += 1;
             selectedCohorts.set(cohortKey, (selectedCohorts.get(cohortKey) || 0) + 1);
@@ -3754,10 +3852,10 @@ export default function App() {
           const coverageSummary = `coverage=${results.length}/${shortlistLimit}/${symbolsToScan.length}`;
           const exposureSummary = `openSides=BUY:${openSideCounts.BUY}|SELL:${openSideCounts.SELL}`;
           addLog(
-            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${baseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} portfolioSideCap=${portfolioSideCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE} ${exposureSummary} ${coverageSummary}`,
+            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${baseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} portfolioSideCap=${portfolioSideCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`,
             selectedCount > 0 ? 'success' : 'info',
           );
-          updateLatestScanArchiveDecision(`SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${baseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} portfolioSideCap=${portfolioSideCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE} ${exposureSummary} ${coverageSummary}`);
+          updateLatestScanArchiveDecision(`SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${baseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} portfolioSideCap=${portfolioSideCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`);
           
           if (selectedTrades.length > 0 || deferredTrades.length > 0) {
             // Live mode safety: execute entries sequentially to avoid burst margin failures.
@@ -3780,7 +3878,10 @@ export default function App() {
                 continue;
               }
               const entryType = side === 'BUY' ? 'LONG' : 'SHORT';
-              await executeTrade(side, pick.symbol, pick.lastPrice, `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`, undefined, cycleId, pick.signal.tradePlan, undefined, getDirectionalEntryScore(side, pick.signal.score));
+              const discoveryReason = pick.signal.overall === 'HOLD'
+                ? `AI HF ${entryType}: ${pick.signal.score}/10`
+                : `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`;
+              await executeTrade(side, pick.symbol, pick.lastPrice, discoveryReason, undefined, cycleId, pick.signal.tradePlan, undefined, getDirectionalEntryScore(side, pick.signal.score));
               if (!autoTradeRef.current || entryLockUntilRef.current > Date.now()) break;
               if (isRealMode) {
                 await new Promise(r => setTimeout(r, liveEntryDelayMs));
@@ -4434,16 +4535,13 @@ export default function App() {
 
   const showInitialLoading = loading && data.length === 0;
   const visibleSignalTableLimit = 30;
-  const nearMissSignalThreshold = 1.15;
+  const nearMissSignalThreshold = 2.1;
   const nearMissPicks = React.useMemo(() => {
     return marketPicks
       .filter((pick) => pick.signal.overall === 'HOLD')
       .map((pick) => ({
         pick,
-        signalDistance: Math.min(
-          Math.abs((pick.signal.score || 0) - 7.2),
-          Math.abs((pick.signal.score || 0) - 2.8),
-        ),
+        signalDistance: getHoldSignalDistance(pick.signal.score || 0),
       }))
       .filter(({ signalDistance }) => signalDistance <= nearMissSignalThreshold)
       .sort((a, b) => {
@@ -4574,12 +4672,14 @@ export default function App() {
         } else {
           const directionalSide = pick.signal.overall === 'SELL' ? 'SELL' : 'BUY';
           const directionalConfidence = getDirectionalEntryScore(directionalSide, pick.signal.score);
-          if (isRealMode && directionalConfidence < autoEntryMinScore) {
-            reason = `confidence ${directionalConfidence.toFixed(1)} below ${autoEntryMinScore.toFixed(1)}`;
+          const relaxedAutoEntryMinScore = isRealMode ? Math.max(0, autoEntryMinScore - 0.8) : autoEntryMinScore;
+          const relaxedMinEdgeAfterFrictionPct = isRealMode ? Math.max(0, minEdgeAfterFrictionPct - 0.2) : minEdgeAfterFrictionPct;
+          if (isRealMode && directionalConfidence < relaxedAutoEntryMinScore) {
+            reason = `confidence ${directionalConfidence.toFixed(1)} below ${relaxedAutoEntryMinScore.toFixed(1)}`;
           } else {
             const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(directionalSide, pick.lastPrice, pick.signal.tradePlan, estimatedRoundTripFrictionBps);
-            if (isRealMode && edgeAfterFrictionPct !== null && edgeAfterFrictionPct < minEdgeAfterFrictionPct) {
-              reason = `edge ${edgeAfterFrictionPct.toFixed(2)}% below ${minEdgeAfterFrictionPct.toFixed(2)}%`;
+            if (isRealMode && edgeAfterFrictionPct !== null && edgeAfterFrictionPct < relaxedMinEdgeAfterFrictionPct) {
+              reason = `edge ${edgeAfterFrictionPct.toFixed(2)}% below ${relaxedMinEdgeAfterFrictionPct.toFixed(2)}%`;
             } else if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
               reason = 'quote asset treated as cash';
             } else if (isLiveBinance && isUnsupportedLiveScanSymbol(pick.symbol)) {
@@ -5425,6 +5525,8 @@ export default function App() {
               <div className="space-y-2 max-h-[520px] overflow-y-auto custom-scrollbar pr-2">
                 {visibleSignalTableEntries.map(({ pick, foundAt }) => {
                   const lifecycle = getMarketPickLifecycle(pick);
+                  const isHoldFallbackCandidate = pick.signal.overall === 'HOLD'
+                    && getHoldSignalDistance(pick.signal.score || 0) <= nearMissSignalThreshold;
                   const eligibility = rankedSignalStatuses[pick.symbol] || {
                     label: 'UNKNOWN',
                     detail: 'status unavailable',
@@ -5447,6 +5549,11 @@ export default function App() {
                       <span className={`mt-1 rounded-sm px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide ${lifecycle.className}`}>
                         {lifecycle.label}
                       </span>
+                      {isHoldFallbackCandidate && (
+                        <span className="mt-1 rounded-sm border border-amber-300 bg-amber-50 px-1 py-0.5 text-[8px] font-black uppercase tracking-wide text-amber-700">
+                          HF
+                        </span>
+                      )}
                       <span className="mt-1 text-[8px] font-mono uppercase opacity-45">
                         {formatSignalAge(foundAt)}
                       </span>

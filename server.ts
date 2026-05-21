@@ -49,6 +49,7 @@ async function startServer() {
   const MAX_BACKOFF_MS = 5 * 60 * 1000; // cap backoff at 5 minutes
   const MAX_AUTH_BLOCK_MS = 10 * 60 * 1000; // cap auth block at 10 minutes
   const PRIVATE_BALANCE_CACHE_MS = 4000;
+  const PRIVATE_BALANCE_STALE_WHILE_BLOCKED_MS = 2 * 60 * 1000;
   const MAX_PUBLIC_KLINE_CACHE_ENTRIES = 2200;
   const PUBLIC_KLINE_STALE_WHILE_BLOCKED_MS = 20 * 60 * 1000;
   const throttledLogState = new Map<string, number>();
@@ -705,7 +706,24 @@ async function startServer() {
     const now = Date.now();
     const forceFresh = String(req.query.fresh || '0') === '1';
     recordBinanceRouteHit('private.balance', `fresh=${forceFresh ? 1 : 0}`);
+    const getStalePrivateBalancePayload = (reason: string) => {
+      if (!privateBalanceCache) return null;
+      const ageMs = now - privateBalanceCache.updatedAt;
+      if (ageMs > PRIVATE_BALANCE_STALE_WHILE_BLOCKED_MS) return null;
+      return {
+        ...privateBalanceCache.payload,
+        status: 'cached',
+        cached: true,
+        staleAgeMs: ageMs,
+        authDegraded: true,
+        authDegradedMessage: reason,
+      };
+    };
     if (privateSyncState.authBlockedUntil > now) {
+      const cachedPayload = getStalePrivateBalancePayload('Binance auth is temporarily blocked; serving the last successful balance snapshot.');
+      if (cachedPayload) {
+        return res.json(cachedPayload);
+      }
       const waitSec = Math.ceil((privateSyncState.authBlockedUntil - now) / 1000);
       return res.status(401).json({
         status: 'auth_failed',
@@ -717,6 +735,10 @@ async function startServer() {
 
     const publicBlockedUntil = getPublicBlockedUntil();
     if (publicBlockedUntil > now) {
+      const cachedPayload = getStalePrivateBalancePayload('Public Binance cooldown active; serving the last successful balance snapshot.');
+      if (cachedPayload) {
+        return res.json(cachedPayload);
+      }
       const waitSec = Math.ceil((publicBlockedUntil - now) / 1000);
       console.warn(`[TradeEdge RateLimit] Private sync suppressed by public Binance cooldown — ${waitSec}s remaining`);
       return res.status(429).json({
@@ -728,6 +750,10 @@ async function startServer() {
     }
 
     if (privateSyncState.backoffUntil > now) {
+      const cachedPayload = getStalePrivateBalancePayload('Private Binance sync is cooling down; serving the last successful balance snapshot.');
+      if (cachedPayload) {
+        return res.json(cachedPayload);
+      }
       const waitSec = Math.ceil((privateSyncState.backoffUntil - now) / 1000);
       console.warn(`[TradeEdge RateLimit] Private sync backoff active — ${waitSec}s remaining`);
       return res.status(429).json({
@@ -1128,18 +1154,8 @@ async function startServer() {
           }
         }
         
-        const skipFurtherPrivatePositionProbes = authDegraded && !positionsFetched;
-        if (skipFurtherPrivatePositionProbes) {
-          logWithThrottle(
-            'warn',
-            'sync-private-auth-short-circuit',
-            '[TradeEdge Sync] Private auth degraded and no position data recovered from direct/account HTTP endpoints. Skipping remaining private fallback probes for this sync cycle.',
-            60 * 1000,
-          );
-        }
-
         // FALLBACK: Try CCXT methods if HTTP didn't work
-        if (!positionsFetched && !skipFurtherPrivatePositionProbes) {
+        if (!positionsFetched) {
           try {
             const fetchedPositions = await (client as any).fetchPositions?.(undefined, { type: 'future' });
             if (Array.isArray(fetchedPositions) && fetchedPositions.length > 0) {
@@ -1154,7 +1170,7 @@ async function startServer() {
           }
         }
 
-        if (!positionsFetched && !skipFurtherPrivatePositionProbes) {
+        if (!positionsFetched) {
           const positionRiskFetchers = [
             { name: 'fapiPrivateV2GetPositionRisk', fn: async () => await (client as any).fapiPrivateV2GetPositionRisk?.() },
             { name: 'fapiPrivateGetPositionRisk', fn: async () => await (client as any).fapiPrivateGetPositionRisk?.() },
@@ -1179,7 +1195,7 @@ async function startServer() {
           }
         }
         
-        if (!positionsFetched && Object.keys(allPositions).length === 0 && !skipFurtherPrivatePositionProbes) {
+        if (!positionsFetched && Object.keys(allPositions).length === 0) {
           console.warn(`[TradeEdge Sync] WARNING: No positions fetched from any endpoint. Attempting direct account info query...`);
           try {
             const acctInfo = await (client as any).privateGetAccount?.();
@@ -1197,7 +1213,7 @@ async function startServer() {
           }
         }
         
-        if (!positionsFetched && Object.keys(allPositions).length === 0 && !skipFurtherPrivatePositionProbes) {
+        if (!positionsFetched && Object.keys(allPositions).length === 0) {
           console.warn(`[TradeEdge Sync] WARNING: No positions fetched from any endpoint. Account may be flat or API keys lack futures permissions.`);
           try {
             const acct = await (client as any).fetchAccount?.();
@@ -1330,19 +1346,6 @@ async function startServer() {
       if (authDegraded && authDegradedMessage) {
         authDegradedMessage = 'Some Binance private endpoints are restricted for this account mode. Trading may still work via compatible endpoints.';
       }
-
-      if (authDegraded && !hasUsablePositions && !hasUsableBalance) {
-        privateSyncState.authFailCount += 1;
-        const blockMs = Math.min(privateSyncState.authFailCount * 2 * 60 * 1000, MAX_AUTH_BLOCK_MS);
-        privateSyncState.authBlockedUntil = Date.now() + blockMs;
-        privateBalanceCache = null;
-        return res.status(401).json({
-          status: 'auth_failed',
-          message: authDegradedMessage || 'Binance private futures endpoints returned auth/permission errors.',
-          blockedUntil: privateSyncState.authBlockedUntil,
-          retryAfterMs: blockMs,
-        });
-      }
       
       const positionKeys = Object.keys(allPositions);
       const shouldLogSummary = process.env.TRADEEDGE_VERBOSE_SYNC === 'true' || positionKeys.length > 0;
@@ -1428,6 +1431,17 @@ async function startServer() {
           const backoffMs = Math.min(privateSyncState.failCount * 10000, MAX_BACKOFF_MS);
           privateSyncState.backoffUntil = Date.now() + backoffMs;
           console.warn(`[TradeEdge Sync] ${privateSyncState.failCount} consecutive failures — backing off ${backoffMs / 1000}s`);
+        }
+        if (privateBalanceCache && (Date.now() - privateBalanceCache.updatedAt) <= PRIVATE_BALANCE_STALE_WHILE_BLOCKED_MS) {
+          console.warn(`[TradeEdge Sync] Serving cached private balance after sync failure: ${msg}`);
+          return res.json({
+            ...privateBalanceCache.payload,
+            status: 'cached',
+            cached: true,
+            staleAgeMs: Date.now() - privateBalanceCache.updatedAt,
+            authDegraded: true,
+            authDegradedMessage: 'Live Binance sync failed; serving the last successful balance snapshot.',
+          });
         }
         console.error(`[TradeEdge Sync Error] ${msg}`);
         res.status(500).json({ status: 'error', message: msg });
@@ -1576,6 +1590,43 @@ async function startServer() {
             : undefined;
           let effectivePositionSide: 'LONG' | 'SHORT' | 'BOTH' | undefined = validPositionSide;
           const wantsReduceOnly = reduceOnly === true;
+          const loadReducibleExposure = async () => {
+            const preferredBinance = getPreferredBinanceCredentials();
+            const binanceKey = preferredBinance.key;
+            const binanceSecret = preferredBinance.secret;
+            if (!binanceKey || !binanceSecret) return null;
+
+            const primary = await fetchBinancePositionsViaHttp(binanceKey, binanceSecret);
+            const secondary = primary.positions.length > 0
+              ? { positions: [] as any[] }
+              : await fetchBinancePositionsFromAccountViaHttp(binanceKey, binanceSecret);
+            const rows = [...primary.positions, ...(secondary.positions || [])];
+            const matchingRows = rows.filter((row: any) => {
+              const rowSymbol = String(row?.symbol || row?.info?.symbol || '').toUpperCase().replace('/', '').replace(':', '');
+              return rowSymbol === raw;
+            });
+
+            let reducibleAmount = 0;
+            let reduciblePositionSide: 'LONG' | 'SHORT' | 'BOTH' | undefined;
+            for (const row of matchingRows) {
+              const positionAmt = Number(row?.positionAmt ?? row?.contracts ?? row?.amount ?? row?.info?.positionAmt ?? 0);
+              if (!Number.isFinite(positionAmt) || positionAmt === 0) continue;
+              const closesLong = side.toUpperCase() === 'SELL' && positionAmt > 0;
+              const closesShort = side.toUpperCase() === 'BUY' && positionAmt < 0;
+              if (!closesLong && !closesShort) continue;
+              reducibleAmount += Math.abs(positionAmt);
+              if (!reduciblePositionSide) {
+                const rowPositionSide = String(row?.positionSide || row?.info?.positionSide || '').toUpperCase();
+                reduciblePositionSide = rowPositionSide === 'LONG' || rowPositionSide === 'SHORT'
+                  ? rowPositionSide
+                  : 'BOTH';
+              }
+            }
+
+            return reducibleAmount > 0
+              ? { amount: reducibleAmount, positionSide: reduciblePositionSide }
+              : null;
+          };
 
           if (client.id === 'binance') {
             const preferredBinance = getPreferredBinanceCredentials();
@@ -1591,6 +1642,20 @@ async function startServer() {
                 effectivePositionSide = side.toUpperCase() === 'BUY' ? 'LONG' : 'SHORT';
               }
             }
+          }
+
+          if (client.id === 'binance' && wantsReduceOnly) {
+            const reducibleExposure = await loadReducibleExposure();
+            if (!reducibleExposure) {
+              return res.json({
+                status: 'skipped',
+                message: `reduceOnly skipped: ${raw} no longer has reducible exposure on exchange`,
+              });
+            }
+            if (!validPositionSide && reducibleExposure.positionSide) {
+              effectivePositionSide = reducibleExposure.positionSide;
+            }
+            finalAmount = Math.min(finalAmount, reducibleExposure.amount);
           }
 
           // Precision and exchange limits precheck before submit.
@@ -1759,6 +1824,7 @@ async function startServer() {
             const primaryMsg = String(primaryErr?.message || '');
             const isPositionModeMismatch = /position side does not match|positionSide|hedge mode|\b-4061\b|\"code\":-4061/i.test(primaryMsg);
             const isReduceOnlyNotRequired = /reduceOnly.+not required|Parameter 'reduceOnly' sent when not required|\"code\":-1106/i.test(primaryMsg);
+            const isReduceOnlyRejected = /reduceonly order is rejected|\"code\":-2022/i.test(primaryMsg);
 
             const retryVariants: Record<string, any>[] = [];
             const pushVariant = (params: Record<string, any>) => {
@@ -1785,6 +1851,26 @@ async function startServer() {
               const noReduceVariant = { ...orderParams };
               delete noReduceVariant.reduceOnly;
               pushVariant(noReduceVariant);
+            }
+
+            if (isReduceOnlyRejected && wantsReduceOnly) {
+              const reducibleExposure = await loadReducibleExposure();
+              if (!reducibleExposure) {
+                return res.json({
+                  status: 'skipped',
+                  message: `reduceOnly skipped: ${raw} exposure was already closed before retry`,
+                });
+              }
+              finalAmount = Math.min(finalAmount, reducibleExposure.amount);
+              try {
+                finalAmount = parseFloat(client.amountToPrecision(ccxtSymbol, finalAmount));
+              } catch {
+                // Keep numeric fallback.
+              }
+              if (!validPositionSide && reducibleExposure.positionSide) {
+                pushVariant({ ...orderParams, positionSide: reducibleExposure.positionSide, reduceOnly: true });
+              }
+              pushVariant({ ...orderParams, positionSide: 'BOTH', reduceOnly: true });
             }
 
             // Combined fallback: same strict variants should be re-tried if both errors occur together.
@@ -2327,8 +2413,6 @@ async function startServer() {
             if (banMatch) publicRateLimitState.bannedUntil = parseInt(banMatch[1], 10);
             else publicRateLimitState.backoffUntil = Date.now() + 60000;
             console.warn('[TradeEdge RateLimit] ticker24hr Binance public rate limited');
-          } else if (response.status === 451) {
-            logWithThrottle('warn', 'ticker24hr-451', '[TradeEdge] ticker24hr: Binance futures blocked by location, serving degraded fallback', 60000);
           }
           const bybitTickers = await fetchBybitTickers();
           if (bybitTickers.length > 0) {
@@ -2340,8 +2424,7 @@ async function startServer() {
             setPublicSourceHeaders(res, 'BINANCE_PUBLIC', true);
             return res.json(publicTicker24hCache.rows);
           }
-          setPublicSourceHeaders(res, 'BINANCE_PUBLIC', true);
-          return res.json([]);
+          throw new Error('Binance public ticker failed');
         }
 
         // Try Bybit first (primary ticker source)

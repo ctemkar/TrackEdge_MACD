@@ -159,7 +159,10 @@ export function evaluateStrategy(
   const volumeLookback = Math.max(1, Math.floor(config.volumeLookback));
   const recentVolumeCandles = candles.slice(-volumeLookback);
   const avgVolume = recentVolumeCandles.reduce((acc, c) => acc + c.volume, 0) / recentVolumeCandles.length;
-  const volumeConfirmed = lastCandle.volume > avgVolume * config.volumeMultiplier;
+  const softenedVolumeMultiplier = Math.max(1, config.volumeMultiplier * 0.82);
+  const volumeConfirmed = lastCandle.volume > avgVolume * softenedVolumeMultiplier;
+  const volumeSupportive = lastCandle.volume > avgVolume * Math.max(0.9, softenedVolumeMultiplier * 0.84);
+  const shortVolumeSupportive = lastCandle.volume > avgVolume * Math.max(0.82, softenedVolumeMultiplier * 0.76);
 
   // Confluence
   const rsiMode: 'OVERBOUGHT' | 'OVERSOLD' | 'NEUTRAL' = lastRSI > config.rsiOverbought ? 'OVERBOUGHT' : lastRSI < config.rsiOversold ? 'OVERSOLD' : 'NEUTRAL';
@@ -219,7 +222,7 @@ export function evaluateStrategy(
     const crossedDown = prev.MACD >= prev.signal && curr.MACD < curr.signal;
     if (crossedUp || crossedDown) recentCrossovers += 1;
   }
-  const choppyMarket = recentCrossovers >= 3;
+  const choppyMarket = recentCrossovers >= 5;
 
   // Volatility guardrail (ATR-like percentage using high/low range).
   const volatilityLookback = Math.min(14, candles.length);
@@ -227,11 +230,11 @@ export function evaluateStrategy(
   const avgRangePct = recentRanges.length > 0
     ? (recentRanges.reduce((sum, value) => sum + value, 0) / recentRanges.length) * 100
     : 0;
-  const extremeVolatility = avgRangePct > 8;
+  const extremeVolatility = avgRangePct > 11;
 
   // Late-entry guard: avoid chasing after an overextended candle.
   const candleBodyPct = Math.abs(lastCandle.close - lastCandle.open) / Math.max(lastCandle.open, 1e-12) * 100;
-  const lateEntryRisk = candleBodyPct > Math.max(1.5, avgRangePct * 0.9);
+  const lateEntryRisk = candleBodyPct > Math.max(1.9, avgRangePct * 1.05);
 
   const longStop = Math.min(lastCandle.close * 0.985, supportLevel * 0.997);
   const longTarget = Math.max(resistanceLevel, lastCandle.close * 1.025);
@@ -245,8 +248,8 @@ export function evaluateStrategy(
   const shortReward = Math.max(lastCandle.close - shortTarget, 0);
   const shortRiskReward = shortReward / shortRisk;
 
-  const trendBullish = trend === 'UP' && emaCrossover === 'BULLISH';
-  const trendBearish = trend === 'DOWN' && emaCrossover === 'BEARISH';
+  const trendBullish = (trend === 'UP' && emaCrossover !== 'BEARISH') || (trend !== 'DOWN' && emaCrossover === 'BULLISH');
+  const trendBearish = (trend === 'DOWN' && emaCrossover !== 'BULLISH') || (trend !== 'UP' && emaCrossover === 'BEARISH');
 
   const computeDirectionalMacdScore = (direction: 'LONG' | 'SHORT') => {
     let directionalScore = 0;
@@ -291,26 +294,26 @@ export function evaluateStrategy(
   const shortBase = (macdCrossover === 'BEARISH' || bearishMomentum) && trendBearish;
 
   let longChecks = 0;
-  if (volumeConfirmed) longChecks += 1;
+  if (volumeSupportive) longChecks += 1;
   if (nearSupport || !nearResistance) longChecks += 1;
   if (!lateEntryRisk) longChecks += 1;
   if (!choppyMarket) longChecks += 1;
   if (!extremeVolatility) longChecks += 1;
-  if (longRiskReward >= 1.5) longChecks += 1;
+  if (longRiskReward >= 1.25) longChecks += 1;
 
   let shortChecks = 0;
-  if (volumeConfirmed) shortChecks += 1;
+  if (shortVolumeSupportive) shortChecks += 1;
   if (nearResistance || !nearSupport) shortChecks += 1;
   if (!lateEntryRisk) shortChecks += 1;
   if (!choppyMarket) shortChecks += 1;
   if (!extremeVolatility) shortChecks += 1;
-  if (shortRiskReward >= 1.5) shortChecks += 1;
+  if (shortRiskReward >= 1.25) shortChecks += 1;
 
-  const longOtherSignalsVeryStrong = longChecks >= 6 && longRiskReward >= 2 && volumeConfirmed && !lateEntryRisk && !choppyMarket && !extremeVolatility;
-  const shortOtherSignalsVeryStrong = shortChecks >= 6 && shortRiskReward >= 2 && volumeConfirmed && !lateEntryRisk && !choppyMarket && !extremeVolatility;
+  const longOtherSignalsVeryStrong = longChecks >= 5 && longRiskReward >= 1.6 && volumeSupportive && !lateEntryRisk && !choppyMarket && !extremeVolatility;
+  const shortOtherSignalsVeryStrong = shortChecks >= 4 && shortRiskReward >= 1.45 && shortVolumeSupportive && !lateEntryRisk && !choppyMarket && !extremeVolatility;
 
-  const longQuality = longBase && !weakMacdLong && (strongMacdLong ? longChecks >= 5 : conditionalMacdLong && longOtherSignalsVeryStrong);
-  const shortQuality = shortBase && !weakMacdShort && (strongMacdShort ? shortChecks >= 5 : conditionalMacdShort && shortOtherSignalsVeryStrong);
+  const longQuality = longBase && !weakMacdLong && (strongMacdLong ? longChecks >= 4 : conditionalMacdLong && longOtherSignalsVeryStrong);
+  const shortQuality = shortBase && !weakMacdShort && (strongMacdShort ? shortChecks >= 3 : conditionalMacdShort && shortOtherSignalsVeryStrong);
 
   const computeTrendScore = (direction: 'LONG' | 'SHORT') => {
     let directionalScore = 0;
@@ -334,7 +337,7 @@ export function evaluateStrategy(
       ? macdHistogramMode === 'BULLISH_ACCELERATION' || macdHistogramMode === 'BULLISH_FADE'
       : macdHistogramMode === 'BEARISH_ACCELERATION' || macdHistogramMode === 'BEARISH_FADE';
 
-    if (volumeConfirmed) directionalScore += 4;
+    if (direction === 'SHORT' ? shortVolumeSupportive : volumeSupportive) directionalScore += 4;
     if (momentumSupports) directionalScore += 3;
     if (histogramSupports) directionalScore += 1;
     if (!choppyMarket) directionalScore += 1;
@@ -348,7 +351,8 @@ export function evaluateStrategy(
     if (riskReward >= 3) directionalScore += 6;
     else if (riskReward >= 2) directionalScore += 5;
     else if (riskReward >= 1.5) directionalScore += 4;
-    else if (riskReward >= 1.2) directionalScore += 2;
+    else if (riskReward >= 1.2) directionalScore += 3;
+    else if (riskReward >= 1.0) directionalScore += 1;
 
     if (!lateEntryRisk) directionalScore += 2;
     if (!extremeVolatility) directionalScore += 1;
@@ -381,8 +385,8 @@ export function evaluateStrategy(
   const bearishMacdConfirmed = macdMode === 'BEARISH' || macdCrossover === 'BEARISH' || bearishMomentum;
   const bearishMacdReversal = (macdMode === 'BEARISH' || macdCrossover === 'BEARISH' || macdHistogramMode === 'BEARISH_ACCELERATION') && shortMacdScore >= 7;
   const bullishMacdReversal = (macdMode === 'BULLISH' || macdCrossover === 'BULLISH' || macdHistogramMode === 'BULLISH_ACCELERATION') && longMacdScore >= 7;
-  const longTradeDeteriorating = longRiskReward < 1.2 || nearResistance || choppyMarket || extremeVolatility || (weakeningMomentum && !trendBullish);
-  const shortTradeDeteriorating = shortRiskReward < 1.2 || nearSupport || choppyMarket || extremeVolatility || (weakeningMomentum && !trendBearish);
+  const longTradeDeteriorating = longRiskReward < 1.05 || nearResistance || extremeVolatility || (weakeningMomentum && !trendBullish);
+  const shortTradeDeteriorating = shortRiskReward < 1.05 || nearSupport || extremeVolatility || (weakeningMomentum && !trendBearish);
   const longWeightedScore = computeWeightedTradeScore(
     longMacdScore,
     longTrendScore,
@@ -407,13 +411,12 @@ export function evaluateStrategy(
     : 0;
   const longMoveAlreadyHappened = recentMovePct > Math.max(2.2, avgRangePct * 1.15) || (nearResistance && candleBodyPct > Math.max(1.2, avgRangePct * 0.7));
   const shortMoveAlreadyHappened = recentMovePct < -Math.max(2.2, avgRangePct * 1.15) || (nearSupport && candleBodyPct > Math.max(1.2, avgRangePct * 0.7));
-  const unclearSetup = directionalEdge < 1.25
-    || choppyMarket
-    || (Math.abs(finalTradeScore - 5) < 0.75)
+  const unclearSetup = directionalEdge < 0.8
+    || (Math.abs(finalTradeScore - 5) < 0.55)
     || (longWeightedScore >= 6 && shortWeightedScore >= 6)
     || (!bullishMacdConfirmed && !bearishMacdConfirmed);
-  const longEntryQualified = !unclearSetup && !longMoveAlreadyHappened && longQuality && bullishMacdConfirmed && finalTradeScore >= 7.2;
-  const shortEntryQualified = !unclearSetup && !shortMoveAlreadyHappened && shortQuality && bearishMacdConfirmed && finalTradeScore <= 2.8;
+  const longEntryQualified = !unclearSetup && !longMoveAlreadyHappened && longQuality && bullishMacdConfirmed && finalTradeScore >= 6.8;
+  const shortEntryQualified = !unclearSetup && !shortMoveAlreadyHappened && shortQuality && bearishMacdConfirmed && finalTradeScore <= 3.2;
   const trailingBufferPct = Math.max(0.008, Math.min(0.025, (avgRangePct / 100) * 0.6 || 0.012));
   const longTradePlan = {
     stopPrice: Number(longStop.toFixed(8)),
@@ -456,15 +459,15 @@ export function evaluateStrategy(
     };
 
     if (!trendBullish && !trendBearish) pushReason('trend and EMA regime are not aligned');
-    if (!volumeConfirmed) pushReason('volume is below confirmation threshold');
+    if (!(trendBearish ? shortVolumeSupportive : volumeSupportive)) pushReason('volume is below confirmation threshold');
     if (lateEntryRisk) pushReason('late-entry risk after an extended candle');
     if (choppyMarket) pushReason('market is too choppy');
     if (extremeVolatility) pushReason('volatility is too high');
-    if (longRiskReward < 1.5 && shortRiskReward < 1.5) pushReason('risk/reward is below target');
+    if (longRiskReward < 1.25 && shortRiskReward < 1.25) pushReason('risk/reward is below target');
     if (!bullishMacdConfirmed && !bearishMacdConfirmed) pushReason('MACD confirmation is missing');
     if (weakMacdLong && weakMacdShort) pushReason('MACD strength is too weak');
     if (longMoveAlreadyHappened || shortMoveAlreadyHappened) pushReason('the move already happened before entry');
-    if (directionalEdge < 1.25) pushReason('directional edge is too weak');
+    if (directionalEdge < 0.8) pushReason('directional edge is too weak');
     if (Math.abs(finalTradeScore - 5) < 0.75) pushReason('trade score is still near neutral');
     if (longWeightedScore >= 6 && shortWeightedScore >= 6) pushReason('long and short cases are conflicting');
     if (trendBullish && !longQuality) pushReason('long setup lacks enough confirmation checks');
