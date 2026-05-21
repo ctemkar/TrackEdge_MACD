@@ -3967,11 +3967,6 @@ export default function App() {
       });
       setScanDataSource(formatScanSourceLabel());
 
-      if ((!manual && !autoTradeRef.current) || rateLimitedUntilRef.current > Date.now()) {
-        setScanProgress({ current: 0, total: 0 });
-        return;
-      }
-
       setMarketPicks(results);
       if (results.length > 0) {
         const foundAt = Date.now();
@@ -4034,6 +4029,12 @@ export default function App() {
         signalCounts.BUY > 0 || signalCounts.SELL > 0 ? 'success' : 'info'
       );
       console.log(`[TradeEdge] ${scanSummary}`);
+
+      if ((!manual && !autoTradeRef.current) || rateLimitedUntilRef.current > Date.now()) {
+        setScanProgress({ current: 0, total: 0 });
+        return;
+      }
+
       // Wait a moment before resetting progress to let the user see "Complete" in the UI
       setTimeout(() => setScanProgress({ current: 0, total: 0 }), 3000);
       
