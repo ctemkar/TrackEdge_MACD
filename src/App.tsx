@@ -1558,8 +1558,8 @@ export default function App() {
           message = authRetryAt
             ? `Live trading disabled until ${authRetryAt}`
             : `Live trading disabled until ${(new Date(authBlockedUntil || Date.now() + 60000)).toLocaleTimeString()}`;
-          setIsRealMode(false);
           setAutoTrade(false);
+          setAuthDegradedMessage(message);
           if (hasAuthBlock) {
             setEntryLockUntil(authBlockedUntil);
           }
@@ -4437,6 +4437,7 @@ export default function App() {
     syncErrorLower.includes('-2015')
   );
   const isAuthDegradedBannerVisible = isRealMode && !isAuthDisabledBannerVisible && Boolean(authDegradedMessage);
+  const authLockReason = authDegradedMessage || 'Binance rejected private futures auth (-2015). Check API key validity, futures or portfolio-margin permission, and IP whitelist settings.';
   const authLockMinutes = Math.floor(entryLockRemainingSec / 60);
   const authLockSeconds = String(entryLockRemainingSec % 60).padStart(2, '0');
 
@@ -5020,6 +5021,8 @@ export default function App() {
               <ShieldAlert size={16} className="text-rose-700 mt-0.5 shrink-0" />
               <div>
                 <p className="text-[10px] font-black uppercase tracking-[0.18em] text-rose-900">Live trading disabled until {entryLockRetryTime}</p>
+                <p className="text-[10px] font-mono text-rose-900 mt-1">{authLockReason}</p>
+                <p className="text-[10px] font-mono text-rose-900 mt-1">Required fix: valid Binance key/secret, futures or portfolio-margin permission on the key, and your current outbound IP on the Binance whitelist.</p>
               </div>
             </div>
             <span className="text-[10px] font-mono font-black text-rose-800 border border-rose-300 bg-white px-2 py-1 rounded-sm shrink-0">{entryLockRetryTime}</span>
@@ -5064,7 +5067,7 @@ export default function App() {
                   onClick={async () => {
                     reportSyncError(null);
                     if (entryLockActive) {
-                      const lockMessage = `Live trading disabled until ${entryLockRetryTime}`;
+                      const lockMessage = `Live trading disabled until ${entryLockRetryTime}. ${authLockReason}`;
                       setExecutionFeedback({ type: 'warning', message: lockMessage });
                       addLog(lockMessage, 'warning');
                       return;
