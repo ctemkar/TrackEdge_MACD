@@ -36,7 +36,7 @@ const CRITERIA_HELP: Record<string, string> = {
   paperLossCooldownMinutes: 'Cooldown after a paper-trading loss. Reduces repeated losses from rapid re-entry in bad conditions.',
   duplicateOrderLockoutSec: 'Minimum seconds before allowing a repeated order on the same side/symbol. Prevents accidental duplicate submissions.',
   liveEntryDelayMs: 'Delay between sequential live entry submissions. Reduces burst orders and margin/permission race failures.',
-  liveEntriesPerCycle: 'Legacy setting retained for compatibility. Live scans now execute all eligible entries sequentially up to available slots, so signals are not deferred by a per-cycle cap.',
+  liveEntriesPerCycle: 'Hard cap on new live entries allowed per scan cycle. Lower values slow expansion and reduce overnight position sprawl.',
   minPaperAllocation: 'Minimum paper capital allocated per trade. Prevents unrealistically tiny paper positions in simulation mode.',
   lowMarginLockMinutes: 'Lock duration when free margin is too low. Temporarily pauses entries to avoid repeated margin rejects.',
   closeFailureLockMinutes: 'Lock duration after close-order failures. Prevents repeated close retries from spiraling into API churn.',
@@ -93,6 +93,9 @@ const PARAMETER_DEFAULTS = {
 } as const;
 
 const NON_TRADABLE_QUOTE_BASES = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
+const LIVE_PORTFOLIO_GROSS_EXPOSURE_MULTIPLIER = 4.5;
+const LIVE_FREE_CAPITAL_RESERVE_RATIO = 0.18;
+const LIVE_FREE_CAPITAL_RESERVE_MIN_ORDERS = 3;
 
 const getCompactUsdSymbolParts = (raw: string): { compact: string; base: string; quote: string } | null => {
   const compact = String(raw || '').toUpperCase().split(':')[0].replace('/', '');
@@ -1027,6 +1030,7 @@ export default function App() {
   const maxConcurrentTradesRef = React.useRef(maxConcurrentTrades);
   const strategyConfigRef = React.useRef(strategyConfig);
   const performScanRef = React.useRef<() => Promise<void>>(async () => {});
+  const perSymbolEntryRetryLockRef = React.useRef<Record<string, { until: number; reason: string }>>({});
 
   const getHoldingActiveNotional = React.useCallback((
     holding: Pick<Holding, 'amount' | 'contracts' | 'notional' | 'markPrice' | 'entryPrice'> | undefined,
@@ -1066,6 +1070,51 @@ export default function App() {
     const bufferRatio = Math.max(0, Math.min(0.5, liveMarginBufferPct / 100));
     return Math.max(0, safeCapital * (1 - bufferRatio));
   }, [liveMarginBufferPct]);
+
+  const getLivePortfolioExposureCap = React.useCallback((equity: number) => {
+    const safeEquity = Math.max(0, equity);
+    return Math.max(maxLiveOrderNotional * 4, safeEquity * LIVE_PORTFOLIO_GROSS_EXPOSURE_MULTIPLIER);
+  }, [maxLiveOrderNotional]);
+
+  const getLiveCapitalReserveTarget = React.useCallback((equity: number) => {
+    const safeEquity = Math.max(0, equity);
+    return Math.max(liveMinOrderNotional * LIVE_FREE_CAPITAL_RESERVE_MIN_ORDERS, safeEquity * LIVE_FREE_CAPITAL_RESERVE_RATIO);
+  }, [liveMinOrderNotional]);
+
+  const getPortfolioGrossNotional = React.useCallback((activeHoldings: Array<Pick<Holding, 'amount' | 'contracts' | 'notional' | 'markPrice' | 'entryPrice'>>) => {
+    return activeHoldings.reduce((sum, holding) => sum + getHoldingActiveNotional(holding), 0);
+  }, [getHoldingActiveNotional]);
+
+  const getLiveEntryCapacityBlock = React.useCallback(({
+    desiredNotional,
+    currentHoldingNotional,
+    bufferedCapital,
+    openHoldings,
+    queuedNotional = 0,
+  }: {
+    desiredNotional: number;
+    currentHoldingNotional: number;
+    bufferedCapital: number;
+    openHoldings: Holding[];
+    queuedNotional?: number;
+  }) => {
+    const incrementalNotional = Math.max(0, desiredNotional - currentHoldingNotional);
+    if (!(incrementalNotional > 0)) return null;
+
+    const grossOpenNotional = getPortfolioGrossNotional(openHoldings);
+    const exposureCap = getLivePortfolioExposureCap(balance);
+    const reserveTarget = getLiveCapitalReserveTarget(balance);
+    const projectedGrossNotional = grossOpenNotional + queuedNotional + incrementalNotional;
+    const projectedBufferedCapital = Math.max(0, bufferedCapital - queuedNotional - incrementalNotional);
+
+    if (projectedBufferedCapital < reserveTarget) {
+      return `free-margin reserve lock (${projectedBufferedCapital.toFixed(2)} < ${reserveTarget.toFixed(2)} after entry)`;
+    }
+    if (projectedGrossNotional > exposureCap) {
+      return `gross exposure cap (${projectedGrossNotional.toFixed(2)} > ${exposureCap.toFixed(2)})`;
+    }
+    return null;
+  }, [balance, getLiveCapitalReserveTarget, getLivePortfolioExposureCap, getPortfolioGrossNotional]);
 
   const getDesiredLiveEntryNotional = React.useCallback((confidenceScore: number | undefined, tradableCapital: number) => {
     const minLiveNotional = Math.max(1, liveMinOrderNotional);
@@ -1115,6 +1164,29 @@ export default function App() {
     autoTradeRef.current = autoTrade;
     maxConcurrentTradesRef.current = maxConcurrentTrades;
   }, [holdings, autoTrade, maxConcurrentTrades]);
+
+  const getEntryRetryLock = React.useCallback((rawSymbol: string, now = Date.now()) => {
+    const symbolKey = normalizeLiveFuturesSymbol(rawSymbol);
+    const activeLock = perSymbolEntryRetryLockRef.current[symbolKey];
+    if (!activeLock) return null;
+    if (activeLock.until <= now) {
+      delete perSymbolEntryRetryLockRef.current[symbolKey];
+      return null;
+    }
+    return activeLock;
+  }, []);
+
+  const setEntryRetryLock = React.useCallback((rawSymbol: string, ms: number, reason: string) => {
+    const symbolKey = normalizeLiveFuturesSymbol(rawSymbol);
+    perSymbolEntryRetryLockRef.current[symbolKey] = {
+      until: Date.now() + ms,
+      reason,
+    };
+  }, []);
+
+  const clearEntryRetryLock = React.useCallback((rawSymbol: string) => {
+    delete perSymbolEntryRetryLockRef.current[normalizeLiveFuturesSymbol(rawSymbol)];
+  }, []);
 
   React.useEffect(() => {
     strategyConfigRef.current = strategyConfig;
@@ -1831,6 +1903,16 @@ export default function App() {
     tradeLockout.current.add(lockKey);
     setTimeout(() => tradeLockout.current.delete(lockKey), duplicateOrderLockoutSec * 1000);
 
+    const retryLock = getEntryRetryLock(tradeSymbol);
+    if (retryLock && !allowManualOverride) {
+      const remainingSec = Math.max(1, Math.ceil((retryLock.until - Date.now()) / 1000));
+      const retryMsg = `retry lock active for ${remainingSec}s (${retryLock.reason})`;
+      addLog(`TRADE SKIPPED: ${tradeSymbol} ${retryMsg}.`, 'warning');
+      setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${retryMsg}.` });
+      pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${retryMsg}`, status: 'SKIPPED', cycleId: eventCycleId });
+      return;
+    }
+
 
     if (isRealMode) {
       setExecutionFeedback({ type: 'info', message: `Submitting ${type} ${tradeSymbol} at $${formatPrice(price)}...` });
@@ -2043,6 +2125,19 @@ export default function App() {
             return;
           }
 
+          const capacityBlock = getLiveEntryCapacityBlock({
+            desiredNotional,
+            currentHoldingNotional,
+            bufferedCapital: tradableCapital,
+            openHoldings: holdingsRef.current,
+          });
+          if (capacityBlock) {
+            addLog(`TRADE ABORTED: ${tradeSymbol} ${capacityBlock}.`, 'warning');
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${capacityBlock}`, status: 'SKIPPED', cycleId: eventCycleId });
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * softCooldownMinutes) }));
+            return;
+          }
+
           amount = allocation / price;
         } else {
           amount = heldAmount;
@@ -2087,6 +2182,7 @@ export default function App() {
         }
 
         if (result.status === 'success') {
+          clearEntryRetryLock(tradeSymbol);
 
           // Verify position state after order acknowledgement. Some accounts cannot
           // read positionRisk immediately (or at all), so we treat accepted orders
@@ -2265,6 +2361,7 @@ export default function App() {
         }
 
         if (verified) {
+          clearEntryRetryLock(tradeSymbol);
           addLog(`REAL ${type} VERIFIED: ${tradeSymbol} (post-error exchange state confirms fill)`, 'success');
           setExecutionFeedback({ type: 'success', message: `${type} verified for ${tradeSymbol} after exchange resync.` });
           if (closingExisting) {
@@ -2322,6 +2419,12 @@ export default function App() {
         addLog(`REAL ${type} FAILED: ${msg}`, 'warning');
   setExecutionFeedback({ type: 'warning', message: `${type} failed for ${tradeSymbol}: ${msg}` });
         pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `FAILED: ${msg}`, status: 'FAILED', cycleId: eventCycleId });
+
+        if (isMarginOrFundsFailure) {
+          setEntryRetryLock(tradeSymbol, hardFailureLockMinutes * 60 * 1000, 'margin/funds failure');
+        } else if (!isAuthFailure) {
+          setEntryRetryLock(tradeSymbol, Math.max(softCooldownMinutes, closeFailureLockMinutes) * 60 * 1000, 'exchange transport failure');
+        }
 
         if (isMarginOrFundsFailure || isAuthFailure) {
           // Hard fail-safe: disable autonomous trading immediately on exchange-level hard failures.
@@ -2471,7 +2574,7 @@ export default function App() {
         }
       }
     }
-  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, maxLiveOrderNotional, autoEntryMinScore, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes, hardReentryCooldownMinutes, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional, getBufferedLiveCapital, liveMarginBufferPct]);
+  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, maxLiveOrderNotional, autoEntryMinScore, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes, hardReentryCooldownMinutes, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional, getBufferedLiveCapital, liveMarginBufferPct, getLiveEntryCapacityBlock, getEntryRetryLock, setEntryRetryLock, clearEntryRetryLock]);
 
   const managePlannedExit = React.useCallback((holding: Holding, price: number, signal?: StrategySignal | null, cycleId?: number) => {
     const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
@@ -3610,10 +3713,16 @@ export default function App() {
           return symbolRiskBlock.reason;
         }
         if (isRealMode) {
+          const retryLock = getEntryRetryLock(pick.symbol, scanNow);
+          if (retryLock) {
+            const minutesRemaining = Math.max(1, Math.ceil((retryLock.until - scanNow) / 60000));
+            return `retry lock ${minutesRemaining}m remaining (${retryLock.reason})`;
+          }
           const directionalConfidence = getDirectionalEntryScore(side, pick.signal.score);
           if (directionalConfidence < relaxedAutoEntryMinScore) {
             return `confidence ${directionalConfidence.toFixed(1)} below ${relaxedAutoEntryMinScore.toFixed(1)}`;
           }
+          const desiredNotional = getDesiredLiveEntryNotional(directionalConfidence, getBufferedLiveCapital(availableFunds));
           if (side === 'SELL' && isShortFacingLocalUpwardMomentum(pick)) {
             const strongerShortThreshold = Math.min(10, relaxedAutoEntryMinScore + 0.4);
             if (directionalConfidence < strongerShortThreshold || pick.signal.macdScore < 7) {
@@ -3621,12 +3730,21 @@ export default function App() {
             }
           }
           if (matchingHolding) {
-            const desiredNotional = getDesiredLiveEntryNotional(directionalConfidence, getBufferedLiveCapital(availableFunds));
             const currentNotional = getHoldingActiveNotional(matchingHolding, pick.lastPrice);
             if ((desiredNotional - currentNotional) < liveMinOrderNotional) {
               const sameSymbol = matchingHolding.symbol === pick.symbol;
               return sameSymbol ? 'already sized' : `already sized via ${matchingHolding.symbol}`;
             }
+          }
+          const currentHoldingNotional = matchingHolding ? getHoldingActiveNotional(matchingHolding, pick.lastPrice) : 0;
+          const capacityBlock = getLiveEntryCapacityBlock({
+            desiredNotional,
+            currentHoldingNotional,
+            bufferedCapital: getBufferedLiveCapital(availableFunds),
+            openHoldings: currentHoldings,
+          });
+          if (capacityBlock) {
+            return capacityBlock;
           }
           const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(side, pick.lastPrice, pick.signal.tradePlan, estimatedRoundTripFrictionBps);
           if (edgeAfterFrictionPct !== null && edgeAfterFrictionPct < relaxedMinEdgeAfterFrictionPct) {
@@ -3719,15 +3837,18 @@ export default function App() {
         const eligibleSellCount = entries.filter(entry => entry.side === 'SELL').length;
         const baseAvailableSlots = Math.max(0, currentMaxTrades - currentHoldings.length);
         const boostedAvailableSlots = Math.max(0, (currentMaxTrades + STRONG_LIVE_SIGNAL_EXTRA_SLOTS) - currentHoldings.length);
-        const totalLiveCapacity = Math.max(1, currentMaxTrades + STRONG_LIVE_SIGNAL_EXTRA_SLOTS);
-        const sideSelectionCap = boostedAvailableSlots <= 1
+        const scanEntryCap = isRealMode ? Math.max(1, liveEntriesPerCycle) : boostedAvailableSlots;
+        const effectiveBaseAvailableSlots = Math.min(baseAvailableSlots, scanEntryCap);
+        const effectiveBoostedAvailableSlots = Math.min(boostedAvailableSlots, scanEntryCap);
+        const totalLiveCapacity = Math.max(1, currentHoldings.length + effectiveBoostedAvailableSlots);
+        const sideSelectionCap = effectiveBoostedAvailableSlots <= 1
           ? 1
-          : Math.min(5, Math.max(3, Math.ceil(boostedAvailableSlots * 0.8)));
+          : Math.min(2, Math.max(1, Math.ceil(effectiveBoostedAvailableSlots * 0.5)));
         const portfolioSideCap = totalLiveCapacity <= 2
           ? 1
-          : Math.max(3, Math.ceil(totalLiveCapacity * 0.85));
+          : Math.max(2, Math.ceil(totalLiveCapacity * 0.6));
 
-        if (boostedAvailableSlots > 0) {
+        if (effectiveBoostedAvailableSlots > 0) {
           const openSideCounts = currentHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
             acc[holding.side === 'SHORT' ? 'SELL' : 'BUY'] += 1;
             return acc;
@@ -3761,14 +3882,19 @@ export default function App() {
             SELL: openSideCounts.SELL,
           };
           const selectedCohorts = new Map<string, number>();
+          let queuedNotional = 0;
 
           entries.forEach((entry) => {
             const underlyingKey = getSymbolRiskIdentity(entry.pick.symbol).key;
             const directionalScore = getDirectionalEntryScore(entry.side, entry.pick.signal.score);
             const strongSignal = isStrongLiveSignal(directionalScore, relaxedAutoEntryMinScore);
             const cohortKey = getEntryCohortKey(entry);
+            const matchingHolding = currentHoldings.find((h) => getSymbolRiskIdentity(h.symbol).key === underlyingKey && h.side === (entry.side === 'SELL' ? 'SHORT' : 'LONG'));
+            const desiredNotional = getDesiredLiveEntryNotional(directionalScore, realTradableCapital);
+            const currentHoldingNotional = matchingHolding ? getHoldingActiveNotional(matchingHolding, entry.pick.lastPrice) : 0;
+            const incrementalNotional = Math.max(0, desiredNotional - currentHoldingNotional);
 
-            if (selectedTrades.length >= boostedAvailableSlots) {
+            if (selectedTrades.length >= effectiveBoostedAvailableSlots) {
               deferredTrades.push({
                 symbol: entry.pick.symbol,
                 side: entry.side,
@@ -3778,13 +3904,30 @@ export default function App() {
               });
               return;
             }
-            if (selectedTrades.length >= baseAvailableSlots && !strongSignal) {
+            if (selectedTrades.length >= effectiveBaseAvailableSlots && !strongSignal) {
               deferredTrades.push({
                 symbol: entry.pick.symbol,
                 side: entry.side,
                 score: entry.pick.signal.score,
                 priorityRank: entry.pick.priorityRank || 0,
                 reason: 'reserved extra slots for stronger setups',
+              });
+              return;
+            }
+            const capacityBlock = getLiveEntryCapacityBlock({
+              desiredNotional,
+              currentHoldingNotional,
+              bufferedCapital: realTradableCapital,
+              openHoldings: currentHoldings,
+              queuedNotional,
+            });
+            if (capacityBlock) {
+              deferredTrades.push({
+                symbol: entry.pick.symbol,
+                side: entry.side,
+                score: entry.pick.signal.score,
+                priorityRank: entry.pick.priorityRank || 0,
+                reason: capacityBlock,
               });
               return;
             }
@@ -3840,6 +3983,7 @@ export default function App() {
             }
 
             selectedTrades.push(entry);
+            queuedNotional += incrementalNotional;
             selectedUnderlyingKeys.add(underlyingKey);
             selectedThisCycleBySide[entry.side] += 1;
             selectedPortfolioBySide[entry.side] += 1;
@@ -3848,14 +3992,14 @@ export default function App() {
 
           const selectedCount = selectedTrades.length;
           const deferredCount = deferredTrades.length;
-          const extraStrongTradeCount = Math.max(0, selectedTrades.length - Math.min(selectedTrades.length, baseAvailableSlots));
+          const extraStrongTradeCount = Math.max(0, selectedTrades.length - Math.min(selectedTrades.length, effectiveBaseAvailableSlots));
           const coverageSummary = `coverage=${results.length}/${shortlistLimit}/${symbolsToScan.length}`;
           const exposureSummary = `openSides=BUY:${openSideCounts.BUY}|SELL:${openSideCounts.SELL}`;
           addLog(
-            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${baseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} portfolioSideCap=${portfolioSideCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`,
+            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} portfolioSideCap=${portfolioSideCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`,
             selectedCount > 0 ? 'success' : 'info',
           );
-          updateLatestScanArchiveDecision(`SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${baseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} portfolioSideCap=${portfolioSideCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`);
+          updateLatestScanArchiveDecision(`SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} portfolioSideCap=${portfolioSideCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`);
           
           if (selectedTrades.length > 0 || deferredTrades.length > 0) {
             // Live mode safety: execute entries sequentially to avoid burst margin failures.
@@ -3888,7 +4032,7 @@ export default function App() {
               }
             }
           } else {
-            pushScanSkipEvent(`SKIP: No eligible entries (BUY=${eligibleBuyCount}, SELL=${eligibleSellCount}, slots=${baseAvailableSlots}${boostedAvailableSlots > baseAvailableSlots ? `+${boostedAvailableSlots - baseAvailableSlots} strong-only` : ''})`, cycleId);
+            pushScanSkipEvent(`SKIP: No eligible entries (BUY=${eligibleBuyCount}, SELL=${eligibleSellCount}, slots=${effectiveBaseAvailableSlots}${effectiveBoostedAvailableSlots > effectiveBaseAvailableSlots ? `+${effectiveBoostedAvailableSlots - effectiveBaseAvailableSlots} strong-only` : ''})`, cycleId);
           }
         } else {
           pushScanSkipEvent(`SKIP: No free slots (${currentHoldings.length}/${currentMaxTrades}${STRONG_LIVE_SIGNAL_EXTRA_SLOTS > 0 ? ` base, +${STRONG_LIVE_SIGNAL_EXTRA_SLOTS} strong-only` : ''})`, cycleId);
