@@ -1487,7 +1487,8 @@ export default function App() {
     setSyncError(null);
   }, [syncError]);
 
-  const syncRealBalance = React.useCallback(async () => {
+  const syncRealBalance = React.useCallback(async (options?: { ignoreEntryLock?: boolean }) => {
+    const ignoreEntryLock = options?.ignoreEntryLock === true;
     if (isSyncingRef.current) return false;
     if (rateLimitedUntilRef.current > Date.now()) {
       const retryTime = new Date(rateLimitedUntilRef.current).toLocaleTimeString();
@@ -1508,10 +1509,11 @@ export default function App() {
       reportSyncError(message);
       return false;
     }
-    if (entryLockUntilRef.current > Date.now()) {
+    if (!ignoreEntryLock && entryLockUntilRef.current > Date.now()) {
       const retryTime = new Date(entryLockUntilRef.current).toLocaleTimeString();
       const message = `Live trading disabled until ${retryTime}`;
       reportSyncError(message);
+      return false;
     }
     isSyncingRef.current = true;
     setIsSyncing(true);
@@ -1575,6 +1577,8 @@ export default function App() {
       const data = await resp.json();
       if (data.status === 'success' || data.status === 'cached') {
         setPrivateSyncBlockedUntil(0);
+        setEntryLockUntil(0);
+        reportSyncError(null);
         const liveEquity = Number(data.equity);
         const usdt = Number(data?.balance?.USDT || 0);
         const liveAvailable = Number(data?.availableBalance);
@@ -2647,12 +2651,8 @@ export default function App() {
       return didChange ? next : prev;
     });
 
-    const technicalInvalidation = margin > 0
-      ? currentMarginPnlPct <= -Math.abs(stopLossPercent)
-      : (holding.side === 'LONG' ? price <= stopPrice : price >= stopPrice);
-    const marginProfitTargetHit = margin > 0
-      ? currentMarginPnlPct >= Math.abs(takeProfitPercent)
-      : false;
+    const technicalInvalidation = holding.side === 'LONG' ? price <= stopPrice : price >= stopPrice;
+    const priceProfitTargetHit = holding.side === 'LONG' ? price >= tp2Price : price <= tp2Price;
     const hitTp1 = holding.side === 'LONG' ? price >= tp1Price : price <= tp1Price;
     const hitTp2 = holding.side === 'LONG' ? price >= tp2Price : price <= tp2Price;
     const trailingStopPrice = holding.trailingStopPrice || stopPrice;
@@ -2665,7 +2665,7 @@ export default function App() {
         holding.symbol,
         price,
         margin > 0
-          ? `AUTO_EXIT: MARGIN STOP ${currentMarginPnlPct.toFixed(2)}% <= -${Math.abs(stopLossPercent).toFixed(2)}%`
+          ? `AUTO_EXIT: PRICE STOP ${price.toFixed(6)} crossed ${stopPrice.toFixed(6)} (margin P&L ${currentMarginPnlPct.toFixed(2)}%)`
           : 'AUTO_EXIT: TECHNICAL INVALIDATION',
         holding.id,
         cycleId,
@@ -2675,12 +2675,14 @@ export default function App() {
       return;
     }
 
-    if (marginProfitTargetHit) {
+    if (priceProfitTargetHit) {
       executeTrade(
         closeSide,
         holding.symbol,
         price,
-        `AUTO_EXIT: MARGIN TAKE PROFIT ${currentMarginPnlPct.toFixed(2)}% >= ${Math.abs(takeProfitPercent).toFixed(2)}%`,
+        margin > 0
+          ? `AUTO_EXIT: PRICE TAKE PROFIT ${price.toFixed(6)} reached ${tp2Price.toFixed(6)} (margin P&L ${currentMarginPnlPct.toFixed(2)}%)`
+          : 'AUTO_EXIT: TAKE PROFIT',
         holding.id,
         cycleId,
         undefined,
@@ -2852,16 +2854,23 @@ export default function App() {
   const currentHoldingContracts = Number(currentHolding?.contracts || currentHolding?.amount || 0);
   const currentHoldingNotional = Number(currentHolding?.notional || (currentHoldingContracts * Number(currentHolding?.entryPrice || 0)) || 0);
   const currentHoldingMargin = Number(currentHolding?.initialMargin || (currentHoldingNotional > 0 ? currentHoldingNotional / 5 : 0) || 0);
-  const currentHoldingUsesMarginTargets = currentHoldingMargin > 0;
   const stopLossPrice = currentHolding
     ? (currentHolding.side === 'SHORT'
       ? currentHolding.entryPrice * (1 + stopLossPercent / 100)
       : currentHolding.entryPrice * (1 - stopLossPercent / 100))
     : 0;
-  const takeProfitPrice = currentHolding
-    ? (currentHolding.side === 'SHORT'
-      ? currentHolding.entryPrice * (1 - takeProfitPercent / 100)
-      : currentHolding.entryPrice * (1 + takeProfitPercent / 100))
+  const currentHoldingRiskPerUnit = currentHolding
+    ? Math.max(Math.abs(currentHolding.entryPrice - stopLossPrice), currentHolding.entryPrice * 0.005)
+    : 0;
+  const currentHoldingTp1Price = currentHolding
+    ? (currentHolding.tp1Price || (currentHolding.side === 'SHORT'
+      ? currentHolding.entryPrice - (currentHoldingRiskPerUnit * 1.25)
+      : currentHolding.entryPrice + (currentHoldingRiskPerUnit * 1.25)))
+    : 0;
+  const currentHoldingTp2Price = currentHolding
+    ? (currentHolding.tp2Price || (currentHolding.side === 'SHORT'
+      ? currentHolding.entryPrice - (currentHoldingRiskPerUnit * 2.4)
+      : currentHolding.entryPrice + (currentHoldingRiskPerUnit * 2.4)))
     : 0;
 
   const [scanProgress, setScanProgress] = useState({ current: 0, total: 0 });
@@ -5066,14 +5075,11 @@ export default function App() {
                 <button 
                   onClick={async () => {
                     reportSyncError(null);
-                    if (entryLockActive) {
-                      const lockMessage = `Live trading disabled until ${entryLockRetryTime}. ${authLockReason}`;
-                      setExecutionFeedback({ type: 'warning', message: lockMessage });
-                      addLog(lockMessage, 'warning');
-                      return;
-                    }
                     if (serverConfig?.hasKeys) {
-                      const success = await syncRealBalance();
+                      if (entryLockActive) {
+                        addLog('Retrying live Binance handshake despite prior auth lock.', 'info');
+                      }
+                      const success = await syncRealBalance({ ignoreEntryLock: true });
                       if (success) setIsRealMode(true);
                     }
                     else {
@@ -5085,8 +5091,8 @@ export default function App() {
                       addLog(message, 'warning');
                     }
                   }}
-                  disabled={isSyncing || entryLockActive}
-                  className={`w-32 px-4 py-1.5 text-[10px] font-black uppercase tracking-tighter transition-all flex items-center justify-center gap-2 ${isRealMode ? 'bg-rose-600 text-white shadow-lg' : 'text-white/40 hover:text-white'} ${(isSyncing || entryLockActive) ? 'cursor-not-allowed opacity-70' : ''}`}
+                  disabled={isSyncing}
+                  className={`w-32 px-4 py-1.5 text-[10px] font-black uppercase tracking-tighter transition-all flex items-center justify-center gap-2 ${isRealMode ? 'bg-rose-600 text-white shadow-lg' : 'text-white/40 hover:text-white'} ${isSyncing ? 'cursor-not-allowed opacity-70' : ''}`}
                 >
                   <span className="inline-flex w-3 h-3 items-center justify-center">
                     <Loader2 size={10} className={isSyncing ? 'opacity-60' : 'opacity-0'} />
@@ -5478,7 +5484,7 @@ export default function App() {
                     <div key={`blocked-${entry.symbol}-${entry.reason}`} className="border border-rose-200 bg-white/60 px-2 py-2">
                       <div className="flex items-center justify-between gap-2">
                         <span className="font-black text-[11px] text-rose-950">{entry.symbol}</span>
-                        <span className="text-[9px] text-rose-900/70">{entry.side} | score {entry.score.toFixed(1)} | rank {entry.priorityRank.toFixed(2)}</span>
+                        <span className="text-[9px] text-rose-900/70">{entry.side} | score {(entry.score ?? 0).toFixed(1)} | rank {(entry.priorityRank ?? 0).toFixed(2)}</span>
                       </div>
                       <div className="mt-1 flex items-center justify-between gap-2 text-[9px] text-rose-900/75">
                         <span>{entry.reason}</span>
@@ -5505,7 +5511,7 @@ export default function App() {
                     <div key={`deferred-${entry.symbol}-${entry.side}`} className="border border-sky-200 bg-white/60 px-2 py-2">
                       <div className="flex items-center justify-between gap-2">
                         <span className="font-black text-[11px] text-sky-950">{entry.symbol}</span>
-                        <span className="text-[9px] text-sky-900/70">{entry.side} | score {entry.score.toFixed(1)} | rank {entry.priorityRank.toFixed(2)}</span>
+                        <span className="text-[9px] text-sky-900/70">{entry.side} | score {(entry.score ?? 0).toFixed(1)} | rank {(entry.priorityRank ?? 0).toFixed(2)}</span>
                       </div>
                       <div className="mt-1 flex items-center justify-between gap-2 text-[9px] text-sky-900/75">
                         <span>{entry.reason || 'eligible but postponed by live cycle throttle'}</span>
@@ -5532,7 +5538,7 @@ export default function App() {
                     <div key={`near-miss-${pick.symbol}`} className="border border-amber-200 bg-white/60 px-2 py-2">
                       <div className="flex items-center justify-between gap-2">
                         <span className="font-black text-[11px] text-amber-950">{pick.symbol}</span>
-                        <span className="text-[9px] text-amber-900/70">score {pick.signal.score.toFixed(1)} | rank {(pick.priorityRank || 0).toFixed(2)} | MACD {pick.signal.macdScore.toFixed(1)}</span>
+                        <span className="text-[9px] text-amber-900/70">score {(pick.signal.score ?? 0).toFixed(1)} | rank {(pick.priorityRank ?? 0).toFixed(2)} | MACD {(pick.signal.macdScore ?? 0).toFixed(1)}</span>
                       </div>
                       <div className="mt-1 flex items-center justify-between gap-2 text-[9px] text-amber-900/75">
                         <span>{describeHoldReason(pick.signal.holdReason)}</span>
@@ -5611,7 +5617,7 @@ export default function App() {
                                   {entry.pick.signal.overall}
                                 </span>
                                 <span className="text-[9px] font-mono text-slate-600">
-                                  score {entry.pick.signal.score.toFixed(1)} | rank {(entry.pick.priorityRank || 0).toFixed(2)}
+                                  score {(entry.pick.signal.score ?? 0).toFixed(1)} | rank {(entry.pick.priorityRank ?? 0).toFixed(2)}
                                 </span>
                               </div>
                               <div className="mt-1 text-[8px] font-mono uppercase opacity-45">
@@ -6169,7 +6175,7 @@ export default function App() {
                       onClick={async () => {
                         if (isRealMode) setIsRealMode(false);
                         else {
-                          const success = await syncRealBalance();
+                          const success = await syncRealBalance({ ignoreEntryLock: true });
                           if (success) setIsRealMode(true);
                         }
                       }}
@@ -6287,18 +6293,27 @@ export default function App() {
                 </div>
 
                 {currentHolding && (
-                  <div className="grid grid-cols-2 gap-4">
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                     <div className="bg-white/5 p-3 border border-white/10">
                       <p className="text-[8px] uppercase font-bold opacity-40 mb-1">Stop Loss Target</p>
                       <p className="text-sm font-black text-rose-400 tabular-nums">
-                        {currentHoldingUsesMarginTargets ? `${Math.abs(stopLossPercent).toFixed(2)}% margin P&L` : `$${formatPrice(stopLossPrice)}`}
+                        ${formatPrice(stopLossPrice)}
                       </p>
+                      <p className="mt-1 text-[8px] font-mono uppercase opacity-45">{Math.abs(stopLossPercent).toFixed(2)}% from entry</p>
                     </div>
                     <div className="bg-white/5 p-3 border border-white/10">
-                      <p className="text-[8px] uppercase font-bold opacity-40 mb-1">Take Profit Target</p>
+                      <p className="text-[8px] uppercase font-bold opacity-40 mb-1">Take Profit 1</p>
                       <p className="text-sm font-black text-emerald-400 tabular-nums">
-                        {currentHoldingUsesMarginTargets ? `${Math.abs(takeProfitPercent).toFixed(2)}% margin P&L` : `$${formatPrice(takeProfitPrice)}`}
+                        ${formatPrice(currentHoldingTp1Price)}
                       </p>
+                      <p className="mt-1 text-[8px] font-mono uppercase opacity-45">1.25R target</p>
+                    </div>
+                    <div className="bg-white/5 p-3 border border-white/10">
+                      <p className="text-[8px] uppercase font-bold opacity-40 mb-1">Take Profit 2</p>
+                      <p className="text-sm font-black text-emerald-300 tabular-nums">
+                        ${formatPrice(currentHoldingTp2Price)}
+                      </p>
+                      <p className="mt-1 text-[8px] font-mono uppercase opacity-45">2.4R target</p>
                     </div>
                   </div>
                 )}
