@@ -116,6 +116,7 @@ const NON_TRADABLE_QUOTE_BASES = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP'
 const LIVE_PORTFOLIO_GROSS_EXPOSURE_MULTIPLIER = 4.5;
 const LIVE_FREE_CAPITAL_RESERVE_RATIO = 0.12;
 const LIVE_FREE_CAPITAL_RESERVE_MIN_ORDERS = 2;
+const COOLDOWNS_ENABLED = false;
 
 const getCompactUsdSymbolParts = (raw: string): { compact: string; base: string; quote: string } | null => {
   const compact = String(raw || '').toUpperCase().split(':')[0].replace('/', '');
@@ -1022,6 +1023,9 @@ export default function App() {
   }, []);
 
   const getExitCooldownMinutes = React.useCallback((reason: string | undefined, pnl: number) => {
+    if (!COOLDOWNS_ENABLED) {
+      return 0;
+    }
     const normalizedReason = String(reason || '');
     if (/EMERGENCY_LIQUIDATION/i.test(normalizedReason) || pnl < 0) {
       return Math.max(hardReentryCooldownMinutes, paperLossCooldownMinutes);
@@ -1034,6 +1038,12 @@ export default function App() {
     }
     return hardReentryCooldownMinutes;
   }, [hardReentryCooldownMinutes, paperLossCooldownMinutes, successCooldownMinutes]);
+
+  useEffect(() => {
+    if (!COOLDOWNS_ENABLED && Object.keys(cooldowns).length > 0) {
+      setCooldowns({});
+    }
+  }, [cooldowns]);
 
   const symbolRiskSummary = React.useMemo(() => {
     const now = Date.now();
@@ -4134,10 +4144,12 @@ export default function App() {
         if (opposingHolding) {
           return `held ${opposingHolding.side.toLowerCase()}`;
         }
-        const cooldownUntil = cooldowns[pick.symbol] || 0;
-        if (cooldownUntil > scanNow) {
-          const minutesRemaining = Math.max(1, Math.ceil((cooldownUntil - scanNow) / 60000));
-          return `cooldown ${minutesRemaining}m remaining`;
+        if (COOLDOWNS_ENABLED) {
+          const cooldownUntil = cooldowns[pick.symbol] || 0;
+          if (cooldownUntil > scanNow) {
+            const minutesRemaining = Math.max(1, Math.ceil((cooldownUntil - scanNow) / 60000));
+            return `cooldown ${minutesRemaining}m remaining`;
+          }
         }
         const symbolRiskBlock = getSymbolRiskBlock(pick.symbol, scanNow);
         const directionalConfidence = getDirectionalEntryScore(side, pick.signal.score);
@@ -5389,11 +5401,14 @@ export default function App() {
     } else if (holdings.some((holding) => holding.symbol === pick.symbol)) {
       reason = 'already held';
     } else {
-      const cooldownUntil = cooldowns[pick.symbol] || 0;
-      if (cooldownUntil > scanNow) {
-        const minutesRemaining = Math.max(1, Math.ceil((cooldownUntil - scanNow) / 60000));
-        reason = `cooldown ${minutesRemaining}m`;
-      } else {
+      if (COOLDOWNS_ENABLED) {
+        const cooldownUntil = cooldowns[pick.symbol] || 0;
+        if (cooldownUntil > scanNow) {
+          const minutesRemaining = Math.max(1, Math.ceil((cooldownUntil - scanNow) / 60000));
+          reason = `cooldown ${minutesRemaining}m`;
+        }
+      }
+      if (!reason) {
         const symbolRiskBlock = getSymbolRiskBlock(pick.symbol, scanNow);
         if (symbolRiskBlock) {
           reason = symbolRiskBlock.reason;
