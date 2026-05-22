@@ -5310,14 +5310,20 @@ export default function App() {
     const cutoff = Date.now() - LIVE_RANKED_SIGNAL_STALE_MS;
     return persistedRankedSignals.filter((entry) => entry.foundAt >= cutoff);
   }, [isRealMode, persistedRankedSignals]);
+  const freshDisplayMarketPicks = React.useMemo(() => {
+    if (!isRealMode) return marketPicks;
+    const updatedAt = Number(scanSignalSummary.updatedAt || 0);
+    if (updatedAt <= 0) return [];
+    return Date.now() - updatedAt <= LIVE_RANKED_SIGNAL_STALE_MS ? marketPicks : [];
+  }, [isRealMode, marketPicks, scanSignalSummary.updatedAt]);
   const hasHiddenStaleRankedSignals = isRealMode
-    && marketPicks.length === 0
-    && persistedRankedSignals.length > freshPersistedRankedSignals.length;
+    && (marketPicks.length > freshDisplayMarketPicks.length || persistedRankedSignals.length > freshPersistedRankedSignals.length)
+    && freshDisplayMarketPicks.length === 0;
 
   const visibleSignalTableEntries = React.useMemo(() => {
     const latestFoundAt = scanSignalSummary.updatedAt || Date.now();
     const latestPickBySymbol = new Map(
-      marketPicks.map((pick) => [normalizeLiveFuturesSymbol(pick.symbol), pick]),
+      freshDisplayMarketPicks.map((pick) => [normalizeLiveFuturesSymbol(pick.symbol), pick]),
     );
 
     const mergedEntries = new Map<string, { pick: MarketScanResult; foundAt: number }>();
@@ -5328,8 +5334,8 @@ export default function App() {
       }
     };
 
-    if (marketPicks.length > 0) {
-      marketPicks
+    if (freshDisplayMarketPicks.length > 0) {
+      freshDisplayMarketPicks
         .slice()
         .sort((a, b) => compareTopSignalDisplayPriority(a, b))
         .slice(0, visibleSignalTableLimit)
@@ -5348,9 +5354,9 @@ export default function App() {
       .slice()
       .sort((a, b) => compareTopSignalDisplayPriority(a.pick, b.pick))
       .slice(0, visibleSignalTableLimit);
-  }, [freshPersistedRankedSignals, marketPicks, scanSignalSummary.updatedAt]);
+  }, [freshDisplayMarketPicks, freshPersistedRankedSignals, scanSignalSummary.updatedAt]);
   const visibleSignalTablePicks = visibleSignalTableEntries.map((entry) => entry.pick);
-  const usingPersistedRankedSignals = marketPicks.length === 0 && freshPersistedRankedSignals.length > 0;
+  const usingPersistedRankedSignals = freshDisplayMarketPicks.length === 0 && freshPersistedRankedSignals.length > 0;
   const getPickEligibility = React.useCallback((pick: MarketScanResult) => {
     const normalizedLiveExchange = String(serverConfig?.exchange || '').toLowerCase();
     const isLiveBinance = isRealMode && normalizedLiveExchange === 'binance';
