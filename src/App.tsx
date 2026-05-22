@@ -11,6 +11,7 @@ const STRATEGY_SIGNAL_INTERVAL = '1d';
 const SCAN_SHORTLIST_SAFE_CAP = 2000;
 const DEFAULT_BROAD_SCAN_LIMIT = 1500;
 const DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT = 'USDT,USDC,FDUSD,BUSD,TUSD';
+const LIVE_RANKED_SIGNAL_STALE_MS = 5 * 60 * 1000;
 const LIVE_CONTROL_TAB_KEY = 'te_live_controller_tab';
 const LIVE_CONTROL_FOCUS_REQUEST_KEY = 'te_live_controller_focus_request';
 const LIVE_CONTROL_CLOSE_OTHERS_KEY = 'te_live_close_other_tabs_request';
@@ -740,6 +741,7 @@ export default function App() {
 
   interface ExecuteTradeOptions {
     allowManualOverride?: boolean;
+    bypassDuplicateOrderLockout?: boolean;
   }
   
   interface PendingManualOverrideTrade {
@@ -2082,6 +2084,7 @@ export default function App() {
     const normalizedTradeSymbol = String(tradeSymbol || '').toUpperCase();
     const hasAllowedLiveQuote = liveQuoteAllowlist.some((quote: string) => normalizedTradeSymbol.endsWith(quote));
     const allowManualOverride = options?.allowManualOverride === true;
+    const bypassDuplicateOrderLockout = options?.bypassDuplicateOrderLockout === true;
     
     if (tradeSymbol.includes('undefined') || price <= 0) {
        addLog(`TRADE ABORTED: Invalid symbol or price [${tradeSymbol} @ ${price}]`, 'warning');
@@ -2155,7 +2158,7 @@ export default function App() {
     }
 
     const lockKey = `${type}_${tradeSymbol}_${targetId || 'all'}`;
-    if (tradeLockout.current.has(lockKey)) {
+    if (tradeLockout.current.has(lockKey) && !bypassDuplicateOrderLockout) {
       setExecutionFeedback({ type: 'warning', message: `${type} skipped for ${tradeSymbol}: duplicate order lockout.` });
       pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: Duplicate order lockout', status: 'SKIPPED', cycleId: eventCycleId });
       return;
@@ -4468,7 +4471,18 @@ export default function App() {
               const discoveryReason = pick.signal.overall === 'HOLD'
                 ? `AI HF ${entryType}: ${pick.signal.score}/10`
                 : `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`;
-              await executeTrade(side, pick.symbol, pick.lastPrice, discoveryReason, undefined, cycleId, pick.signal.tradePlan, undefined, getDirectionalEntryScore(side, pick.signal.score));
+              await executeTrade(
+                side,
+                pick.symbol,
+                pick.lastPrice,
+                discoveryReason,
+                undefined,
+                cycleId,
+                pick.signal.tradePlan,
+                undefined,
+                getDirectionalEntryScore(side, pick.signal.score),
+                { bypassDuplicateOrderLockout: true },
+              );
               if (!autoTradeRef.current || entryLockUntilRef.current > Date.now()) break;
               if (isRealMode) {
                 await new Promise(r => setTimeout(r, liveEntryDelayMs));
@@ -5291,6 +5305,15 @@ export default function App() {
     }
   }, [rejectReasonGroups, selectedRejectReason]);
 
+  const freshPersistedRankedSignals = React.useMemo(() => {
+    if (!isRealMode) return persistedRankedSignals;
+    const cutoff = Date.now() - LIVE_RANKED_SIGNAL_STALE_MS;
+    return persistedRankedSignals.filter((entry) => entry.foundAt >= cutoff);
+  }, [isRealMode, persistedRankedSignals]);
+  const hasHiddenStaleRankedSignals = isRealMode
+    && marketPicks.length === 0
+    && persistedRankedSignals.length > freshPersistedRankedSignals.length;
+
   const visibleSignalTableEntries = React.useMemo(() => {
     const latestFoundAt = scanSignalSummary.updatedAt || Date.now();
     const latestPickBySymbol = new Map(
@@ -5312,7 +5335,7 @@ export default function App() {
         .slice(0, visibleSignalTableLimit)
         .forEach((pick) => pushEntry(pick, latestFoundAt));
 
-      persistedRankedSignals.forEach((entry) => {
+      freshPersistedRankedSignals.forEach((entry) => {
         const latestPick = latestPickBySymbol.get(normalizeLiveFuturesSymbol(entry.pick.symbol));
         pushEntry(latestPick || entry.pick, latestPick ? latestFoundAt : entry.foundAt);
       });
@@ -5321,13 +5344,13 @@ export default function App() {
         .sort((a, b) => compareTopSignalDisplayPriority(a.pick, b.pick))
         .slice(0, visibleSignalTableLimit);
     }
-    return persistedRankedSignals
+    return freshPersistedRankedSignals
       .slice()
       .sort((a, b) => compareTopSignalDisplayPriority(a.pick, b.pick))
       .slice(0, visibleSignalTableLimit);
-  }, [marketPicks, persistedRankedSignals, scanSignalSummary.updatedAt]);
+  }, [freshPersistedRankedSignals, marketPicks, scanSignalSummary.updatedAt]);
   const visibleSignalTablePicks = visibleSignalTableEntries.map((entry) => entry.pick);
-  const usingPersistedRankedSignals = marketPicks.length === 0 && persistedRankedSignals.length > 0;
+  const usingPersistedRankedSignals = marketPicks.length === 0 && freshPersistedRankedSignals.length > 0;
   const getPickEligibility = React.useCallback((pick: MarketScanResult) => {
     const normalizedLiveExchange = String(serverConfig?.exchange || '').toLowerCase();
     const isLiveBinance = isRealMode && normalizedLiveExchange === 'binance';
@@ -5433,7 +5456,7 @@ export default function App() {
       return statuses;
     }
 
-    if (marketPicks.length === 0 && persistedRankedSignals.length > 0) {
+    if (marketPicks.length === 0 && freshPersistedRankedSignals.length > 0) {
       visibleSignalTablePicks.forEach((pick) => {
         const currentStatus = statuses[pick.symbol];
         if (currentStatus?.label === 'READY') {
@@ -5693,7 +5716,7 @@ export default function App() {
     entryLockUntil,
     autoTrade,
     marketPicks,
-    persistedRankedSignals.length,
+    freshPersistedRankedSignals.length,
     nearMissSignalThreshold,
     liveEntriesPerCycle,
     autoEntryMinScore,
@@ -6579,11 +6602,16 @@ export default function App() {
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <h3 className="font-mono text-[12px] uppercase tracking-[0.2em] opacity-75">Top Ranked Signals</h3>
-                <span className="text-[10px] font-mono uppercase opacity-50">{visibleSignalTablePicks.length} shown{usingPersistedRankedSignals ? ' | last non-empty' : ''}</span>
+                <span className="text-[10px] font-mono uppercase opacity-50">{visibleSignalTablePicks.length} shown{usingPersistedRankedSignals ? ' | last non-empty' : ''}{hasHiddenStaleRankedSignals ? ' | stale hidden' : ''}</span>
               </div>
               <p className="text-[9px] font-mono uppercase tracking-wide opacity-45 px-2">
                 Displaying strategy score, profitability rank, and when the signal was found.
               </p>
+              {hasHiddenStaleRankedSignals && (
+                <p className="px-2 text-[9px] font-mono uppercase tracking-wide text-amber-700/80">
+                  Stale cached ranked signals are hidden in live mode until a fresh non-empty scan completes.
+                </p>
+              )}
               <div className="grid grid-cols-6 items-center border-b pb-2 text-[10px] font-mono opacity-50 uppercase tracking-wide px-2">
                 <span>Asset</span>
                 <span className="text-center">Trend/RSI</span>
