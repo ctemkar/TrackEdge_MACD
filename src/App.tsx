@@ -113,8 +113,8 @@ const PARAMETER_DEFAULTS = {
 
 const NON_TRADABLE_QUOTE_BASES = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
 const LIVE_PORTFOLIO_GROSS_EXPOSURE_MULTIPLIER = 4.5;
-const LIVE_FREE_CAPITAL_RESERVE_RATIO = 0.18;
-const LIVE_FREE_CAPITAL_RESERVE_MIN_ORDERS = 3;
+const LIVE_FREE_CAPITAL_RESERVE_RATIO = 0.12;
+const LIVE_FREE_CAPITAL_RESERVE_MIN_ORDERS = 2;
 
 const getCompactUsdSymbolParts = (raw: string): { compact: string; base: string; quote: string } | null => {
   const compact = String(raw || '').toUpperCase().split(':')[0].replace('/', '');
@@ -4063,9 +4063,12 @@ export default function App() {
         })
         .map(({ side, pick }) => ({ side, pick }));
 
+      const allowHoldFallbackEntries = !isRealMode;
       const signalCandidates = primarySignalCandidates.length > 0
         ? primarySignalCandidates
-        : holdFallbackCandidates;
+        : allowHoldFallbackEntries
+          ? holdFallbackCandidates
+          : [];
 
       const MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE = 0;
       const relaxedAutoEntryMinScore = isRealMode ? Math.max(0, autoEntryMinScore - 0.8) : autoEntryMinScore;
@@ -4252,9 +4255,11 @@ export default function App() {
         const primaryEntries = primarySignalCandidates
           .filter(entry => !getEntryBlockReason(entry))
           .sort(compareExecutionPriority);
-        const eligibleHoldFallbackEntries = holdFallbackCandidates
-          .filter(entry => !getEntryBlockReason(entry))
-          .sort(compareExecutionPriority);
+        const eligibleHoldFallbackEntries = allowHoldFallbackEntries
+          ? holdFallbackCandidates
+            .filter(entry => !getEntryBlockReason(entry))
+            .sort(compareExecutionPriority)
+          : [];
         const mergedEntries = new Map<string, { side: 'BUY' | 'SELL'; pick: MarketScanResult }>();
         primaryEntries.forEach((entry) => {
           mergedEntries.set(`${entry.side}:${normalizeLiveFuturesSymbol(entry.pick.symbol)}`, entry);
@@ -4266,7 +4271,7 @@ export default function App() {
           }
         });
         const entries = Array.from(mergedEntries.values()).sort(compareExecutionPriority);
-        const usingHoldFallbackEntries = eligibleHoldFallbackEntries.length > 0 && entries.length > primaryEntries.length;
+        const usingHoldFallbackEntries = allowHoldFallbackEntries && eligibleHoldFallbackEntries.length > 0 && entries.length > primaryEntries.length;
         if (usingHoldFallbackEntries) {
           const fallbackCount = entries.length - primaryEntries.length;
           addLog(`HOLD FALLBACK: adding ${fallbackCount} near-miss HOLD setup${fallbackCount === 1 ? '' : 's'} to fill remaining entry capacity.`, 'info');
@@ -4275,7 +4280,7 @@ export default function App() {
         const eligibleSellCount = entries.filter(entry => entry.side === 'SELL').length;
         const baseAvailableSlots = Math.max(0, currentMaxTrades - currentHoldings.length);
         const boostedAvailableSlots = Math.max(0, (currentMaxTrades + STRONG_LIVE_SIGNAL_EXTRA_SLOTS) - currentHoldings.length);
-        const scanEntryCap = isRealMode ? Math.max(1, liveEntriesPerCycle) : boostedAvailableSlots;
+        const scanEntryCap = boostedAvailableSlots;
         const effectiveBaseAvailableSlots = Math.min(baseAvailableSlots, scanEntryCap);
         const effectiveBoostedAvailableSlots = Math.min(boostedAvailableSlots, scanEntryCap);
         const totalLiveCapacity = Math.max(1, currentHoldings.length + effectiveBoostedAvailableSlots);
@@ -4929,8 +4934,10 @@ export default function App() {
       .slice(0, 30);
   }, [liveAccountAudit]);
   const remainingLiveSlots = Math.max(0, maxConcurrentTrades - holdings.length);
+  const liveBufferedFreeMargin = getBufferedLiveCapital(exchangeFreeMargin);
+  const liveReserveTarget = getLiveCapitalReserveTarget(balance);
   const deployableLiveMargin = isRealMode
-    ? Math.max(0, Math.min(getBufferedLiveCapital(exchangeFreeMargin), remainingLiveSlots * Math.max(1, maxLiveOrderNotional)))
+    ? Math.max(0, Math.min(liveBufferedFreeMargin, remainingLiveSlots * Math.max(1, maxLiveOrderNotional)))
     : balance;
   const displayedAvailableFunds = exchangeFreeMargin;
   const grossInvestedCapital = holdings.reduce((total, holding) => total + getHoldingCommittedCapital(holding), 0);
@@ -5391,15 +5398,312 @@ export default function App() {
     }
 
     return {
-      label: 'ELIGIBLE',
-      detail: `${pick.signal.overall} ready`,
+      label: 'READY',
+      detail: `${pick.signal.overall} passed base checks`,
       className: 'bg-emerald-100 text-emerald-700',
     };
   }, [serverConfig?.exchange, isRealMode, liveQuoteAllowlist, fullUniverseMode, holdings, cooldowns, isUnsupportedLiveScanSymbol, autoEntryMinScore, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock]);
 
   const rankedSignalStatuses = React.useMemo(() => {
-    return Object.fromEntries(visibleSignalTablePicks.map((pick) => [pick.symbol, getPickEligibility(pick)]));
-  }, [visibleSignalTablePicks, getPickEligibility]);
+    const now = Date.now();
+    const normalizedLiveExchange = String(serverConfig?.exchange || '').toLowerCase();
+    const isLiveBinance = isRealMode && normalizedLiveExchange === 'binance';
+    const currentHoldings = holdings;
+    const currentMaxTrades = maxConcurrentTrades;
+    const entryLockActive = entryLockUntil > now;
+    const currentAutoTrade = autoTrade;
+    const liveTradableSymbols = liveTradableSymbolsRef.current;
+    const scanSourcePicks = marketPicks.length > 0 ? marketPicks : visibleSignalTablePicks;
+
+    const statuses = Object.fromEntries(
+      visibleSignalTablePicks.map((pick) => [pick.symbol, getPickEligibility(pick)]),
+    ) as Record<string, { label: string; detail: string; className: string }>;
+
+    if (!currentAutoTrade) {
+      visibleSignalTablePicks.forEach((pick) => {
+        const currentStatus = statuses[pick.symbol];
+        if (currentStatus?.label === 'READY') {
+          statuses[pick.symbol] = {
+            label: 'AUTO OFF',
+            detail: 'autonomous entry is disabled',
+            className: 'bg-slate-100 text-slate-700',
+          };
+        }
+      });
+      return statuses;
+    }
+
+    if (marketPicks.length === 0 && persistedRankedSignals.length > 0) {
+      visibleSignalTablePicks.forEach((pick) => {
+        const currentStatus = statuses[pick.symbol];
+        if (currentStatus?.label === 'READY') {
+          statuses[pick.symbol] = {
+            label: 'STALE',
+            detail: 'waiting for a fresh scan cycle',
+            className: 'bg-slate-100 text-slate-700',
+          };
+        }
+      });
+      return statuses;
+    }
+
+    if (entryLockActive) {
+      visibleSignalTablePicks.forEach((pick) => {
+        const currentStatus = statuses[pick.symbol];
+        if (currentStatus?.label === 'READY') {
+          const remainingSec = Math.max(1, Math.ceil((entryLockUntil - now) / 1000));
+          statuses[pick.symbol] = {
+            label: 'LOCKED',
+            detail: `entry lock active (${remainingSec}s remaining)`,
+            className: 'bg-amber-100 text-amber-700',
+          };
+        }
+      });
+      return statuses;
+    }
+
+    if (isLiveBinance && liveTradableSymbols.size === 0) {
+      visibleSignalTablePicks.forEach((pick) => {
+        const currentStatus = statuses[pick.symbol];
+        if (currentStatus?.label === 'READY') {
+          statuses[pick.symbol] = {
+            label: 'BLOCKED',
+            detail: 'Binance tradable metadata unavailable',
+            className: 'bg-rose-100 text-rose-700',
+          };
+        }
+      });
+      return statuses;
+    }
+
+    const allowHoldFallbackEntries = !isRealMode;
+    const primarySignalCandidates = scanSourcePicks
+      .filter((pick) => pick.signal.overall === 'BUY' || (isRealMode && pick.signal.overall === 'SELL'))
+      .map((pick) => ({ side: pick.signal.overall === 'SELL' ? 'SELL' as const : 'BUY' as const, pick }));
+
+    const holdFallbackCandidates = scanSourcePicks
+      .filter((pick) => pick.signal.overall === 'HOLD')
+      .map((pick) => ({
+        pick,
+        side: getHoldFallbackSide(pick.signal.score || 0),
+        signalDistance: getHoldSignalDistance(pick.signal.score || 0),
+      }))
+      .filter((entry) => entry.signalDistance <= nearMissSignalThreshold)
+      .filter((entry) => isRealMode || entry.side === 'BUY')
+      .sort((a, b) => {
+        if (a.signalDistance !== b.signalDistance) return a.signalDistance - b.signalDistance;
+        return compareExecutionPriority(a, b);
+      })
+      .map(({ side, pick }) => ({ side, pick }));
+
+    const primaryEntries = primarySignalCandidates
+      .filter((entry) => getPickEligibility(entry.pick).label === 'READY')
+      .sort(compareExecutionPriority);
+    const eligibleHoldFallbackEntries = allowHoldFallbackEntries
+      ? holdFallbackCandidates
+        .filter((entry) => getPickEligibility(entry.pick).label === 'READY')
+        .sort(compareExecutionPriority)
+      : [];
+
+    const mergedEntries = new Map<string, { side: 'BUY' | 'SELL'; pick: MarketScanResult }>();
+    primaryEntries.forEach((entry) => {
+      mergedEntries.set(`${entry.side}:${normalizeLiveFuturesSymbol(entry.pick.symbol)}`, entry);
+    });
+    eligibleHoldFallbackEntries.forEach((entry) => {
+      const key = `${entry.side}:${normalizeLiveFuturesSymbol(entry.pick.symbol)}`;
+      if (!mergedEntries.has(key)) {
+        mergedEntries.set(key, entry);
+      }
+    });
+    const entries = Array.from(mergedEntries.values()).sort(compareExecutionPriority);
+
+    const openSideCounts = currentHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
+      acc[holding.side === 'SHORT' ? 'SELL' : 'BUY'] += 1;
+      return acc;
+    }, { BUY: 0, SELL: 0 });
+    const openSideNotional = currentHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
+      const side = holding.side === 'SHORT' ? 'SELL' : 'BUY';
+      acc[side] += getHoldingActiveNotional(holding);
+      return acc;
+    }, { BUY: 0, SELL: 0 });
+    const totalOpenNotional = openSideNotional.BUY + openSideNotional.SELL;
+    const totalOpenPositions = currentHoldings.length;
+    const shortCountShare = totalOpenPositions > 0 ? openSideCounts.SELL / totalOpenPositions : 0;
+    const shortNotionalShare = totalOpenNotional > 0 ? openSideNotional.SELL / totalOpenNotional : 0;
+    const shortBookDominant = totalOpenPositions >= 4
+      && openSideCounts.SELL >= (openSideCounts.BUY + 3)
+      && (shortCountShare >= 0.75 || shortNotionalShare >= 0.75);
+
+    const baseAvailableSlots = Math.max(0, currentMaxTrades - currentHoldings.length);
+    const boostedAvailableSlots = Math.max(0, (currentMaxTrades + STRONG_LIVE_SIGNAL_EXTRA_SLOTS) - currentHoldings.length);
+    const scanEntryCap = boostedAvailableSlots;
+    const effectiveBaseAvailableSlots = Math.min(baseAvailableSlots, scanEntryCap);
+    const effectiveBoostedAvailableSlots = Math.min(boostedAvailableSlots, scanEntryCap);
+    const totalLiveCapacity = Math.max(1, currentHoldings.length + effectiveBoostedAvailableSlots);
+    const sideSelectionCap = effectiveBoostedAvailableSlots <= 1
+      ? 1
+      : Math.min(2, Math.max(1, Math.ceil(effectiveBoostedAvailableSlots * 0.5)));
+    const portfolioSideCap = totalLiveCapacity <= 2
+      ? 1
+      : Math.max(2, Math.ceil(totalLiveCapacity * 0.6));
+    const realTradableCapital = getBufferedLiveCapital(availableFunds);
+
+    if (isRealMode && realTradableCapital < liveMinOrderNotional) {
+      visibleSignalTablePicks.forEach((pick) => {
+        const currentStatus = statuses[pick.symbol];
+        if (currentStatus?.label === 'READY') {
+          statuses[pick.symbol] = {
+            label: 'BLOCKED',
+            detail: `free margin too low ($${realTradableCapital.toFixed(2)} < $${liveMinOrderNotional.toFixed(2)})`,
+            className: 'bg-rose-100 text-rose-700',
+          };
+        }
+      });
+      return statuses;
+    }
+
+    const selectedEntries = new Set<string>();
+    const deferredByKey = new Map<string, string>();
+    const selectedThisCycleBySide: Record<'BUY' | 'SELL', number> = { BUY: 0, SELL: 0 };
+    const selectedUnderlyingKeys = new Set<string>();
+    const selectedPortfolioBySide: Record<'BUY' | 'SELL', number> = {
+      BUY: openSideCounts.BUY,
+      SELL: openSideCounts.SELL,
+    };
+    const selectedCohorts = new Map<string, number>();
+    let queuedNotional = 0;
+    const maxLiveEntriesPerCohortPerCycle = 0;
+    const relaxedAutoEntryMinScore = isRealMode ? Math.max(0, autoEntryMinScore - 0.8) : autoEntryMinScore;
+
+    entries.forEach((entry) => {
+      const underlyingKey = getSymbolRiskIdentity(entry.pick.symbol).key;
+      const directionalScore = getDirectionalEntryScore(entry.side, entry.pick.signal.score);
+      const strongSignal = isStrongLiveSignal(directionalScore, relaxedAutoEntryMinScore);
+      const cohortKey = (() => {
+        const parts = getCompactUsdSymbolParts(entry.pick.symbol);
+        const quote = parts?.quote || 'OTHER';
+        const priceBucket = entry.pick.lastPrice < 0.01
+          ? 'MICRO'
+          : entry.pick.lastPrice < 0.1
+            ? 'LOW'
+            : entry.pick.lastPrice < 1
+              ? 'MID'
+              : 'HIGH';
+        const moveMagnitude = Math.abs(entry.pick.change24h || 0);
+        const moveBucket = moveMagnitude >= 8 ? 'EXPLOSIVE' : moveMagnitude >= 4 ? 'FAST' : 'NORMAL';
+        return `${entry.side}:${quote}:${entry.pick.signal.trend}:${priceBucket}:${moveBucket}`;
+      })();
+      const matchingHolding = currentHoldings.find((holding) => getSymbolRiskIdentity(holding.symbol).key === underlyingKey && holding.side === (entry.side === 'SELL' ? 'SHORT' : 'LONG'));
+      const desiredNotional = getDesiredLiveEntryNotional(directionalScore, realTradableCapital);
+      const currentHoldingNotional = matchingHolding ? getHoldingActiveNotional(matchingHolding, entry.pick.lastPrice) : 0;
+      const incrementalNotional = Math.max(0, desiredNotional - currentHoldingNotional);
+      const selectionKey = `${entry.side}:${normalizeLiveFuturesSymbol(entry.pick.symbol)}`;
+
+      if (selectedEntries.size >= effectiveBoostedAvailableSlots) {
+        deferredByKey.set(selectionKey, 'all live slots filled this cycle');
+        return;
+      }
+      if (selectedEntries.size >= effectiveBaseAvailableSlots && !strongSignal) {
+        deferredByKey.set(selectionKey, 'reserved extra slots for stronger setups');
+        return;
+      }
+      const capacityBlock = getLiveEntryCapacityBlock({
+        desiredNotional,
+        currentHoldingNotional,
+        bufferedCapital: realTradableCapital,
+        openHoldings: currentHoldings,
+        queuedNotional,
+      });
+      if (capacityBlock) {
+        deferredByKey.set(selectionKey, capacityBlock);
+        return;
+      }
+      if (selectedThisCycleBySide[entry.side] >= sideSelectionCap) {
+        deferredByKey.set(selectionKey, `same-side cap reached (${sideSelectionCap} ${entry.side.toLowerCase()}s this cycle)`);
+        return;
+      }
+      if (selectedUnderlyingKeys.has(underlyingKey)) {
+        deferredByKey.set(selectionKey, `underlying already selected this cycle (${underlyingKey})`);
+        return;
+      }
+      if (selectedPortfolioBySide[entry.side] >= portfolioSideCap) {
+        deferredByKey.set(selectionKey, `same-side portfolio cap reached (${portfolioSideCap} max ${entry.side.toLowerCase()}s open or queued)`);
+        return;
+      }
+      if (entry.side === 'SELL' && shortBookDominant) {
+        deferredByKey.set(selectionKey, `portfolio rebalance: short exposure already dominant (${openSideCounts.SELL} shorts vs ${openSideCounts.BUY} longs)`);
+        return;
+      }
+      if (maxLiveEntriesPerCohortPerCycle > 0 && (selectedCohorts.get(cohortKey) || 0) >= maxLiveEntriesPerCohortPerCycle) {
+        deferredByKey.set(selectionKey, 'correlation throttle: similar momentum cohort already selected');
+        return;
+      }
+
+      selectedEntries.add(selectionKey);
+      queuedNotional += incrementalNotional;
+      selectedUnderlyingKeys.add(underlyingKey);
+      selectedThisCycleBySide[entry.side] += 1;
+      selectedPortfolioBySide[entry.side] += 1;
+      selectedCohorts.set(cohortKey, (selectedCohorts.get(cohortKey) || 0) + 1);
+    });
+
+    visibleSignalTablePicks.forEach((pick) => {
+      const currentStatus = statuses[pick.symbol];
+      if (currentStatus?.label !== 'READY') return;
+      const side = pick.signal.overall === 'SELL' ? 'SELL' : 'BUY';
+      const selectionKey = `${side}:${normalizeLiveFuturesSymbol(pick.symbol)}`;
+      const duplicateLockKey = `${side}_${pick.symbol}_all`;
+
+      if (tradeLockout.current.has(duplicateLockKey)) {
+        statuses[pick.symbol] = {
+          label: 'LOCKOUT',
+          detail: `duplicate order lockout active (${duplicateOrderLockoutSec}s guard)` ,
+          className: 'bg-amber-100 text-amber-700',
+        };
+        return;
+      }
+
+      if (selectedEntries.has(selectionKey)) {
+        statuses[pick.symbol] = {
+          label: 'SELECTED',
+          detail: 'queued for this scan cycle',
+          className: 'bg-sky-100 text-sky-700',
+        };
+        return;
+      }
+
+      const deferredReason = deferredByKey.get(selectionKey);
+      if (deferredReason) {
+        statuses[pick.symbol] = {
+          label: 'DEFERRED',
+          detail: deferredReason,
+          className: 'bg-amber-100 text-amber-700',
+        };
+      }
+    });
+
+    return statuses;
+  }, [
+    visibleSignalTablePicks,
+    getPickEligibility,
+    serverConfig?.exchange,
+    isRealMode,
+    holdings,
+    maxConcurrentTrades,
+    entryLockUntil,
+    autoTrade,
+    marketPicks,
+    persistedRankedSignals.length,
+    nearMissSignalThreshold,
+    liveEntriesPerCycle,
+    autoEntryMinScore,
+    availableFunds,
+    liveMinOrderNotional,
+    getBufferedLiveCapital,
+    getDesiredLiveEntryNotional,
+    getHoldingActiveNotional,
+    getLiveEntryCapacityBlock,
+  ]);
 
   const visibleLiquidationReviewEntries = React.useMemo(() => {
     const now = Date.now();
@@ -6642,6 +6946,20 @@ export default function App() {
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Live Margin Buffer (%)" detail={CRITERIA_HELP.liveMarginBufferPct} />
                       <input type="number" min="0" max="50" step="0.5" value={liveMarginBufferPct} onChange={(e) => setLiveMarginBufferPct(Math.max(0, Math.min(50, parseFloat(e.target.value) || 0)))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
+                    <div className="col-span-2 rounded-sm border border-cyan-400/20 bg-cyan-400/5 px-3 py-3 text-[11px] font-mono text-cyan-100/85">
+                      <div className="flex flex-wrap items-center justify-between gap-2 uppercase tracking-wide">
+                        <span>Live Entry Headroom</span>
+                        <span>{isRealMode ? 'Real Futures' : 'Paper / Local'}</span>
+                      </div>
+                      <div className="mt-2 grid grid-cols-1 gap-1 text-[12px] text-white/85 md:grid-cols-3">
+                        <span>Exchange Free: ${exchangeFreeMargin.toFixed(2)}</span>
+                        <span>Buffered Free: ${liveBufferedFreeMargin.toFixed(2)}</span>
+                        <span>Reserve Floor: ${liveReserveTarget.toFixed(2)}</span>
+                      </div>
+                      <div className="mt-2 text-[10px] uppercase tracking-wide text-cyan-100/60">
+                        After each new entry, buffered free margin must stay above the reserve floor or the pick will show as deferred.
+                      </div>
+                    </div>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Hard Re-entry Cooldown (m)" detail={CRITERIA_HELP.hardReentryCooldownMinutes} />
                       <input type="number" min="1" step="1" value={hardReentryCooldownMinutes} onChange={(e) => setHardReentryCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
