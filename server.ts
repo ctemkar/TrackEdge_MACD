@@ -537,10 +537,13 @@ async function startServer() {
     tradeId: string;
   };
 
-  const fetchBinanceSignedJson = async (
+  type BinanceSignedMethod = 'GET' | 'POST' | 'DELETE';
+
+  const sendBinanceSignedRequest = async (
     apiKey: string,
     apiSecret: string,
     endpoints: BinanceSignedEndpoint[],
+    method: BinanceSignedMethod,
     params: Record<string, string>,
   ) => {
     let lastMessage = 'unknown Binance signed request error';
@@ -553,12 +556,19 @@ async function startServer() {
           recvWindow: params.recvWindow || '5000',
         }, { forceTimeSync: requestAttempt > 0 });
 
-        const response = await fetch(`${candidate.baseUrl}${candidate.endpoint}?${queryString}&signature=${signature}`, {
-          headers: {
-            'X-MBX-APIKEY': apiKey,
-            'Content-Type': 'application/json',
-          },
-        });
+        const signedPayload = `${queryString}&signature=${signature}`;
+        const isBodyMethod = method === 'POST';
+        const response = await fetch(
+          isBodyMethod ? `${candidate.baseUrl}${candidate.endpoint}` : `${candidate.baseUrl}${candidate.endpoint}?${signedPayload}`,
+          {
+            method,
+            headers: {
+              'X-MBX-APIKEY': apiKey,
+              'Content-Type': isBodyMethod ? 'application/x-www-form-urlencoded' : 'application/json',
+            },
+            body: isBodyMethod ? signedPayload : undefined,
+          }
+        );
 
         const text = await response.text();
         let parsed: any = null;
@@ -590,6 +600,15 @@ async function startServer() {
     const error: any = new Error(lastMessage);
     error.authError = sawAuthError;
     throw error;
+  };
+
+  const fetchBinanceSignedJson = async (
+    apiKey: string,
+    apiSecret: string,
+    endpoints: BinanceSignedEndpoint[],
+    params: Record<string, string>,
+  ) => {
+    return await sendBinanceSignedRequest(apiKey, apiSecret, endpoints, 'GET', params);
   };
 
   const fetchBinanceAccountAuditViaHttp = async (
@@ -2337,6 +2356,139 @@ async function startServer() {
       }
       console.error(`[TradeEdge ERROR] Order Failed: ${error.message}`);
       res.status(500).json({ status: 'error', message: error.message });
+    }
+  });
+
+  app.post('/api/binance/protection', async (req, res) => {
+    try {
+      if (process.env.ENABLE_REAL_TRADING !== 'true') {
+        throw new Error('REAL TRADING DISABLED: Set ENABLE_REAL_TRADING=true.');
+      }
+
+      const action = String(req.body?.action || 'ensure').toLowerCase();
+      const symbol = String(req.body?.symbol || '').toUpperCase().replace('/', '').replace(':', '');
+      const requestedPositionSide = String(req.body?.positionSide || '').toUpperCase();
+      const stopPriceInput = Number(req.body?.stopPrice);
+      const takeProfitPriceInput = Number(req.body?.takeProfitPrice);
+
+      if (!symbol) {
+        throw new Error('Protection request requires a symbol.');
+      }
+      if (isNonTradableQuoteBaseSymbol(symbol)) {
+        throw new Error(`UNSUPPORTED MARKET: ${symbol} is not a tradable futures symbol.`);
+      }
+
+      const preferredBinance = getPreferredBinanceCredentials();
+      const apiKey = preferredBinance.key;
+      const apiSecret = preferredBinance.secret;
+      if (!apiKey || !apiSecret) {
+        throw new Error('Binance API keys unavailable for protection orders.');
+      }
+
+      const client = getExchange();
+      await client.loadMarkets();
+      const byId = (client as any).markets_by_id || {};
+      const candidates = byId[symbol] ? (Array.isArray(byId[symbol]) ? byId[symbol] : [byId[symbol]]) : [];
+      const allowedQuotes = new Set(liveFuturesQuoteAllowlist);
+      const filteredCandidates = candidates.filter((m: any) => {
+        const quote = String(m?.quote || '').toUpperCase();
+        const isContract = m?.contract || m?.swap || m?.future || m?.type === 'swap';
+        return isContract && allowedQuotes.has(quote) && m?.active !== false;
+      });
+      const resolvedMarket = filteredCandidates[0] || candidates.find((m: any) => m?.contract && m?.active !== false) || null;
+      if (!resolvedMarket?.symbol) {
+        throw new Error(`UNSUPPORTED MARKET: ${symbol} not tradable on configured Binance futures quotes.`);
+      }
+
+      const ccxtSymbol = String(resolvedMarket.symbol);
+      const normalizeStopPrice = (value: number) => {
+        if (!Number.isFinite(value) || value <= 0) return null;
+        try {
+          const precise = Number(client.priceToPrecision(ccxtSymbol, value));
+          return Number.isFinite(precise) && precise > 0 ? precise : value;
+        } catch {
+          return value;
+        }
+      };
+
+      const orderEndpoints: BinanceSignedEndpoint[] = [
+        { label: 'FAPI', baseUrl: 'https://fapi.binance.com', endpoint: '/fapi/v1/order' },
+        { label: 'PAPI UM', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/order' },
+      ];
+      const openOrderEndpoints: BinanceSignedEndpoint[] = [
+        { label: 'FAPI', baseUrl: 'https://fapi.binance.com', endpoint: '/fapi/v1/openOrders' },
+        { label: 'PAPI UM', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/openOrders' },
+      ];
+
+      const listed = await sendBinanceSignedRequest(apiKey, apiSecret, openOrderEndpoints, 'GET', { symbol, recvWindow: '5000' });
+      const existingOrders = Array.isArray(listed?.data) ? listed.data : [];
+      const protectiveOrders = existingOrders.filter((order: any) => {
+        const type = String(order?.type || order?.origType || '').toUpperCase();
+        const closePosition = String(order?.closePosition || '').toLowerCase() === 'true';
+        const reduceOnly = String(order?.reduceOnly || '').toLowerCase() === 'true';
+        const positionSide = String(order?.positionSide || '').toUpperCase();
+        const sameSide = !requestedPositionSide || !positionSide || positionSide === requestedPositionSide || positionSide === 'BOTH';
+        return sameSide && (type === 'STOP_MARKET' || type === 'TAKE_PROFIT_MARKET') && (closePosition || reduceOnly);
+      });
+
+      const cancelled: Array<{ orderId: string; type: string }> = [];
+      for (const order of protectiveOrders) {
+        const orderId = String(order?.orderId || order?.clientOrderId || '');
+        if (!orderId) continue;
+        await sendBinanceSignedRequest(apiKey, apiSecret, orderEndpoints, 'DELETE', {
+          symbol,
+          orderId,
+          recvWindow: '5000',
+        });
+        cancelled.push({ orderId, type: String(order?.type || order?.origType || 'UNKNOWN') });
+      }
+
+      if (action === 'clear') {
+        return res.json({ status: 'success', action: 'clear', cancelled });
+      }
+
+      const positionSide = requestedPositionSide === 'LONG' || requestedPositionSide === 'SHORT' || requestedPositionSide === 'BOTH'
+        ? requestedPositionSide
+        : 'BOTH';
+      const closeSide = positionSide === 'SHORT' ? 'BUY' : 'SELL';
+      const stopPrice = normalizeStopPrice(stopPriceInput);
+      const takeProfitPrice = normalizeStopPrice(takeProfitPriceInput);
+      if (!stopPrice && !takeProfitPrice) {
+        return res.json({ status: 'success', action: 'ensure', cancelled, armed: [] });
+      }
+
+      const armed: Array<{ type: string; orderId: string; stopPrice: number }> = [];
+      const placeProtectionOrder = async (type: 'STOP_MARKET' | 'TAKE_PROFIT_MARKET', triggerPrice: number) => {
+        const params: Record<string, string> = {
+          symbol,
+          side: closeSide,
+          type,
+          stopPrice: String(triggerPrice),
+          closePosition: 'true',
+          workingType: 'MARK_PRICE',
+          priceProtect: 'true',
+          recvWindow: '5000',
+        };
+        if (positionSide) {
+          params.positionSide = positionSide;
+        }
+        const placed = await sendBinanceSignedRequest(apiKey, apiSecret, orderEndpoints, 'POST', params);
+        return placed?.data;
+      };
+
+      if (stopPrice) {
+        const placed = await placeProtectionOrder('STOP_MARKET', stopPrice);
+        armed.push({ type: 'STOP_MARKET', orderId: String(placed?.orderId || placed?.clientOrderId || ''), stopPrice });
+      }
+      if (takeProfitPrice) {
+        const placed = await placeProtectionOrder('TAKE_PROFIT_MARKET', takeProfitPrice);
+        armed.push({ type: 'TAKE_PROFIT_MARKET', orderId: String(placed?.orderId || placed?.clientOrderId || ''), stopPrice: takeProfitPrice });
+      }
+
+      res.json({ status: 'success', action: 'ensure', cancelled, armed });
+    } catch (error: any) {
+      console.error(`[TradeEdge ERROR] Protection Failed: ${error?.message || error}`);
+      res.status(500).json({ status: 'error', message: String(error?.message || 'Protection order failure') });
     }
   });
 

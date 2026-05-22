@@ -117,8 +117,6 @@ const PARAMETER_DEFAULTS = {
 
 const NON_TRADABLE_QUOTE_BASES = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
 const LIVE_PORTFOLIO_GROSS_EXPOSURE_MULTIPLIER = 4.5;
-const LIVE_FREE_CAPITAL_RESERVE_RATIO = 0.12;
-const LIVE_FREE_CAPITAL_RESERVE_MIN_ORDERS = 2;
 const COOLDOWNS_ENABLED = false;
 
 const getCompactUsdSymbolParts = (raw: string): { compact: string; base: string; quote: string } | null => {
@@ -684,6 +682,11 @@ export default function App() {
     tp2Price?: number;
     trailingStopPrice?: number;
     trailingBufferPct?: number;
+    protectionStatus?: 'PENDING' | 'ARMED' | 'ERROR';
+    protectionStopPrice?: number;
+    protectionTakeProfitPrice?: number;
+    protectionUpdatedAt?: number;
+    protectionError?: string;
     highestPrice?: number;
     lowestPrice?: number;
     time: string;
@@ -874,7 +877,7 @@ export default function App() {
     topExcluded: [] as ScanPreFilterEntry[],
   };
 
-  const SCAN_DIAGNOSTICS_SCHEMA_VERSION = 2;
+  const SCAN_DIAGNOSTICS_SCHEMA_VERSION = 5;
   const SCAN_DIAGNOSTICS_SCHEMA_KEY = 'te_scan_diagnostics_schema_version';
 
   const DEFAULT_SCAN_UNIVERSE_COUNTS = {
@@ -1015,16 +1018,24 @@ export default function App() {
   const tradeLockout = React.useRef<Set<string>>(new Set());
   const isSyncingRef = React.useRef(false);
   const loadingRef = React.useRef(loading);
+  const holdingPricesRef = React.useRef<Record<string, number>>({});
   const syncRealBalanceRef = React.useRef<() => Promise<boolean>>(async () => false);
   const pendingCloseSyncRef = React.useRef<Record<string, PendingCloseSyncConfirmation>>({});
   const scanningRef = React.useRef(false);
   const rateLimitedUntilRef = React.useRef(0);
+  const liveProtectionInflightRef = React.useRef<Record<string, number>>({});
+  const liveProtectionFailureNotifiedAtRef = React.useRef(0);
+  const liveConnectionFailSafeWarnedAtRef = React.useRef(0);
   const RATE_LIMIT_UNTIL_KEY = 'te_rate_limited_until';
   const knownUnsupportedLiveSymbols = React.useMemo(() => new Set(['NMRUSDC', 'KGSTUSDT']), []);
   const unsupportedScanSymbolsRef = React.useRef<Record<string, number>>({});
   const UNSUPPORTED_SCAN_SYMBOLS_KEY = 'te_unsupported_scan_symbols';
   const liveTradableSymbolsRef = React.useRef<Set<string>>(new Set());
   const liveTradableSymbolsFetchedAtRef = React.useRef(0);
+
+  React.useEffect(() => {
+    holdingPricesRef.current = holdingPrices;
+  }, [holdingPrices]);
 
   const isManualLiquidationReason = React.useCallback((reason: string | undefined) => {
     const normalizedReason = String(reason || '').toUpperCase();
@@ -1191,6 +1202,12 @@ export default function App() {
     setLiveControllerTabId((current) => (current === tabId ? '' : current));
   }, []);
 
+  const hasLiveExecutionControl = React.useCallback(() => {
+    if (!isRealMode) return true;
+    const controllerTabId = localStorage.getItem(LIVE_CONTROL_TAB_KEY) || liveControllerTabId;
+    return !controllerTabId || controllerTabId === appTabIdRef.current;
+  }, [isRealMode, liveControllerTabId]);
+
   const getHoldingActiveNotional = React.useCallback((
     holding: Pick<Holding, 'amount' | 'contracts' | 'notional' | 'markPrice' | 'entryPrice'> | undefined,
     fallbackPrice?: number,
@@ -1235,11 +1252,6 @@ export default function App() {
     return Math.max(maxLiveOrderNotional * 4, safeEquity * LIVE_PORTFOLIO_GROSS_EXPOSURE_MULTIPLIER);
   }, [maxLiveOrderNotional]);
 
-  const getLiveCapitalReserveTarget = React.useCallback((equity: number) => {
-    const safeEquity = Math.max(0, equity);
-    return Math.max(liveMinOrderNotional * LIVE_FREE_CAPITAL_RESERVE_MIN_ORDERS, safeEquity * LIVE_FREE_CAPITAL_RESERVE_RATIO);
-  }, [liveMinOrderNotional]);
-
   const getPortfolioGrossNotional = React.useCallback((activeHoldings: Array<Pick<Holding, 'amount' | 'contracts' | 'notional' | 'markPrice' | 'entryPrice'>>) => {
     return activeHoldings.reduce((sum, holding) => sum + getHoldingActiveNotional(holding), 0);
   }, [getHoldingActiveNotional]);
@@ -1247,13 +1259,11 @@ export default function App() {
   const getLiveEntryCapacityBlock = React.useCallback(({
     desiredNotional,
     currentHoldingNotional,
-    bufferedCapital,
     openHoldings,
     queuedNotional = 0,
   }: {
     desiredNotional: number;
     currentHoldingNotional: number;
-    bufferedCapital: number;
     openHoldings: Holding[];
     queuedNotional?: number;
   }) => {
@@ -1262,18 +1272,12 @@ export default function App() {
 
     const grossOpenNotional = getPortfolioGrossNotional(openHoldings);
     const exposureCap = getLivePortfolioExposureCap(balance);
-    const reserveTarget = getLiveCapitalReserveTarget(balance);
     const projectedGrossNotional = grossOpenNotional + queuedNotional + incrementalNotional;
-    const projectedBufferedCapital = Math.max(0, bufferedCapital - queuedNotional - incrementalNotional);
-
-    if (projectedBufferedCapital < reserveTarget) {
-      return `free-margin reserve lock (${projectedBufferedCapital.toFixed(2)} < ${reserveTarget.toFixed(2)} after entry)`;
-    }
     if (projectedGrossNotional > exposureCap) {
       return `gross exposure cap (${projectedGrossNotional.toFixed(2)} > ${exposureCap.toFixed(2)})`;
     }
     return null;
-  }, [balance, getLiveCapitalReserveTarget, getLivePortfolioExposureCap, getPortfolioGrossNotional]);
+  }, [balance, getLivePortfolioExposureCap, getPortfolioGrossNotional]);
 
   const getDesiredLiveEntryNotional = React.useCallback((confidenceScore: number | undefined, tradableCapital: number) => {
     const minLiveNotional = Math.max(1, liveMinOrderNotional);
@@ -1287,21 +1291,21 @@ export default function App() {
       ? (0.2 + (normalizedConfidence * 0.2))
       : (0.16 + (normalizedConfidence * 0.12));
     const proportionalTargetNotional = availableCapital * proportionalCapitalShare;
-    const cappedMaxLiveNotional = Math.min(
-      availableCapital,
-      Math.max(
-        minLiveNotional,
-        maxLiveOrderNotional,
-        proportionalTargetNotional,
-        maxLiveOrderNotional * (strongSignalSizing ? STRONG_LIVE_SIGNAL_NOTIONAL_MULTIPLIER : 1)
-      )
+    const maxSignalNotional = Math.max(
+      minLiveNotional,
+      maxLiveOrderNotional * (strongSignalSizing ? STRONG_LIVE_SIGNAL_NOTIONAL_MULTIPLIER : 1)
     );
-    let allocation = cappedMaxLiveNotional;
+    const cappedMaxLiveNotional = Math.min(availableCapital, maxSignalNotional);
+    const sizingTargetNotional = Math.min(
+      cappedMaxLiveNotional,
+      Math.max(minLiveNotional, proportionalTargetNotional)
+    );
+    let allocation = sizingTargetNotional;
 
     if (normalizedConfidence > 0) {
       const confidenceFloorAllocation = strongSignalSizing ? 0.7 : 0.55;
       const scaledConfidence = confidenceFloorAllocation + ((1 - confidenceFloorAllocation) * normalizedConfidence);
-      allocation = minLiveNotional + ((cappedMaxLiveNotional - minLiveNotional) * scaledConfidence);
+      allocation = minLiveNotional + ((sizingTargetNotional - minLiveNotional) * scaledConfidence);
     }
 
     allocation = Math.min(Math.max(minLiveNotional, allocation), cappedMaxLiveNotional);
@@ -1544,8 +1548,6 @@ export default function App() {
         setLiveControllerTabId(nextController);
         setShowLiveControlLockPrompt(false);
         if (nextController && nextController !== appTabIdRef.current && autoTradeRef.current) {
-          autoTradeRef.current = false;
-          setAutoTrade(false);
           setExecutionFeedback({ type: 'warning', message: 'Autonomous control moved to another tab. This tab is now read-only.' });
           addLog('AUTONOMOUS CONTROL TRANSFERRED: another tab is now the live controller.', 'warning');
         }
@@ -1569,8 +1571,6 @@ export default function App() {
         try {
           const payload = JSON.parse(event.newValue) as { requesterTabId?: string; requestedAt?: number };
           if (payload.requesterTabId && payload.requesterTabId !== appTabIdRef.current) {
-            autoTradeRef.current = false;
-            setAutoTrade(false);
             releaseLiveControl();
             setShowLiveControlLockPrompt(false);
             setExecutionFeedback({ type: 'warning', message: 'Another tab took live control and asked this tab to close.' });
@@ -1764,6 +1764,101 @@ export default function App() {
     setSyncError(null);
   }, [syncError]);
 
+  const clearExchangeProtection = React.useCallback(async (rawSymbol: string, positionSide?: 'LONG' | 'SHORT' | 'BOTH') => {
+    if (!isRealMode || String(serverConfig?.exchange || '').toLowerCase() !== 'binance') return false;
+    const symbol = normalizeLiveFuturesSymbol(rawSymbol);
+    if (!symbol) return false;
+
+    try {
+      const response = await fetch('/api/binance/protection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'clear',
+          symbol,
+          positionSide,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload?.status !== 'success') {
+        throw new Error(String(payload?.message || `Protection clear failed with ${response.status}`));
+      }
+      return true;
+    } catch (error: any) {
+      addLog(`PROTECTION CLEAR FAILED: ${symbol} ${String(error?.message || error)}`, 'warning');
+      return false;
+    }
+  }, [addLog, isRealMode, serverConfig?.exchange]);
+
+  const armExchangeProtection = React.useCallback(async (holding: Holding) => {
+    if (!isRealMode || String(serverConfig?.exchange || '').toLowerCase() !== 'binance') return false;
+    const symbol = normalizeLiveFuturesSymbol(holding.symbol);
+    const stopPrice = Number(holding.stopPrice || 0);
+    const takeProfitPrice = Number(holding.tp2Price || 0);
+    if (!symbol || (!Number.isFinite(stopPrice) && !Number.isFinite(takeProfitPrice))) return false;
+
+    const protectionKey = `${symbol}:${holding.side}`;
+    if (liveProtectionInflightRef.current[protectionKey]) return false;
+    liveProtectionInflightRef.current[protectionKey] = Date.now();
+
+    setHoldings(prev => prev.map(existing => existing.id === holding.id
+      ? {
+          ...existing,
+          protectionStatus: 'PENDING',
+          protectionUpdatedAt: Date.now(),
+          protectionError: undefined,
+        }
+      : existing));
+
+    try {
+      const response = await fetch('/api/binance/protection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'ensure',
+          symbol,
+          positionSide: holding.side,
+          stopPrice: Number.isFinite(stopPrice) && stopPrice > 0 ? stopPrice : undefined,
+          takeProfitPrice: Number.isFinite(takeProfitPrice) && takeProfitPrice > 0 ? takeProfitPrice : undefined,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload?.status !== 'success') {
+        throw new Error(String(payload?.message || `Protection arm failed with ${response.status}`));
+      }
+
+      setHoldings(prev => prev.map(existing => existing.id === holding.id
+        ? {
+            ...existing,
+            protectionStatus: 'ARMED',
+            protectionStopPrice: Number.isFinite(stopPrice) && stopPrice > 0 ? stopPrice : undefined,
+            protectionTakeProfitPrice: Number.isFinite(takeProfitPrice) && takeProfitPrice > 0 ? takeProfitPrice : undefined,
+            protectionUpdatedAt: Date.now(),
+            protectionError: undefined,
+          }
+        : existing));
+      return true;
+    } catch (error: any) {
+      const message = String(error?.message || 'Protection arm failed');
+      setHoldings(prev => prev.map(existing => existing.id === holding.id
+        ? {
+            ...existing,
+            protectionStatus: 'ERROR',
+            protectionError: message,
+            protectionUpdatedAt: Date.now(),
+          }
+        : existing));
+      const now = Date.now();
+      if (now - liveProtectionFailureNotifiedAtRef.current > 15000) {
+        liveProtectionFailureNotifiedAtRef.current = now;
+        addLog(`PROTECTION ARM FAILED: ${symbol} ${message}`, 'warning');
+      }
+      return false;
+    } finally {
+      delete liveProtectionInflightRef.current[protectionKey];
+    }
+  }, [addLog, isRealMode, serverConfig?.exchange]);
+
   const syncRealBalance = React.useCallback(async (options?: { ignoreEntryLock?: boolean }) => {
     const ignoreEntryLock = options?.ignoreEntryLock === true;
     if (isSyncingRef.current) return false;
@@ -1837,7 +1932,6 @@ export default function App() {
           message = authRetryAt
             ? `Live trading disabled until ${authRetryAt}`
             : `Live trading disabled until ${(new Date(authBlockedUntil || Date.now() + 60000)).toLocaleTimeString()}`;
-          setAutoTrade(false);
           setAuthDegradedMessage(message);
           if (hasAuthBlock) {
             setEntryLockUntil(authBlockedUntil);
@@ -1884,14 +1978,10 @@ export default function App() {
           ? (degradedMsg || 'Binance futures auth is degraded (-2015): API key, IP whitelist, or permissions are incomplete.')
           : null);
 
-        // Hard live safety: pause autonomous mode before scanner/order logic when buffered margin is below minimum order notional.
+        // Keep autonomous mode running here; narrower scan/entry checks already block undersized live orders.
         const bufferedAvailable = getBufferedLiveCapital(syncedAvailable);
         if (isRealMode && autoTradeRef.current && bufferedAvailable < liveMinOrderNotional) {
-          const lockMs = lowMarginLockMinutes * 60 * 1000;
-          autoTradeRef.current = false;
-          setAutoTrade(false);
-          setEntryLockUntil(prev => Math.max(prev, Date.now() + lockMs));
-          const lowMarginMsg = `AUTONOMOUS PAUSED: Free margin $${syncedAvailable.toFixed(2)} ($${bufferedAvailable.toFixed(2)} after ${liveMarginBufferPct.toFixed(1)}% buffer) below minimum order $${liveMinOrderNotional.toFixed(2)}.`;
+          const lowMarginMsg = `LIVE ENTRY MARGIN WARNING: Free margin $${syncedAvailable.toFixed(2)} ($${bufferedAvailable.toFixed(2)} after ${liveMarginBufferPct.toFixed(1)}% buffer) below minimum order $${liveMinOrderNotional.toFixed(2)}. Autonomous mode stays on; only undersized entries are skipped.`;
           addLog(lowMarginMsg, 'warning');
           setExecutionFeedback({ type: 'warning', message: lowMarginMsg });
         }
@@ -1961,6 +2051,11 @@ export default function App() {
               tp2Price: previousHolding?.tp2Price,
               trailingStopPrice: previousHolding?.trailingStopPrice,
               trailingBufferPct: previousHolding?.trailingBufferPct,
+              protectionStatus: previousHolding?.protectionStatus,
+              protectionStopPrice: previousHolding?.protectionStopPrice,
+              protectionTakeProfitPrice: previousHolding?.protectionTakeProfitPrice,
+              protectionUpdatedAt: previousHolding?.protectionUpdatedAt,
+              protectionError: previousHolding?.protectionError,
               highestPrice: previousHolding?.highestPrice,
               lowestPrice: previousHolding?.lowestPrice,
               time: new Date().toISOString()
@@ -2182,8 +2277,12 @@ export default function App() {
       pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: Duplicate order lockout', status: 'SKIPPED', cycleId: eventCycleId });
       return;
     }
-    tradeLockout.current.add(lockKey);
-    setTimeout(() => tradeLockout.current.delete(lockKey), duplicateOrderLockoutSec * 1000);
+
+    const armDuplicateOrderLockout = () => {
+      if (bypassDuplicateOrderLockout) return;
+      tradeLockout.current.add(lockKey);
+      setTimeout(() => tradeLockout.current.delete(lockKey), duplicateOrderLockoutSec * 1000);
+    };
 
     const retryLock = getEntryRetryLock(tradeSymbol);
     if (retryLock && !allowManualOverride) {
@@ -2197,6 +2296,7 @@ export default function App() {
 
 
     if (isRealMode) {
+      armDuplicateOrderLockout();
       setExecutionFeedback({ type: 'info', message: `Submitting ${type} ${tradeSymbol} at $${formatPrice(price)}...` });
       addLog(`EXECUTING REAL ${type}: ${tradeSymbol} @ $${price} [${reason}]`, 'info');
       let existingHolding = holdings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
@@ -2207,6 +2307,25 @@ export default function App() {
         (heldSide === 'LONG' && type === 'SELL') ||
         (heldSide === 'SHORT' && type === 'BUY')
       );
+
+      if ((type === 'BUY' || openingShort) && !closingExisting && serverStatus !== 'OK') {
+        const message = 'CONNECTION FAIL-SAFE: new live entries are blocked until connection health returns.';
+        if (!allowManualOverride) {
+          addLog(message, 'warning');
+          setExecutionFeedback({ type: 'warning', message });
+          pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${message}`, status: 'SKIPPED', cycleId: eventCycleId });
+          return;
+        }
+        addLog(`MANUAL OVERRIDE: ${tradeSymbol} bypassing connection fail-safe.`, 'warning');
+      }
+
+      if ((type === 'BUY' || openingShort) && !closingExisting && !hasLiveExecutionControl()) {
+        const message = 'LIVE CONTROL LOCK: another tab owns live execution. This tab remains read-only.';
+        addLog(message, 'warning');
+        setExecutionFeedback({ type: 'warning', message });
+        pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${message}`, status: 'SKIPPED', cycleId: eventCycleId });
+        return;
+      }
 
       const entryLockActive = entryLockUntilRef.current > Date.now();
       if ((type === 'BUY' || openingShort) && !closingExisting && entryLockActive) {
@@ -2387,7 +2506,7 @@ export default function App() {
         if (closingExisting) {
           amount = Math.min(heldAmount, requestedAmount && requestedAmount > 0 ? requestedAmount : heldAmount);
         } else if (type === 'BUY' || openingShort) {
-          const realFreeCapital = getBufferedLiveCapital(availableFunds);
+          const realFreeCapital = Math.max(0, availableFunds);
           const tradableCapital = isRealMode
             ? realFreeCapital
             : Math.max(0, balance);
@@ -2410,7 +2529,6 @@ export default function App() {
           const capacityBlock = getLiveEntryCapacityBlock({
             desiredNotional,
             currentHoldingNotional,
-            bufferedCapital: tradableCapital,
             openHoldings: holdingsRef.current,
           });
           if (capacityBlock) {
@@ -2571,6 +2689,7 @@ export default function App() {
             const basis = (existingHolding?.entryPrice || price) * Math.max(amount, 1e-12);
             const realizedPct = basis > 0 ? (realized / basis) * 100 : 0;
             applyOptimisticLiveFill(type, tradeSymbol, amount, price, time);
+            void clearExchangeProtection(tradeSymbol, heldSide === 'SHORT' ? 'SHORT' : 'LONG');
             pushTradeEvent({
               type,
               symbol: tradeSymbol,
@@ -2653,6 +2772,7 @@ export default function App() {
           if (closingExisting) {
             clearEntryLock();
             clearPendingCloseSync(tradeSymbol);
+            void clearExchangeProtection(tradeSymbol, heldSide === 'SHORT' ? 'SHORT' : 'LONG');
           }
           pushTradeEvent({
             type,
@@ -2713,15 +2833,13 @@ export default function App() {
         }
 
         if (isMarginOrFundsFailure || isAuthFailure) {
-          // Hard fail-safe: disable autonomous trading immediately on exchange-level hard failures.
-          autoTradeRef.current = false;
-          setAutoTrade(false);
+          // Keep autonomous mode running; lock entries instead of switching the system off.
           lockEntries(hardFailureLockMinutes * 60 * 1000, `Entry lock engaged after hard exchange failure (${isAuthFailure ? 'auth/permission' : 'margin'}).`);
           if (isAuthFailure) {
             setIsRealMode(false);
             addLog('LIVE MODE DISABLED: Exchange auth/permission failure detected.', 'warning');
           } else {
-            addLog('AUTONOMOUS PAUSED: Margin insufficient. Review leverage/available margin before retrying.', 'warning');
+            addLog('ENTRY LOCK ENGAGED: Margin insufficient. Review leverage/available margin before retrying.', 'warning');
           }
         }
 
@@ -2766,6 +2884,7 @@ export default function App() {
         if (serverConfig?.exchange === 'gemini') commission = 0.004; 
         if (useBNBFees && serverConfig?.exchange !== 'gemini') commission *= 0.75; 
 
+        armDuplicateOrderLockout();
         setBalance(prev => prev - allocation);
         setHoldings(prev => [...prev, {
           id: holdingId,
@@ -2861,7 +2980,7 @@ export default function App() {
         }
       }
     }
-  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, maxLiveOrderNotional, autoEntryMinScore, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes, hardReentryCooldownMinutes, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional, getBufferedLiveCapital, liveMarginBufferPct, getLiveEntryCapacityBlock, getEntryRetryLock, setEntryRetryLock, clearEntryRetryLock]);
+  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, maxLiveOrderNotional, autoEntryMinScore, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes, hardReentryCooldownMinutes, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional, getBufferedLiveCapital, liveMarginBufferPct, getLiveEntryCapacityBlock, getEntryRetryLock, setEntryRetryLock, clearEntryRetryLock, clearExchangeProtection, serverStatus]);
 
   const managePlannedExit = React.useCallback((holding: Holding, price: number, signal?: StrategySignal | null, cycleId?: number) => {
     const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
@@ -2902,6 +3021,12 @@ export default function App() {
     const histogramExpanding = holding.side === 'LONG'
       ? signal?.confluence.macdHistogram === 'BULLISH_ACCELERATION'
       : signal?.confluence.macdHistogram === 'BEARISH_ACCELERATION';
+    const macdFlippedAgainstPosition = holding.side === 'LONG'
+      ? signal?.confluence.macd === 'BEARISH'
+      : signal?.confluence.macd === 'BULLISH';
+    const macdExitSignalTriggered = holding.side === 'LONG'
+      ? signal?.exitSignal === 'EXIT_LONG'
+      : signal?.exitSignal === 'EXIT_SHORT';
     const momentumWeakening = holding.side === 'LONG'
       ? signal?.exitSignal === 'EXIT_LONG' || signal?.confluence.macdHistogram === 'BULLISH_FADE' || signal?.confluence.macd === 'BEARISH'
       : signal?.exitSignal === 'EXIT_SHORT' || signal?.confluence.macdHistogram === 'BEARISH_FADE' || signal?.confluence.macd === 'BULLISH';
@@ -2985,6 +3110,34 @@ export default function App() {
       return;
     }
 
+    if (macdExitSignalTriggered) {
+      executeTrade(
+        closeSide,
+        holding.symbol,
+        price,
+        `AUTO_EXIT: PRIMARY MACD EXIT SIGNAL ${signal?.exitSignal || 'EXIT'}`,
+        holding.id,
+        cycleId,
+        undefined,
+        holding.amount,
+      );
+      return;
+    }
+
+    if (macdFlippedAgainstPosition) {
+      executeTrade(
+        closeSide,
+        holding.symbol,
+        price,
+        `AUTO_EXIT: PRIMARY MACD FLIP ${signal?.confluence.macd || 'REVERSAL'}`,
+        holding.id,
+        cycleId,
+        undefined,
+        holding.amount,
+      );
+      return;
+    }
+
     if (technicalInvalidation) {
       executeTrade(
         closeSide,
@@ -3037,7 +3190,7 @@ export default function App() {
     }
 
     if (weaknessConfirmed) {
-      executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: MOMENTUM WEAKNESS CONFIRMED', holding.id, cycleId, undefined, holding.amount);
+      executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: MACD MOMENTUM WEAKNESS CONFIRMED', holding.id, cycleId, undefined, holding.amount);
     }
   }, [executeTrade, stopLossPercent, takeProfitPercent, holdingPollIntervalSec]);
 
@@ -3103,6 +3256,64 @@ export default function App() {
   useEffect(() => {
     checkServer();
   }, [checkServer]);
+
+  useEffect(() => {
+    const handleOffline = () => setServerStatus('ERROR');
+    const handleOnline = () => {
+      void checkServer();
+      if (isRealMode && holdings.length > 0) {
+        void syncRealBalanceRef.current();
+      }
+    };
+
+    window.addEventListener('offline', handleOffline);
+    window.addEventListener('online', handleOnline);
+    return () => {
+      window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('online', handleOnline);
+    };
+  }, [checkServer, holdings.length, isRealMode]);
+
+  useEffect(() => {
+    if (!isRealMode || holdings.length === 0 || serverStatus !== 'ERROR') return;
+    const now = Date.now();
+    if (now - liveConnectionFailSafeWarnedAtRef.current < 15000) return;
+    liveConnectionFailSafeWarnedAtRef.current = now;
+    const message = 'CONNECTION FAIL-SAFE: new live entries are blocked while connection health is degraded. Autonomous mode stays on and exchange-native protection remains the primary exit guard.';
+    reportSyncError(message);
+    setExecutionFeedback({ type: 'warning', message });
+    addLog(message, 'warning');
+  }, [addLog, holdings.length, isRealMode, reportSyncError, serverStatus]);
+
+  useEffect(() => {
+    if (!isRealMode || String(serverConfig?.exchange || '').toLowerCase() !== 'binance') return;
+    if (serverStatus !== 'OK' || holdings.length === 0) return;
+    const now = Date.now();
+
+    holdings.forEach((holding) => {
+      const symbolKey = normalizeLiveFuturesSymbol(holding.symbol);
+      if (!symbolKey || pendingCloseSyncRef.current[symbolKey]) return;
+
+      const stopPrice = Number(holding.stopPrice || 0);
+      const takeProfitPrice = Number(holding.tp2Price || 0);
+      const expectedStop = Number.isFinite(stopPrice) && stopPrice > 0 ? stopPrice : undefined;
+      const expectedTakeProfit = Number.isFinite(takeProfitPrice) && takeProfitPrice > 0 ? takeProfitPrice : undefined;
+      if (!expectedStop && !expectedTakeProfit) return;
+
+      if (holding.protectionStatus === 'PENDING') return;
+
+      const protectionMatchesStop = expectedStop === undefined || holding.protectionStopPrice === expectedStop;
+      const protectionMatchesTakeProfit = expectedTakeProfit === undefined || holding.protectionTakeProfitPrice === expectedTakeProfit;
+      if (holding.protectionStatus === 'ARMED' && protectionMatchesStop && protectionMatchesTakeProfit) return;
+
+      const lastProtectionUpdate = Number(holding.protectionUpdatedAt || 0);
+      if (holding.protectionStatus === 'ERROR' && lastProtectionUpdate > 0 && (now - lastProtectionUpdate) < 30000) {
+        return;
+      }
+
+      void armExchangeProtection(holding);
+    });
+  }, [armExchangeProtection, holdings, isRealMode, serverConfig?.exchange, serverStatus]);
 
   // Note: Automatic sync disabled to respect user instruction: "dont make the live futures active unless I tell you!!"
   // We only sync and activate real mode if the user explicitly clicks the "Live Futures" button.
@@ -3790,7 +4001,6 @@ export default function App() {
   // Market Scanner Logic
   const performScan = React.useCallback(async (manual = false) => {
     if (scanningRef.current) return;
-    if (!manual && !autoTradeRef.current) return;
     if (rateLimitedUntilRef.current > Date.now()) {
       setScanProgress({ current: 0, total: 0 });
       return;
@@ -3891,6 +4101,10 @@ export default function App() {
               preScanExcluded.push({ symbol: value, reason: `outside focused quote universe [${liveQuoteAllowlist.join(', ')}]` });
               return false;
             }
+            if (!isLiveTradableFuturesSymbol(value)) {
+              preScanExcluded.push({ symbol: value, reason: 'not in Binance futures tradable set' });
+              return false;
+            }
             return true;
           })
         : Array.from(new Set([baseSymbol, ...candidateValues]));
@@ -3963,7 +4177,7 @@ export default function App() {
           lastLoggedCount = safeCurrent;
         }
         },
-        () => rateLimitedUntilRef.current <= Date.now() && (manual || autoTradeRef.current),
+        () => rateLimitedUntilRef.current <= Date.now(),
         strategyConfig,
         {
           shortlistLimit,
@@ -4063,7 +4277,7 @@ export default function App() {
       );
       console.log(`[TradeEdge] ${scanSummary}`);
 
-      if ((!manual && !autoTradeRef.current) || rateLimitedUntilRef.current > Date.now()) {
+      if (rateLimitedUntilRef.current > Date.now()) {
         setScanProgress({ current: 0, total: 0 });
         return;
       }
@@ -4072,6 +4286,7 @@ export default function App() {
       setTimeout(() => setScanProgress({ current: 0, total: 0 }), 3000);
       
       const currentAutoTrade = autoTradeRef.current;
+      const currentExecutionEnabled = currentAutoTrade && hasLiveExecutionControl();
       const currentHoldings = holdingsRef.current;
       const currentMaxTrades = maxConcurrentTradesRef.current;
       const entryLockActive = entryLockUntilRef.current > Date.now();
@@ -4216,7 +4431,6 @@ export default function App() {
           const capacityBlock = getLiveEntryCapacityBlock({
             desiredNotional,
             currentHoldingNotional,
-            bufferedCapital: getBufferedLiveCapital(availableFunds),
             openHoldings: currentHoldings,
           });
           if (capacityBlock) {
@@ -4266,13 +4480,18 @@ export default function App() {
         topDeferred: [],
       });
 
-      if (currentAutoTrade && isRealMode && entryLockActive) {
+      if (currentAutoTrade && !currentExecutionEnabled) {
+        pushScanSkipEvent('SKIP: Another tab owns live execution control; this tab remains read-only.', cycleId);
+        return;
+      }
+
+      if (currentExecutionEnabled && isRealMode && entryLockActive) {
         const remainingSec = Math.max(1, Math.ceil((entryLockUntilRef.current - Date.now()) / 1000));
         pushScanSkipEvent(`SKIP: Entry lock active (${remainingSec}s remaining) after close-order failures`, cycleId);
         return;
       }
 
-      if (currentAutoTrade && currentHoldings.length > 0) {
+      if (currentExecutionEnabled && currentHoldings.length > 0) {
         currentHoldings.forEach(holding => {
           const scanResult = results.find(r => r.symbol === holding.symbol);
           if (scanResult) {
@@ -4281,7 +4500,7 @@ export default function App() {
         });
       }
 
-      if (currentAutoTrade) {
+      if (currentExecutionEnabled) {
         if (isLiveBinance && liveTradableSymbols.size === 0) {
           pushScanSkipEvent('SKIP: Binance futures tradable symbol set unavailable; blocking new live entries until metadata refresh succeeds.', cycleId);
           return;
@@ -4318,14 +4537,6 @@ export default function App() {
         const scanEntryCap = boostedAvailableSlots;
         const effectiveBaseAvailableSlots = Math.min(baseAvailableSlots, scanEntryCap);
         const effectiveBoostedAvailableSlots = Math.min(boostedAvailableSlots, scanEntryCap);
-        const totalLiveCapacity = Math.max(1, currentHoldings.length + effectiveBoostedAvailableSlots);
-        const sideSelectionCap = effectiveBoostedAvailableSlots <= 1
-          ? 1
-          : Math.min(2, Math.max(1, Math.ceil(effectiveBoostedAvailableSlots * 0.5)));
-        const portfolioSideCap = totalLiveCapacity <= 2
-          ? 1
-          : Math.max(2, Math.ceil(totalLiveCapacity * 0.6));
-
         if (effectiveBoostedAvailableSlots > 0) {
           const openSideCounts = currentHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
             acc[holding.side === 'SHORT' ? 'SELL' : 'BUY'] += 1;
@@ -4343,22 +4554,17 @@ export default function App() {
           const shortBookDominant = totalOpenPositions >= 4
             && openSideCounts.SELL >= (openSideCounts.BUY + 3)
             && (shortCountShare >= 0.75 || shortNotionalShare >= 0.75);
-          const realFreeCapital = getBufferedLiveCapital(availableFunds);
+          const realFreeCapital = Math.max(0, availableFunds);
           const realTradableCapital = realFreeCapital;
-          if (isRealMode && realTradableCapital < liveMinOrderNotional) {
+          if (isRealMode && realFreeCapital < liveMinOrderNotional) {
             const marginLockUntil = Date.now() + (lowMarginLockMinutes * 60 * 1000);
             setEntryLockUntil(prev => Math.max(prev, marginLockUntil));
-            pushScanSkipEvent(`SKIP: Free margin too low for minimum order ($${realFreeCapital.toFixed(2)} effective $${realTradableCapital.toFixed(2)} < $${liveMinOrderNotional.toFixed(2)})`, cycleId);
+            pushScanSkipEvent(`SKIP: Free margin too low for minimum order ($${realFreeCapital.toFixed(2)} < $${liveMinOrderNotional.toFixed(2)})`, cycleId);
             return;
           }
           const selectedTrades: typeof entries = [];
           const deferredTrades: ScanDeferredSignal[] = [];
-          const selectedThisCycleBySide: Record<'BUY' | 'SELL', number> = { BUY: 0, SELL: 0 };
           const selectedUnderlyingKeys = new Set<string>();
-          const selectedPortfolioBySide: Record<'BUY' | 'SELL', number> = {
-            BUY: openSideCounts.BUY,
-            SELL: openSideCounts.SELL,
-          };
           const selectedCohorts = new Map<string, number>();
           let queuedNotional = 0;
 
@@ -4395,7 +4601,6 @@ export default function App() {
             const capacityBlock = getLiveEntryCapacityBlock({
               desiredNotional,
               currentHoldingNotional,
-              bufferedCapital: realTradableCapital,
               openHoldings: currentHoldings,
               queuedNotional,
             });
@@ -4409,16 +4614,6 @@ export default function App() {
               });
               return;
             }
-            if (selectedThisCycleBySide[entry.side] >= sideSelectionCap) {
-              deferredTrades.push({
-                symbol: entry.pick.symbol,
-                side: entry.side,
-                score: entry.pick.signal.score,
-                priorityRank: entry.pick.priorityRank || 0,
-                reason: `same-side cap reached (${sideSelectionCap} ${entry.side.toLowerCase()}s this cycle)`,
-              });
-              return;
-            }
             if (selectedUnderlyingKeys.has(underlyingKey)) {
               deferredTrades.push({
                 symbol: entry.pick.symbol,
@@ -4426,16 +4621,6 @@ export default function App() {
                 score: entry.pick.signal.score,
                 priorityRank: entry.pick.priorityRank || 0,
                 reason: `underlying already selected this cycle (${underlyingKey})`,
-              });
-              return;
-            }
-            if (selectedPortfolioBySide[entry.side] >= portfolioSideCap) {
-              deferredTrades.push({
-                symbol: entry.pick.symbol,
-                side: entry.side,
-                score: entry.pick.signal.score,
-                priorityRank: entry.pick.priorityRank || 0,
-                reason: `same-side portfolio cap reached (${portfolioSideCap} max ${entry.side.toLowerCase()}s open or queued)`,
               });
               return;
             }
@@ -4463,8 +4648,6 @@ export default function App() {
             selectedTrades.push(entry);
             queuedNotional += incrementalNotional;
             selectedUnderlyingKeys.add(underlyingKey);
-            selectedThisCycleBySide[entry.side] += 1;
-            selectedPortfolioBySide[entry.side] += 1;
             selectedCohorts.set(cohortKey, (selectedCohorts.get(cohortKey) || 0) + 1);
           });
 
@@ -4474,10 +4657,10 @@ export default function App() {
           const coverageSummary = `coverage=${results.length}/${shortlistLimit}/${symbolsToScan.length}`;
           const exposureSummary = `openSides=BUY:${openSideCounts.BUY}|SELL:${openSideCounts.SELL}`;
           addLog(
-            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} portfolioSideCap=${portfolioSideCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`,
+            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`,
             selectedCount > 0 ? 'success' : 'info',
           );
-          updateLatestScanArchiveDecision(`SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} sideCap=${sideSelectionCap} portfolioSideCap=${portfolioSideCap} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`);
+          updateLatestScanArchiveDecision(`SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`);
           
           if (selectedTrades.length > 0 || deferredTrades.length > 0) {
             // Live mode safety: execute entries sequentially to avoid burst margin failures.
@@ -4569,9 +4752,7 @@ export default function App() {
   useEffect(() => {
     const initSymbols = async () => {
       if (serverStatus !== 'OK') return;
-      if (!autoTradeRef.current || rateLimitedUntilRef.current > Date.now()) {
-        setAvailableSymbols([]);
-        setScanUniverseCounts({ discovery: 0, liveTradableFutures: 0 });
+      if (rateLimitedUntilRef.current > Date.now()) {
         return;
       }
       try {
@@ -4647,16 +4828,13 @@ export default function App() {
     };
 
     loadData();
-    if (autoTradeRef.current) void performScanRef.current();
+    void performScanRef.current();
+    setNextScanSec(scanIntervalSec);
 
     const refreshInterval = setInterval(() => {
       loadData(true);
-      if (autoTradeRef.current) {
-        void performScanRef.current();
-        setNextScanSec(scanIntervalSec);
-      } else {
-        setNextScanSec(0);
-      }
+      void performScanRef.current();
+      setNextScanSec(scanIntervalSec);
     }, scanIntervalSec * 1000);
 
     const countdownInterval = setInterval(() => {
@@ -4679,51 +4857,50 @@ export default function App() {
     };
   }, [symbol, isRealMode, serverConfig?.exchange, serverStatus, scanIntervalSec]);
 
-  // Dedicated Portfolio Price Watcher (High Frequency)
+  // Dedicated Portfolio Price Watcher (WebSocket first, polling fallback inside subscribeToTicker)
   useEffect(() => {
     if (holdings.length === 0) return;
     if (serverStatus !== 'OK') return;
 
-    const pollHoldingPrices = async () => {
-      if (rateLimitedUntilRef.current > Date.now()) return;
-      const updates: Record<string, number> = {};
-      await Promise.all(holdings.map(async (h) => {
-        try {
-          const lastPrice = await fetchLatestPrice(h.symbol);
-          if (lastPrice) {
-            const prevPrice = holdingPrices[h.symbol] || h.entryPrice;
-            const now = Date.now();
-            const priorMove = recentHoldingMovesRef.current[h.symbol];
-            
-            const priceDelta = prevPrice > 1 ? Math.abs((lastPrice - prevPrice) / prevPrice) : 0;
-            
-            if (lastPrice > 0 && isFinite(lastPrice) && (priceDelta < 3.0 || prevPrice <= 1)) {
-                recentHoldingMovesRef.current[h.symbol] = {
-                  previousPrice: prevPrice,
-                  currentPrice: lastPrice,
-                  previousAt: priorMove?.updatedAt || (now - (Math.max(10, holdingPollIntervalSec) * 1000)),
-                  updatedAt: now,
-                };
-                updates[h.symbol] = lastPrice;
-            } else if (priceDelta >= 3.0) {
-                addLog(`DATA GUARD: Suppressed erratic move for ${h.symbol} ($${lastPrice} vs $${prevPrice})`, 'warning');
-            }
-          }
-        } catch (e) {
-          console.warn(`Failed to poll live price for ${h.symbol}`);
+    const unsubscribers = holdings.map((holding) => {
+      const applyPriceUpdate = (lastPrice: number) => {
+        if (!(lastPrice > 0) || !Number.isFinite(lastPrice)) return;
+        const prevPrice = holdingPricesRef.current[holding.symbol] || holding.entryPrice;
+        const now = Date.now();
+        const priorMove = recentHoldingMovesRef.current[holding.symbol];
+        const priceDelta = prevPrice > 1 ? Math.abs((lastPrice - prevPrice) / prevPrice) : 0;
+
+        if (priceDelta >= 3.0 && prevPrice > 1) {
+          addLog(`DATA GUARD: Suppressed erratic move for ${holding.symbol} ($${lastPrice} vs $${prevPrice})`, 'warning');
+          return;
         }
-      }));
-      
-      if (Object.keys(updates).length > 0) {
-        setHoldingPrices(prev => ({ ...prev, ...updates }));
-      }
+
+        recentHoldingMovesRef.current[holding.symbol] = {
+          previousPrice: prevPrice,
+          currentPrice: lastPrice,
+          previousAt: priorMove?.updatedAt || (now - (Math.max(10, holdingPollIntervalSec) * 1000)),
+          updatedAt: now,
+        };
+        setHoldingPrices(prev => ({ ...prev, [holding.symbol]: lastPrice }));
+      };
+
+      void fetchLatestPrice(holding.symbol).then((lastPrice) => {
+        if (lastPrice) {
+          applyPriceUpdate(lastPrice);
+        }
+      }).catch(() => {
+        console.warn(`Failed to seed live price for ${holding.symbol}`);
+      });
+
+      return subscribeToTicker(holding.symbol, applyPriceUpdate, {
+        preferWebSocket: isRealMode && String(serverConfig?.exchange || '').toLowerCase() === 'binance',
+      });
+    });
+
+    return () => {
+      unsubscribers.forEach((unsubscribe) => unsubscribe());
     };
-
-    const interval = setInterval(pollHoldingPrices, Math.max(10, holdingPollIntervalSec) * 1000);
-    pollHoldingPrices();
-
-    return () => clearInterval(interval);
-  }, [holdings, serverStatus, holdingPollIntervalSec]);
+  }, [addLog, holdingPollIntervalSec, holdings, isRealMode, serverConfig?.exchange, serverStatus]);
 
   useEffect(() => {
     if (holdings.length > 0) {
@@ -4945,9 +5122,6 @@ export default function App() {
     }
     accountLossGuardTriggerRef.current = triggerKey;
 
-    autoTradeRef.current = false;
-    setAutoTrade(false);
-
     const guardMessage = `ACCOUNT LOSS GUARD: Today's equity is down $${currentDailyEquityLoss.toFixed(2)} from the ${dailyEquityAnchorDate} open, breaching the $${guardLimit.toFixed(2)} daily cap. Flattening all live positions.`;
     addLog(guardMessage, 'warning');
     setExecutionFeedback({ type: 'warning', message: guardMessage });
@@ -4981,7 +5155,6 @@ export default function App() {
   }, [liveAccountAudit]);
   const remainingLiveSlots = Math.max(0, maxConcurrentTrades - holdings.length);
   const liveBufferedFreeMargin = getBufferedLiveCapital(exchangeFreeMargin);
-  const liveReserveTarget = getLiveCapitalReserveTarget(balance);
   const deployableLiveMargin = isRealMode
     ? Math.max(0, Math.min(liveBufferedFreeMargin, remainingLiveSlots * Math.max(1, maxLiveOrderNotional)))
     : balance;
@@ -5240,31 +5413,26 @@ export default function App() {
 
   const marketPickLifecycleSummary = React.useMemo(() => {
     let signalFound = 0;
-    let orderSubmitted = 0;
+    let awaitingConfirmation = 0;
     let exchangeConfirmed = 0;
+    let notEntered = 0;
 
     for (const pick of marketPicks) {
-      const symbolKey = String(pick.symbol || '').toUpperCase();
-      const symbolStatuses = tradeStatusesBySymbol.get(symbolKey);
       const lifecycle = getMarketPickLifecycle(pick);
-      const hasSubmittedOrder = Boolean(
-        symbolStatuses?.has('SUBMITTED') ||
-        symbolStatuses?.has('FILLED') ||
-        lifecycle.label === 'Order Submitted' ||
-        lifecycle.label === 'Exchange Confirmed'
-      );
       if (pick.signal.overall === 'BUY' || pick.signal.overall === 'SELL') signalFound += 1;
-      if (hasSubmittedOrder) orderSubmitted += 1;
-      if (lifecycle.label === 'Exchange Confirmed') exchangeConfirmed += 1;
+      if (lifecycle.label === 'Order Submitted') awaitingConfirmation += 1;
+      else if (lifecycle.label === 'Exchange Confirmed') exchangeConfirmed += 1;
+      else if (lifecycle.label === 'Signal Found') notEntered += 1;
     }
 
     return {
       signalFound,
-      orderSubmitted,
+      awaitingConfirmation,
       exchangeConfirmed,
+      notEntered,
       openPositions: holdings.length,
     };
-  }, [getMarketPickLifecycle, holdings.length, marketPicks, tradeStatusesBySymbol]);
+  }, [getMarketPickLifecycle, holdings.length, marketPicks]);
 
   const visibleTradeHistory = tradeHistory.filter(t => {
     // Hide SCAN skips
@@ -5358,19 +5526,12 @@ export default function App() {
   }, [rejectReasonGroups, selectedRejectReason]);
 
   const freshPersistedRankedSignals = React.useMemo(() => {
-    if (!isRealMode) return persistedRankedSignals;
-    const cutoff = Date.now() - LIVE_RANKED_SIGNAL_STALE_MS;
-    return persistedRankedSignals.filter((entry) => entry.foundAt >= cutoff);
-  }, [isRealMode, persistedRankedSignals]);
+    return persistedRankedSignals;
+  }, [persistedRankedSignals]);
   const freshDisplayMarketPicks = React.useMemo(() => {
-    if (!isRealMode) return marketPicks;
-    const updatedAt = Number(scanSignalSummary.updatedAt || 0);
-    if (updatedAt <= 0) return [];
-    return Date.now() - updatedAt <= LIVE_RANKED_SIGNAL_STALE_MS ? marketPicks : [];
-  }, [isRealMode, marketPicks, scanSignalSummary.updatedAt]);
-  const hasHiddenStaleRankedSignals = isRealMode
-    && (marketPicks.length > freshDisplayMarketPicks.length || persistedRankedSignals.length > freshPersistedRankedSignals.length)
-    && freshDisplayMarketPicks.length === 0;
+    return marketPicks;
+  }, [marketPicks]);
+  const hasHiddenStaleRankedSignals = false;
 
   const visibleSignalTableEntries = React.useMemo(() => {
     const latestFoundAt = scanSignalSummary.updatedAt || Date.now();
@@ -5623,14 +5784,7 @@ export default function App() {
     const scanEntryCap = boostedAvailableSlots;
     const effectiveBaseAvailableSlots = Math.min(baseAvailableSlots, scanEntryCap);
     const effectiveBoostedAvailableSlots = Math.min(boostedAvailableSlots, scanEntryCap);
-    const totalLiveCapacity = Math.max(1, currentHoldings.length + effectiveBoostedAvailableSlots);
-    const sideSelectionCap = effectiveBoostedAvailableSlots <= 1
-      ? 1
-      : Math.min(2, Math.max(1, Math.ceil(effectiveBoostedAvailableSlots * 0.5)));
-    const portfolioSideCap = totalLiveCapacity <= 2
-      ? 1
-      : Math.max(2, Math.ceil(totalLiveCapacity * 0.6));
-    const realTradableCapital = getBufferedLiveCapital(availableFunds);
+    const realTradableCapital = Math.max(0, availableFunds);
 
     if (isRealMode && realTradableCapital < liveMinOrderNotional) {
       visibleSignalTablePicks.forEach((pick) => {
@@ -5648,12 +5802,7 @@ export default function App() {
 
     const selectedEntries = new Set<string>();
     const deferredByKey = new Map<string, string>();
-    const selectedThisCycleBySide: Record<'BUY' | 'SELL', number> = { BUY: 0, SELL: 0 };
     const selectedUnderlyingKeys = new Set<string>();
-    const selectedPortfolioBySide: Record<'BUY' | 'SELL', number> = {
-      BUY: openSideCounts.BUY,
-      SELL: openSideCounts.SELL,
-    };
     const selectedCohorts = new Map<string, number>();
     let queuedNotional = 0;
     const maxLiveEntriesPerCohortPerCycle = 0;
@@ -5694,7 +5843,6 @@ export default function App() {
       const capacityBlock = getLiveEntryCapacityBlock({
         desiredNotional,
         currentHoldingNotional,
-        bufferedCapital: realTradableCapital,
         openHoldings: currentHoldings,
         queuedNotional,
       });
@@ -5702,16 +5850,8 @@ export default function App() {
         deferredByKey.set(selectionKey, capacityBlock);
         return;
       }
-      if (selectedThisCycleBySide[entry.side] >= sideSelectionCap) {
-        deferredByKey.set(selectionKey, `same-side cap reached (${sideSelectionCap} ${entry.side.toLowerCase()}s this cycle)`);
-        return;
-      }
       if (selectedUnderlyingKeys.has(underlyingKey)) {
         deferredByKey.set(selectionKey, `underlying already selected this cycle (${underlyingKey})`);
-        return;
-      }
-      if (selectedPortfolioBySide[entry.side] >= portfolioSideCap) {
-        deferredByKey.set(selectionKey, `same-side portfolio cap reached (${portfolioSideCap} max ${entry.side.toLowerCase()}s open or queued)`);
         return;
       }
       if (entry.side === 'SELL' && shortBookDominant) {
@@ -5726,8 +5866,6 @@ export default function App() {
       selectedEntries.add(selectionKey);
       queuedNotional += incrementalNotional;
       selectedUnderlyingKeys.add(underlyingKey);
-      selectedThisCycleBySide[entry.side] += 1;
-      selectedPortfolioBySide[entry.side] += 1;
       selectedCohorts.set(cohortKey, (selectedCohorts.get(cohortKey) || 0) + 1);
     });
 
@@ -6129,6 +6267,14 @@ export default function App() {
                 </div>
                 <button 
                   onClick={() => {
+                    if (isRealMode && isControlledByAnotherTab) {
+                      const message = 'AUTONOMOUS CONTROL LOCKED: another open tab owns live control. This tab is read-only.';
+                      setExecutionFeedback({ type: 'warning', message });
+                      setShowLiveControlLockPrompt(true);
+                      addLog(message, 'warning');
+                      return;
+                    }
+
                     if (!autoTrade && entryLockActive) {
                       const lockMessage = `AUTONOMOUS DISABLED BY SAFETY LOCK: retry in ~${entryLockRemainingSec}s.`;
                       setExecutionFeedback({ type: 'warning', message: lockMessage });
@@ -6156,7 +6302,7 @@ export default function App() {
                     addLog(`SYSTEM UPDATE: Autonomous Execution ${newState ? 'ENGAGED' : 'SUSPENDED'}`, newState ? 'success' : 'warning');
                   }}
                   title={autoTrade ? "Disable Auto-Trading" : "Enable Auto-Trading"}
-                  className={`w-9 h-4.5 rounded-full transition-all relative cursor-pointer ${autoTrade ? 'bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.4)]' : 'bg-gray-400 opacity-60'}`}
+                  className={`w-9 h-4.5 rounded-full transition-all relative ${isRealMode && isControlledByAnotherTab ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'} ${autoTrade ? 'bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.4)]' : 'bg-gray-400 opacity-60'}`}
                 >
                   <div className={`absolute top-0.5 w-3.5 h-3.5 bg-white rounded-full transition-all flex items-center justify-center ${autoTrade ? 'left-5' : 'left-0.5'}`}>
                     <div className={`w-1 h-1 rounded-full ${autoTrade ? 'bg-emerald-500' : 'bg-gray-300'}`} />
@@ -6335,16 +6481,16 @@ export default function App() {
                 <p className="font-black text-[14px] text-sky-700">{marketPickLifecycleSummary.signalFound}</p>
               </div>
               <div className="border border-amber-200 bg-amber-50/60 px-2 py-1">
-                <span className="opacity-50">Submitted</span>
-                <p className="font-black text-[14px] text-amber-700">{marketPickLifecycleSummary.orderSubmitted}</p>
+                <span className="opacity-50">Awaiting Confirm</span>
+                <p className="font-black text-[14px] text-amber-700">{marketPickLifecycleSummary.awaitingConfirmation}</p>
               </div>
               <div className="border border-emerald-200 bg-emerald-50/60 px-2 py-1">
                 <span className="opacity-50">Confirmed</span>
                 <p className="font-black text-[14px] text-emerald-700">{marketPickLifecycleSummary.exchangeConfirmed}</p>
               </div>
               <div className="border border-[#F27D26]/30 bg-[#F27D26]/10 px-2 py-1">
-                <span className="opacity-50">Open Positions</span>
-                <p className="font-black text-[14px] text-[#C85E13]">{marketPickLifecycleSummary.openPositions}</p>
+                <span className="opacity-50">Not Entered</span>
+                <p className="font-black text-[14px] text-[#C85E13]">{marketPickLifecycleSummary.notEntered}</p>
               </div>
             </div>
 
@@ -7111,10 +7257,10 @@ export default function App() {
                       <div className="mt-2 grid grid-cols-1 gap-1 text-[12px] text-white/85 md:grid-cols-3">
                         <span>Exchange Free: ${exchangeFreeMargin.toFixed(2)}</span>
                         <span>Buffered Free: ${liveBufferedFreeMargin.toFixed(2)}</span>
-                        <span>Reserve Floor: ${liveReserveTarget.toFixed(2)}</span>
+                        <span>Deployable: ${deployableLiveMargin.toFixed(2)}</span>
                       </div>
                       <div className="mt-2 text-[10px] uppercase tracking-wide text-cyan-100/60">
-                        After each new entry, buffered free margin must stay above the reserve floor or the pick will show as deferred.
+                        New entries use buffered free margin directly; picks are only deferred when buffered free margin would actually be exhausted.
                       </div>
                     </div>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Hard Re-entry Cooldown (m)" detail={CRITERIA_HELP.hardReentryCooldownMinutes} />
