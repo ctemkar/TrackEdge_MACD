@@ -10,6 +10,7 @@ import { BacktestModule } from './components/BacktestModule';
 const STRATEGY_SIGNAL_INTERVAL = '1d';
 const SCAN_SHORTLIST_SAFE_CAP = 2000;
 const DEFAULT_BROAD_SCAN_LIMIT = 1500;
+const LIVE_AUTO_SCAN_LIMIT = 180;
 const DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT = 'USDT,USDC,FDUSD,BUSD,TUSD';
 const LIVE_RANKED_SIGNAL_STALE_MS = 5 * 60 * 1000;
 const LIVE_CONTROL_TAB_KEY = 'te_live_controller_tab';
@@ -3920,9 +3921,12 @@ export default function App() {
       
       const totalToScan = symbolsToScan.length;
       setScanProgress({ current: 0, total: totalToScan });
+      const effectiveAutoScanLimit = isLiveBinance && !manual
+        ? Math.min(maxSymbolsPerScan, LIVE_AUTO_SCAN_LIMIT)
+        : maxSymbolsPerScan;
       const shortlistLimit = fullUniverseMode
         ? totalToScan
-        : Math.min(totalToScan, Math.max(prioritySymbols.length, maxSymbolsPerScan));
+        : Math.min(totalToScan, Math.max(prioritySymbols.length, effectiveAutoScanLimit));
       let selectionExcluded: ScanPreFilterEntry[] = [];
       let analyzedSymbols: string[] = [];
       let unavailableSummary = {
