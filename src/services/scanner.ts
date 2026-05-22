@@ -24,6 +24,7 @@ type ScanMarketOptions = {
   onRateLimit?: (retryAt: number) => void;
   batchSize?: number;
   interBatchDelayMs?: number;
+  onResultComputed?: (result: MarketScanResult) => void | Promise<void>;
   shortlistExclusionReason?: string;
   tickerStats?: ScanTickerStats;
   onSelectionComputed?: (summary: {
@@ -269,6 +270,12 @@ export async function scanMarket(
     });
 
     const batchResults = await Promise.all(batchPromises);
+    batchResults.forEach((result) => {
+      if (!result) return;
+      void Promise.resolve(options?.onResultComputed?.(result)).catch((error) => {
+        console.warn('[TradeEdge] onResultComputed callback failed:', error);
+      });
+    });
     results.push(...batchResults.filter((r): r is MarketScanResult => r !== null));
     if (!canContinue()) break;
     

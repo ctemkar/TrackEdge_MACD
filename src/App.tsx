@@ -36,7 +36,7 @@ const CRITERIA_HELP: Record<string, string> = {
   minEdgeAfterFrictionPct: 'Minimum expected take-profit edge left after estimated fees and slippage. Blocks live entries whose edge is too thin to justify friction.',
   estimatedRoundTripFrictionBps: 'Estimated round-trip fees plus slippage in basis points. Used to reject setups where expected edge is mostly consumed by execution costs.',
   symbolDailyLossLimit: 'Maximum realized loss per symbol per trading day before that symbol is disabled for the rest of the day.',
-  symbolDailyFlipLimit: 'Maximum number of realized round trips per symbol per trading day before the symbol is kill-switched until the next day.',
+  symbolDailyFlipLimit: 'Maximum number of losing round trips per symbol per trading day before the symbol is kill-switched until the next day.',
   accountDailyLossLimit: 'Maximum account-level equity loss allowed for the current local day before autonomous trading is disabled and all live positions are force-closed.',
   marginStopLossPct: 'Maximum loss allowed on a position as a percent of its margin before it is force-closed, even if the normal price stop has not been hit.',
   fastAdverseMoveExitPct: 'Maximum sudden adverse price move allowed between holding-price polls before a position is force-closed as a crash guard.',
@@ -269,6 +269,7 @@ type SymbolRiskSummary = {
   realizedPnlPct: number;
   entryNotional: number;
   closedTrades: number;
+  losingClosedTrades: number;
   lastExitAt: number;
   hardReentryUntil: number;
   lastExitReason: string | null;
@@ -877,7 +878,7 @@ export default function App() {
     topExcluded: [] as ScanPreFilterEntry[],
   };
 
-  const SCAN_DIAGNOSTICS_SCHEMA_VERSION = 5;
+  const SCAN_DIAGNOSTICS_SCHEMA_VERSION = 6;
   const SCAN_DIAGNOSTICS_SCHEMA_KEY = 'te_scan_diagnostics_schema_version';
 
   const DEFAULT_SCAN_UNIVERSE_COUNTS = {
@@ -1086,6 +1087,7 @@ export default function App() {
         realizedPnlPct: 0,
         entryNotional: 0,
         closedTrades: 0,
+        losingClosedTrades: 0,
         lastExitAt: 0,
         hardReentryUntil: 0,
         lastExitReason: null,
@@ -1113,6 +1115,9 @@ export default function App() {
       summary.realizedPnl += trade.pnl;
       summary.entryNotional += Math.max(0, Number(trade.entryPrice || trade.price || 0) * Math.abs(Number(trade.amount || 0)));
       summary.closedTrades += 1;
+      if (trade.pnl < 0) {
+        summary.losingClosedTrades += 1;
+      }
       if (tradeTs >= summary.lastExitAt) {
         summary.lastExitAt = tradeTs;
         summary.lastExitReason = String(trade.reason || '');
@@ -1129,9 +1134,6 @@ export default function App() {
       if (summary.realizedPnl <= -Math.abs(symbolDailyLossLimit)) {
         summary.dailyStopUntil = tradingDayEnd;
         summary.dailyStopReason = `kill switch: realized loss $${Math.abs(summary.realizedPnl).toFixed(2)} >= $${Math.abs(symbolDailyLossLimit).toFixed(2)}`;
-      } else if (summary.closedTrades >= Math.max(1, symbolDailyFlipLimit)) {
-        summary.dailyStopUntil = tradingDayEnd;
-        summary.dailyStopReason = `kill switch: ${summary.closedTrades} round trips >= ${Math.max(1, symbolDailyFlipLimit)} today`;
       }
     }
 
@@ -1144,10 +1146,8 @@ export default function App() {
     if (!summary) return null;
     if (summary.dailyStopUntil > at && summary.dailyStopReason) {
       const softenedDailyLossLimit = Math.abs(symbolDailyLossLimit) * 1.5;
-      const softenedDailyFlipLimit = Math.max(1, symbolDailyFlipLimit + 4);
       const hardDailyLossBreach = summary.realizedPnl <= -softenedDailyLossLimit;
-      const hardFlipBreach = summary.closedTrades >= softenedDailyFlipLimit;
-      if (!hardDailyLossBreach && !hardFlipBreach) {
+      if (!hardDailyLossBreach) {
         return null;
       }
       const hoursRemaining = Math.max(1, Math.ceil((summary.dailyStopUntil - at) / (60 * 60 * 1000)));
@@ -1373,6 +1373,7 @@ export default function App() {
   }, []);
 
   const privateSyncBlockedUntilRef = React.useRef(0);
+  const consecutiveEmptyPositionSyncsRef = React.useRef(0);
   const setPrivateSyncBlockedUntil = React.useCallback((until: number) => {
     privateSyncBlockedUntilRef.current = until > Date.now() ? until : 0;
   }, []);
@@ -2062,11 +2063,29 @@ export default function App() {
             };
           }).filter((h): h is Holding => h !== null);
 
-          setHoldings(freshHoldings);
-          console.log(`[TradeEdge SYNC] Frontend holdings updated: ${freshHoldings.length} positions ready for Active Positions Engine`);
-          if (freshHoldings.length > 0) {
-            console.log(`[TradeEdge SYNC] Holdings: ${freshHoldings.map(h => `${h.symbol}(${h.side})`).join(', ')}`);
+          const existingHoldings = holdingsRef.current;
+          const shouldPreserveExistingHoldings = isRealMode
+            && existingHoldings.length > 0
+            && freshHoldings.length === 0
+            && nextFilteredSyncSymbols.length === 0
+            && consecutiveEmptyPositionSyncsRef.current < 2;
+
+          if (shouldPreserveExistingHoldings) {
+            consecutiveEmptyPositionSyncsRef.current += 1;
+            freshHoldings = existingHoldings;
+            addLog(`SYNC WARNING: Binance returned an empty position snapshot while ${existingHoldings.length} live holding${existingHoldings.length === 1 ? '' : 's'} were already tracked. Preserving current positions until the exchange confirms the flat state.`, 'warning');
+          } else {
+            consecutiveEmptyPositionSyncsRef.current = freshHoldings.length === 0 ? consecutiveEmptyPositionSyncsRef.current : 0;
+            setHoldings(freshHoldings);
+            console.log(`[TradeEdge SYNC] Frontend holdings updated: ${freshHoldings.length} positions ready for Active Positions Engine`);
+            if (freshHoldings.length > 0) {
+              console.log(`[TradeEdge SYNC] Holdings: ${freshHoldings.map(h => `${h.symbol}(${h.side})`).join(', ')}`);
+            }
           }
+        }
+
+        if (freshHoldings.length > 0) {
+          consecutiveEmptyPositionSyncsRef.current = 0;
         }
 
         const syncUpdatedAt = Date.now();
@@ -2284,22 +2303,9 @@ export default function App() {
       setTimeout(() => tradeLockout.current.delete(lockKey), duplicateOrderLockoutSec * 1000);
     };
 
-    const retryLock = getEntryRetryLock(tradeSymbol);
-    if (retryLock && !allowManualOverride) {
-      const remainingSec = Math.max(1, Math.ceil((retryLock.until - Date.now()) / 1000));
-      const retryMsg = `retry lock active for ${remainingSec}s (${retryLock.reason})`;
-      addLog(`TRADE SKIPPED: ${tradeSymbol} ${retryMsg}.`, 'warning');
-      setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${retryMsg}.` });
-      pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${retryMsg}`, status: 'SKIPPED', cycleId: eventCycleId });
-      return;
-    }
-
-
     if (isRealMode) {
-      armDuplicateOrderLockout();
-      setExecutionFeedback({ type: 'info', message: `Submitting ${type} ${tradeSymbol} at $${formatPrice(price)}...` });
-      addLog(`EXECUTING REAL ${type}: ${tradeSymbol} @ $${price} [${reason}]`, 'info');
-      let existingHolding = holdings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
+      const latestHoldings = holdingsRef.current;
+      let existingHolding = latestHoldings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
       let heldAmount = existingHolding?.amount || 0;
       let heldSide = existingHolding?.side;
       let openingShort = type === 'SELL' && (!existingHolding || heldAmount <= 0);
@@ -2307,6 +2313,16 @@ export default function App() {
         (heldSide === 'LONG' && type === 'SELL') ||
         (heldSide === 'SHORT' && type === 'BUY')
       );
+
+      const retryLock = getEntryRetryLock(tradeSymbol);
+      if (retryLock && !allowManualOverride && !closingExisting) {
+        const remainingSec = Math.max(1, Math.ceil((retryLock.until - Date.now()) / 1000));
+        const retryMsg = `retry lock active for ${remainingSec}s (${retryLock.reason})`;
+        addLog(`TRADE SKIPPED: ${tradeSymbol} ${retryMsg}.`, 'warning');
+        setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${retryMsg}.` });
+        pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${retryMsg}`, status: 'SKIPPED', cycleId: eventCycleId });
+        return;
+      }
 
       if ((type === 'BUY' || openingShort) && !closingExisting && serverStatus !== 'OK') {
         const message = 'CONNECTION FAIL-SAFE: new live entries are blocked until connection health returns.';
@@ -2494,7 +2510,19 @@ export default function App() {
       let amount = 0;
 
       try {
-        existingHolding = holdings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
+        const latestHoldings = holdingsRef.current;
+        const normalizedTradeKey = normalizeLiveFuturesSymbol(tradeSymbol);
+        existingHolding = latestHoldings.find((h) => targetId ? h.id === targetId : false);
+        if (!existingHolding && normalizedTradeKey) {
+          const preferredClosingSide = type === 'SELL' ? 'LONG' : 'SHORT';
+          existingHolding = latestHoldings.find((h) => (
+            normalizeLiveFuturesSymbol(h.symbol) === normalizedTradeKey
+            && h.side === preferredClosingSide
+          ));
+        }
+        if (!existingHolding && normalizedTradeKey) {
+          existingHolding = latestHoldings.find((h) => normalizeLiveFuturesSymbol(h.symbol) === normalizedTradeKey);
+        }
         heldAmount = existingHolding?.amount || 0;
         heldSide = existingHolding?.side;
         openingShort = type === 'SELL' && (!existingHolding || heldAmount <= 0);
@@ -2572,6 +2600,9 @@ export default function App() {
 
         let result: any = null;
         const submitAttempts = closingExisting ? 3 : 1;
+        armDuplicateOrderLockout();
+        setExecutionFeedback({ type: 'info', message: `Submitting ${type} ${tradeSymbol} at $${formatPrice(price)}...` });
+        addLog(`EXECUTING REAL ${type}: ${tradeSymbol} @ $${price} [${reason}]`, 'info');
         for (let attempt = 1; attempt <= submitAttempts; attempt++) {
           result = await submitOrderOnce();
           if (result?.status === 'success') break;
@@ -3005,31 +3036,9 @@ export default function App() {
       ? (holding.entryPrice - price)
       : (price - holding.entryPrice)) * contracts;
     const currentMarginPnlPct = margin > 0 ? (currentUnrealizedPnl / margin) * 100 : 0;
-    const recentMove = recentHoldingMovesRef.current[holding.symbol];
-    const adverseMovePct = recentMove && recentMove.previousPrice > 0
-      ? (holding.side === 'LONG'
-          ? ((recentMove.previousPrice - recentMove.currentPrice) / recentMove.previousPrice) * 100
-          : ((recentMove.currentPrice - recentMove.previousPrice) / recentMove.previousPrice) * 100)
-      : 0;
-    const recentMoveWindowMs = recentMove ? Math.max(0, recentMove.updatedAt - recentMove.previousAt) : 0;
-    const fastAdverseMoveDetected = Boolean(
-      recentMove
-      && recentMoveWindowMs > 0
-      && recentMoveWindowMs <= (Math.max(10, holdingPollIntervalSec) * 2000)
-      && adverseMovePct >= fastAdverseMoveExitPct
-    );
     const histogramExpanding = holding.side === 'LONG'
       ? signal?.confluence.macdHistogram === 'BULLISH_ACCELERATION'
       : signal?.confluence.macdHistogram === 'BEARISH_ACCELERATION';
-    const macdFlippedAgainstPosition = holding.side === 'LONG'
-      ? signal?.confluence.macd === 'BEARISH'
-      : signal?.confluence.macd === 'BULLISH';
-    const macdExitSignalTriggered = holding.side === 'LONG'
-      ? signal?.exitSignal === 'EXIT_LONG'
-      : signal?.exitSignal === 'EXIT_SHORT';
-    const momentumWeakening = holding.side === 'LONG'
-      ? signal?.exitSignal === 'EXIT_LONG' || signal?.confluence.macdHistogram === 'BULLISH_FADE' || signal?.confluence.macd === 'BEARISH'
-      : signal?.exitSignal === 'EXIT_SHORT' || signal?.confluence.macdHistogram === 'BEARISH_FADE' || signal?.confluence.macd === 'BULLISH';
 
     setHoldings(prev => {
       let didChange = false;
@@ -3078,9 +3087,6 @@ export default function App() {
     const priceProfitTargetHit = holding.side === 'LONG' ? price >= tp2Price : price <= tp2Price;
     const hitTp1 = holding.side === 'LONG' ? price >= tp1Price : price <= tp1Price;
     const hitTp2 = holding.side === 'LONG' ? price >= tp2Price : price <= tp2Price;
-    const trailingStopPrice = holding.trailingStopPrice || stopPrice;
-    const trailingBroken = runnerStage && (holding.side === 'LONG' ? price <= trailingStopPrice : price >= trailingStopPrice);
-    const weaknessConfirmed = runnerStage && momentumWeakening && (holding.side === 'LONG' ? price < trailingStopPrice : price > trailingStopPrice);
 
     if (margin > 0 && currentMarginPnlPct <= -marginStopLossPct) {
       executeTrade(
@@ -3088,48 +3094,6 @@ export default function App() {
         holding.symbol,
         price,
         `AUTO_EXIT: MARGIN STOP ${currentMarginPnlPct.toFixed(2)}% <= -${marginStopLossPct.toFixed(2)}%`,
-        holding.id,
-        cycleId,
-        undefined,
-        holding.amount,
-      );
-      return;
-    }
-
-    if (fastAdverseMoveDetected) {
-      executeTrade(
-        closeSide,
-        holding.symbol,
-        price,
-        `AUTO_EXIT: FAST ADVERSE MOVE ${adverseMovePct.toFixed(2)}% in ${(recentMoveWindowMs / 1000).toFixed(0)}s`,
-        holding.id,
-        cycleId,
-        undefined,
-        holding.amount,
-      );
-      return;
-    }
-
-    if (macdExitSignalTriggered) {
-      executeTrade(
-        closeSide,
-        holding.symbol,
-        price,
-        `AUTO_EXIT: PRIMARY MACD EXIT SIGNAL ${signal?.exitSignal || 'EXIT'}`,
-        holding.id,
-        cycleId,
-        undefined,
-        holding.amount,
-      );
-      return;
-    }
-
-    if (macdFlippedAgainstPosition) {
-      executeTrade(
-        closeSide,
-        holding.symbol,
-        price,
-        `AUTO_EXIT: PRIMARY MACD FLIP ${signal?.confluence.macd || 'REVERSAL'}`,
         holding.id,
         cycleId,
         undefined,
@@ -3182,15 +3146,6 @@ export default function App() {
         executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: TP2 NO MOMENTUM EXPANSION', holding.id, cycleId, undefined, holding.amount);
       }
       return;
-    }
-
-    if (trailingBroken) {
-      executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: TRAILING STRUCTURE', holding.id, cycleId, undefined, holding.amount);
-      return;
-    }
-
-    if (weaknessConfirmed) {
-      executeTrade(closeSide, holding.symbol, price, 'AUTO_EXIT: MACD MOMENTUM WEAKNESS CONFIRMED', holding.id, cycleId, undefined, holding.amount);
     }
   }, [executeTrade, stopLossPercent, takeProfitPercent, holdingPollIntervalSec]);
 
@@ -4086,6 +4041,9 @@ export default function App() {
       const prioritySymbolSet = new Set(prioritySymbols.map(value => String(value || '').toUpperCase()));
       const candidateValues = isRealMode ? allValues.map(liveNormalized) : allValues;
       const isLiveTradableFuturesSymbol = (value: string) => liveTradableSymbols.has(normalizeLiveFuturesSymbol(value));
+      const streamLiveEntriesDuringScan = isRealMode;
+      const streamedLiveEntryKeys = new Set<string>();
+      let streamedLiveEntryQueue = Promise.resolve();
       const preScanExcluded: ScanPreFilterEntry[] = [];
       let symbolsToScan = isLiveBinance
         ? Array.from(new Set(candidateValues)).filter(value => {
@@ -4183,6 +4141,61 @@ export default function App() {
           shortlistLimit,
           prioritySymbols,
           tickerStats,
+          onResultComputed: (pick) => {
+            if (!streamLiveEntriesDuringScan) return;
+            if (currentScanCycleRef.current !== cycleId) return;
+            if (pick.signal.overall !== 'BUY' && pick.signal.overall !== 'SELL') return;
+
+            const side: 'BUY' | 'SELL' = pick.signal.overall === 'SELL' ? 'SELL' : 'BUY';
+            const selectionKey = `${side}:${normalizeLiveFuturesSymbol(pick.symbol)}`;
+            if (streamedLiveEntryKeys.has(selectionKey)) return;
+            streamedLiveEntryKeys.add(selectionKey);
+
+            streamedLiveEntryQueue = streamedLiveEntryQueue
+              .then(async () => {
+                if (currentScanCycleRef.current !== cycleId) return;
+                if (!autoTradeRef.current || !hasLiveExecutionControl()) return;
+                if (entryLockUntilRef.current > Date.now()) return;
+
+                if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
+                  pushScanSkipEvent(`SKIP: ${pick.symbol} blocked because quote assets are treated as cash, not tradable base positions`, cycleId);
+                  return;
+                }
+                if (isLiveBinance && !isLiveTradableFuturesSymbol(pick.symbol)) {
+                  pushScanSkipEvent(`SKIP: ${pick.symbol} not present in Binance futures tradable symbol set`, cycleId);
+                  return;
+                }
+                if (isLiveBinance && isUnsupportedLiveScanSymbol(pick.symbol)) {
+                  pushScanSkipEvent(`SKIP: ${pick.symbol} blocked by unsupported market quarantine`, cycleId);
+                  return;
+                }
+
+                const entryType = side === 'BUY' ? 'LONG' : 'SHORT';
+                const discoveryReason = pick.signal.overall === 'HOLD'
+                  ? `AI HF ${entryType}: ${pick.signal.score}/10`
+                  : `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`;
+
+                await executeTrade(
+                  side,
+                  pick.symbol,
+                  pick.lastPrice,
+                  discoveryReason,
+                  undefined,
+                  cycleId,
+                  pick.signal.tradePlan,
+                  undefined,
+                  getDirectionalEntryScore(side, pick.signal.score),
+                  { bypassDuplicateOrderLockout: true },
+                );
+
+                if (autoTradeRef.current && entryLockUntilRef.current <= Date.now() && liveEntryDelayMs > 0) {
+                  await new Promise((resolve) => setTimeout(resolve, liveEntryDelayMs));
+                }
+              })
+              .catch((error) => {
+                console.error('[TradeEdge] Immediate live entry attempt failed:', error);
+              });
+          },
           shortlistExclusionReason: selectionExclusionReason,
           onSelectionComputed: (summary) => {
             analyzedSymbols = summary.analyzedSymbols;
@@ -4201,6 +4214,7 @@ export default function App() {
           },
         },
       );
+      await streamedLiveEntryQueue;
       const combinedPreScanExcluded = [...preScanExcluded, ...selectionExcluded];
       setScanPreFilterSummary({
         updatedAt: Date.now(),
@@ -4564,15 +4578,12 @@ export default function App() {
           }
           const selectedTrades: typeof entries = [];
           const deferredTrades: ScanDeferredSignal[] = [];
-          const selectedUnderlyingKeys = new Set<string>();
-          const selectedCohorts = new Map<string, number>();
           let queuedNotional = 0;
 
           entries.forEach((entry) => {
             const underlyingKey = getSymbolRiskIdentity(entry.pick.symbol).key;
             const directionalScore = getDirectionalEntryScore(entry.side, entry.pick.signal.score);
             const strongSignal = isStrongLiveSignal(directionalScore, relaxedAutoEntryMinScore);
-            const cohortKey = getEntryCohortKey(entry);
             const matchingHolding = currentHoldings.find((h) => getSymbolRiskIdentity(h.symbol).key === underlyingKey && h.side === (entry.side === 'SELL' ? 'SHORT' : 'LONG'));
             const desiredNotional = getDesiredLiveEntryNotional(directionalScore, realTradableCapital);
             const currentHoldingNotional = matchingHolding ? getHoldingActiveNotional(matchingHolding, entry.pick.lastPrice) : 0;
@@ -4585,16 +4596,6 @@ export default function App() {
                 score: entry.pick.signal.score,
                 priorityRank: entry.pick.priorityRank || 0,
                 reason: 'all live slots filled this cycle',
-              });
-              return;
-            }
-            if (selectedTrades.length >= effectiveBaseAvailableSlots && !strongSignal) {
-              deferredTrades.push({
-                symbol: entry.pick.symbol,
-                side: entry.side,
-                score: entry.pick.signal.score,
-                priorityRank: entry.pick.priorityRank || 0,
-                reason: 'reserved extra slots for stronger setups',
               });
               return;
             }
@@ -4614,41 +4615,9 @@ export default function App() {
               });
               return;
             }
-            if (selectedUnderlyingKeys.has(underlyingKey)) {
-              deferredTrades.push({
-                symbol: entry.pick.symbol,
-                side: entry.side,
-                score: entry.pick.signal.score,
-                priorityRank: entry.pick.priorityRank || 0,
-                reason: `underlying already selected this cycle (${underlyingKey})`,
-              });
-              return;
-            }
-            if (entry.side === 'SELL' && shortBookDominant) {
-              deferredTrades.push({
-                symbol: entry.pick.symbol,
-                side: entry.side,
-                score: entry.pick.signal.score,
-                priorityRank: entry.pick.priorityRank || 0,
-                reason: `portfolio rebalance: short exposure already dominant (${openSideCounts.SELL} shorts vs ${openSideCounts.BUY} longs, ${(shortCountShare * 100).toFixed(0)}% count share)`,
-              });
-              return;
-            }
-            if (MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 && (selectedCohorts.get(cohortKey) || 0) >= MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE) {
-              deferredTrades.push({
-                symbol: entry.pick.symbol,
-                side: entry.side,
-                score: entry.pick.signal.score,
-                priorityRank: entry.pick.priorityRank || 0,
-                reason: 'correlation throttle: similar momentum cohort already selected',
-              });
-              return;
-            }
 
             selectedTrades.push(entry);
             queuedNotional += incrementalNotional;
-            selectedUnderlyingKeys.add(underlyingKey);
-            selectedCohorts.set(cohortKey, (selectedCohorts.get(cohortKey) || 0) + 1);
           });
 
           const selectedCount = selectedTrades.length;
@@ -4669,38 +4638,40 @@ export default function App() {
               deferredSignals: deferredTrades.length,
               topDeferred: deferredTrades.slice(0, 6),
             });
-            for (const { side, pick } of selectedTrades) {
-              if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
-                pushScanSkipEvent(`SKIP: ${pick.symbol} blocked because quote assets are treated as cash, not tradable base positions`, cycleId);
-                continue;
-              }
-              if (isLiveBinance && !isLiveTradableFuturesSymbol(pick.symbol)) {
-                pushScanSkipEvent(`SKIP: ${pick.symbol} not present in Binance futures tradable symbol set`, cycleId);
-                continue;
-              }
-              if (isLiveBinance && isUnsupportedLiveScanSymbol(pick.symbol)) {
-                pushScanSkipEvent(`SKIP: ${pick.symbol} blocked by unsupported market quarantine`, cycleId);
-                continue;
-              }
-              const entryType = side === 'BUY' ? 'LONG' : 'SHORT';
-              const discoveryReason = pick.signal.overall === 'HOLD'
-                ? `AI HF ${entryType}: ${pick.signal.score}/10`
-                : `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`;
-              await executeTrade(
-                side,
-                pick.symbol,
-                pick.lastPrice,
-                discoveryReason,
-                undefined,
-                cycleId,
-                pick.signal.tradePlan,
-                undefined,
-                getDirectionalEntryScore(side, pick.signal.score),
-                { bypassDuplicateOrderLockout: true },
-              );
-              if (!autoTradeRef.current || entryLockUntilRef.current > Date.now()) break;
-              if (isRealMode) {
-                await new Promise(r => setTimeout(r, liveEntryDelayMs));
+            if (!streamLiveEntriesDuringScan) {
+              for (const { side, pick } of selectedTrades) {
+                if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
+                  pushScanSkipEvent(`SKIP: ${pick.symbol} blocked because quote assets are treated as cash, not tradable base positions`, cycleId);
+                  continue;
+                }
+                if (isLiveBinance && !isLiveTradableFuturesSymbol(pick.symbol)) {
+                  pushScanSkipEvent(`SKIP: ${pick.symbol} not present in Binance futures tradable symbol set`, cycleId);
+                  continue;
+                }
+                if (isLiveBinance && isUnsupportedLiveScanSymbol(pick.symbol)) {
+                  pushScanSkipEvent(`SKIP: ${pick.symbol} blocked by unsupported market quarantine`, cycleId);
+                  continue;
+                }
+                const entryType = side === 'BUY' ? 'LONG' : 'SHORT';
+                const discoveryReason = pick.signal.overall === 'HOLD'
+                  ? `AI HF ${entryType}: ${pick.signal.score}/10`
+                  : `AI ${entryType} DISCOVERY: CONFIDENCE ${pick.signal.score}/10`;
+                await executeTrade(
+                  side,
+                  pick.symbol,
+                  pick.lastPrice,
+                  discoveryReason,
+                  undefined,
+                  cycleId,
+                  pick.signal.tradePlan,
+                  undefined,
+                  getDirectionalEntryScore(side, pick.signal.score),
+                  { bypassDuplicateOrderLockout: true },
+                );
+                if (!autoTradeRef.current || entryLockUntilRef.current > Date.now()) break;
+                if (isRealMode) {
+                  await new Promise(r => setTimeout(r, liveEntryDelayMs));
+                }
               }
             }
           } else {
@@ -7912,7 +7883,7 @@ export default function App() {
                           {row.realizedPnl >= 0 ? '+' : '-'}${Math.abs(row.realizedPnl).toFixed(2)}
                           <div className="text-[8px] opacity-50">{row.realizedPnlPct >= 0 ? '+' : ''}{row.realizedPnlPct.toFixed(2)}%</div>
                         </td>
-                        <td className="px-3 py-2 text-[9px] font-mono opacity-70">{row.closedTrades}/{Math.max(1, symbolDailyFlipLimit)}</td>
+                        <td className="px-3 py-2 text-[9px] font-mono opacity-70">{row.losingClosedTrades}/{Math.max(1, symbolDailyFlipLimit)}</td>
                         <td className="px-3 py-2">
                           <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-sm ${dailyStopped ? 'bg-rose-100 text-rose-700' : coolingDown ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'}`}>
                             {dailyStopped ? 'KILLED' : coolingDown ? 'COOLDOWN' : 'ACTIVE'}
