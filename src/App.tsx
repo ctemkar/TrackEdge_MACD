@@ -10,7 +10,7 @@ import { BacktestModule } from './components/BacktestModule';
 const STRATEGY_SIGNAL_INTERVAL = '1d';
 const SCAN_SHORTLIST_SAFE_CAP = 2000;
 const DEFAULT_BROAD_SCAN_LIMIT = 1500;
-const LIVE_AUTO_SCAN_LIMIT = 180;
+const DEFAULT_LIVE_AUTO_SCAN_LIMIT = 600;
 const DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT = 'USDT,USDC,FDUSD,BUSD,TUSD';
 const LIVE_RANKED_SIGNAL_STALE_MS = 5 * 60 * 1000;
 const LIVE_CONTROL_TAB_KEY = 'te_live_controller_tab';
@@ -49,6 +49,7 @@ const CRITERIA_HELP: Record<string, string> = {
   scanIntervalSec: 'Seconds between automated market scan cycles. Lower values react faster but increase API load and rate-limit risk.',
   holdingPollIntervalSec: 'Seconds between live holding price refreshes. Lower values improve responsiveness but add frequent API calls.',
   maxSymbolsPerScan: 'Maximum number of symbols evaluated in one scan cycle while focused mode is active. Full Universe Mode ignores this cap and scans the full fetched list.',
+  liveAutoScanLimit: 'Maximum shortlist size allowed for autonomous live Binance scans. Manual scans still use the broader Max Symbols / Scan setting.',
   softCooldownMinutes: 'Cooldown after a skipped/rejected entry. Prevents immediate re-entry attempts on unstable symbols.',
   successCooldownMinutes: 'Cooldown after a successful close. Helps avoid overtrading the same symbol immediately after profit-taking.',
   paperLossCooldownMinutes: 'Cooldown after a paper-trading loss. Reduces repeated losses from rapid re-entry in bad conditions.',
@@ -100,6 +101,7 @@ const PARAMETER_DEFAULTS = {
   scanIntervalSec: 40,
   holdingPollIntervalSec: 10,
   maxSymbolsPerScan: DEFAULT_BROAD_SCAN_LIMIT,
+  liveAutoScanLimit: DEFAULT_LIVE_AUTO_SCAN_LIMIT,
   duplicateOrderLockoutSec: 45,
   liveEntryDelayMs: 900,
   liveEntriesPerCycle: 1,
@@ -577,6 +579,12 @@ export default function App() {
     localStorage.setItem('te_max_symbols_scan_migrated_v2', '1');
     localStorage.setItem('te_max_symbols_scan_reverted_v4', '1');
     return Math.max(20, Math.min(SCAN_SHORTLIST_SAFE_CAP, parsed));
+  });
+  const [liveAutoScanLimit, setLiveAutoScanLimit] = useState(() => {
+    const saved = localStorage.getItem('te_live_auto_scan_limit');
+    return saved
+      ? Math.max(20, Math.min(SCAN_SHORTLIST_SAFE_CAP, parseInt(saved, 10) || DEFAULT_LIVE_AUTO_SCAN_LIMIT))
+      : DEFAULT_LIVE_AUTO_SCAN_LIMIT;
   });
   const [duplicateOrderLockoutSec, setDuplicateOrderLockoutSec] = useState(() => {
     const saved = localStorage.getItem('te_duplicate_order_lockout_sec');
@@ -3141,6 +3149,7 @@ export default function App() {
     localStorage.setItem('te_scan_interval_sec', scanIntervalSec.toString());
     localStorage.setItem('te_holding_poll_interval_sec', holdingPollIntervalSec.toString());
     localStorage.setItem('te_max_symbols_per_scan', maxSymbolsPerScan.toString());
+    localStorage.setItem('te_live_auto_scan_limit', liveAutoScanLimit.toString());
     localStorage.setItem('te_duplicate_order_lockout_sec', duplicateOrderLockoutSec.toString());
     localStorage.setItem('te_live_entry_delay_ms', liveEntryDelayMs.toString());
     localStorage.setItem('te_live_entries_per_cycle', liveEntriesPerCycle.toString());
@@ -3152,7 +3161,7 @@ export default function App() {
     localStorage.setItem('te_close_failure_lock_minutes', closeFailureLockMinutes.toString());
     localStorage.setItem('te_hard_failure_lock_minutes', hardFailureLockMinutes.toString());
     localStorage.setItem('te_strategy_config', JSON.stringify(strategyConfig));
-  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, benchmarkSetAt, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, liveMarginBufferPct, hardReentryCooldownMinutes, minEdgeAfterFrictionPct, estimatedRoundTripFrictionBps, symbolDailyLossLimit, symbolDailyFlipLimit, accountDailyLossLimit, marginStopLossPct, fastAdverseMoveExitPct, dailyEquityAnchorDate, dailyEquityAnchor, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
+  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, benchmarkSetAt, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, liveMarginBufferPct, hardReentryCooldownMinutes, minEdgeAfterFrictionPct, estimatedRoundTripFrictionBps, symbolDailyLossLimit, symbolDailyFlipLimit, accountDailyLossLimit, marginStopLossPct, fastAdverseMoveExitPct, dailyEquityAnchorDate, dailyEquityAnchor, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, liveAutoScanLimit, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
 
   useEffect(() => {
     if (!isRealMode || !Number.isFinite(balance) || balance <= 0) return;
@@ -3378,6 +3387,7 @@ export default function App() {
     scanIntervalSec: number;
     holdingPollIntervalSec: number;
     maxSymbolsPerScan: number;
+    liveAutoScanLimit: number;
     softCooldownMinutes: number;
     successCooldownMinutes: number;
     paperLossCooldownMinutes: number;
@@ -3423,6 +3433,7 @@ export default function App() {
     setScanIntervalSec(aiCriteriaSnapshot.scanIntervalSec);
     setHoldingPollIntervalSec(aiCriteriaSnapshot.holdingPollIntervalSec);
     setMaxSymbolsPerScan(aiCriteriaSnapshot.maxSymbolsPerScan);
+    setLiveAutoScanLimit(aiCriteriaSnapshot.liveAutoScanLimit ?? PARAMETER_DEFAULTS.liveAutoScanLimit);
     setSoftCooldownMinutes(aiCriteriaSnapshot.softCooldownMinutes);
     setSuccessCooldownMinutes(aiCriteriaSnapshot.successCooldownMinutes);
     setPaperLossCooldownMinutes(aiCriteriaSnapshot.paperLossCooldownMinutes);
@@ -3465,6 +3476,7 @@ export default function App() {
     setScanIntervalSec(PARAMETER_DEFAULTS.scanIntervalSec);
     setHoldingPollIntervalSec(PARAMETER_DEFAULTS.holdingPollIntervalSec);
     setMaxSymbolsPerScan(PARAMETER_DEFAULTS.maxSymbolsPerScan);
+    setLiveAutoScanLimit(PARAMETER_DEFAULTS.liveAutoScanLimit);
     setDuplicateOrderLockoutSec(PARAMETER_DEFAULTS.duplicateOrderLockoutSec);
     setLiveEntryDelayMs(PARAMETER_DEFAULTS.liveEntryDelayMs);
     setLiveEntriesPerCycle(PARAMETER_DEFAULTS.liveEntriesPerCycle);
@@ -3521,6 +3533,7 @@ export default function App() {
       scanIntervalSec,
       holdingPollIntervalSec,
       maxSymbolsPerScan,
+      liveAutoScanLimit,
       softCooldownMinutes,
       successCooldownMinutes,
       paperLossCooldownMinutes,
@@ -3583,6 +3596,9 @@ export default function App() {
       } else if ((part.includes('max symbols') || part.includes('symbols per scan')) && val !== null) {
         setMaxSymbolsPerScan(Math.max(20, Math.min(2000, Math.round(val))));
         touched.push('Max Symbols / Scan');
+      } else if ((part.includes('live auto scan limit') || part.includes('auto scan limit') || part.includes('live scan limit')) && val !== null) {
+        setLiveAutoScanLimit(Math.max(20, Math.min(SCAN_SHORTLIST_SAFE_CAP, Math.round(val))));
+        touched.push('Live Auto Scan Limit');
       } else if ((part.includes('soft cooldown')) && val !== null) {
         setSoftCooldownMinutes(Math.max(1, Math.round(val)));
         touched.push('Soft Cooldown');
@@ -3922,7 +3938,7 @@ export default function App() {
       const totalToScan = symbolsToScan.length;
       setScanProgress({ current: 0, total: totalToScan });
       const effectiveAutoScanLimit = isLiveBinance && !manual
-        ? Math.min(maxSymbolsPerScan, LIVE_AUTO_SCAN_LIMIT)
+        ? Math.min(maxSymbolsPerScan, liveAutoScanLimit)
         : maxSymbolsPerScan;
       const shortlistLimit = fullUniverseMode
         ? totalToScan
@@ -4520,7 +4536,7 @@ export default function App() {
       setScanning(false);
       setTimeout(() => setIsBotActive(false), 2000);
     }
-  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, liveEntriesPerCycle, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode, isUnsupportedLiveScanSymbol, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional, getBufferedLiveCapital]);
+  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, liveEntriesPerCycle, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode, isUnsupportedLiveScanSymbol, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional, getBufferedLiveCapital, maxSymbolsPerScan, liveAutoScanLimit]);
  // Removed 'scanning' from dependencies
 
   React.useEffect(() => {
@@ -5177,6 +5193,18 @@ export default function App() {
     return latest;
   }, [tradeHistory]);
 
+  const tradeStatusesBySymbol = React.useMemo(() => {
+    const statuses = new Map<string, Set<ExecutionStatus>>();
+    for (const trade of tradeHistory) {
+      const key = String(trade.symbol || '').toUpperCase();
+      if (!key) continue;
+      const bucket = statuses.get(key) || new Set<ExecutionStatus>();
+      bucket.add((trade.status || 'FILLED') as ExecutionStatus);
+      statuses.set(key, bucket);
+    }
+    return statuses;
+  }, [tradeHistory]);
+
   const getMarketPickLifecycle = React.useCallback((pick: MarketScanResult): MarketPickLifecycle => {
     const normalizedSymbol = String(pick.symbol || '').toUpperCase();
     if (heldSymbols.has(normalizedSymbol)) {
@@ -5216,9 +5244,17 @@ export default function App() {
     let exchangeConfirmed = 0;
 
     for (const pick of marketPicks) {
+      const symbolKey = String(pick.symbol || '').toUpperCase();
+      const symbolStatuses = tradeStatusesBySymbol.get(symbolKey);
       const lifecycle = getMarketPickLifecycle(pick);
+      const hasSubmittedOrder = Boolean(
+        symbolStatuses?.has('SUBMITTED') ||
+        symbolStatuses?.has('FILLED') ||
+        lifecycle.label === 'Order Submitted' ||
+        lifecycle.label === 'Exchange Confirmed'
+      );
       if (pick.signal.overall === 'BUY' || pick.signal.overall === 'SELL') signalFound += 1;
-      if (lifecycle.label === 'Order Submitted') orderSubmitted += 1;
+      if (hasSubmittedOrder) orderSubmitted += 1;
       if (lifecycle.label === 'Exchange Confirmed') exchangeConfirmed += 1;
     }
 
@@ -5228,7 +5264,7 @@ export default function App() {
       exchangeConfirmed,
       openPositions: holdings.length,
     };
-  }, [getMarketPickLifecycle, holdings.length, marketPicks]);
+  }, [getMarketPickLifecycle, holdings.length, marketPicks, tradeStatusesBySymbol]);
 
   const visibleTradeHistory = tradeHistory.filter(t => {
     // Hide SCAN skips
@@ -5752,6 +5788,41 @@ export default function App() {
     getHoldingActiveNotional,
     getLiveEntryCapacityBlock,
   ]);
+
+  const rankedSignalReasonRows = React.useMemo(() => {
+    return visibleSignalTableEntries.map(({ pick, foundAt }) => {
+      const eligibility = rankedSignalStatuses[pick.symbol] || {
+        label: 'UNKNOWN',
+        detail: 'status unavailable',
+        className: 'bg-gray-100 text-gray-600',
+      };
+      const lifecycle = getMarketPickLifecycle(pick);
+
+      let reason = eligibility.detail;
+
+      if (lifecycle.label === 'Exchange Confirmed') {
+        reason = eligibility.detail === 'already held'
+          ? 'already open on exchange; bot will not stack another entry on the same symbol'
+          : 'already open on exchange';
+      } else if (lifecycle.label === 'Order Submitted') {
+        reason = 'order already submitted; waiting for exchange confirmation';
+      } else if (eligibility.label === 'HOLD') {
+        const holdSummary = summarizeRejectReasons(pick.signal.rejectReasons, 3);
+        reason = holdSummary || describeHoldReason(pick.signal.holdReason);
+      } else if (eligibility.label === 'SELECTED') {
+        reason = 'queued for the current scan cycle';
+      }
+
+      return {
+        symbol: pick.symbol,
+        signal: pick.signal.overall,
+        foundAt,
+        lifecycle,
+        eligibility,
+        reason,
+      };
+    });
+  }, [getMarketPickLifecycle, rankedSignalStatuses, visibleSignalTableEntries]);
 
   const visibleLiquidationReviewEntries = React.useMemo(() => {
     const now = Date.now();
@@ -6625,6 +6696,39 @@ export default function App() {
 
           <section className="bg-white border-2 border-[#141414] p-4 shadow-[8px_8px_0px_0px_#141414]">
             <div className="space-y-4">
+              <div className="border border-indigo-200 bg-indigo-50/60 px-3 py-2 text-[10px] font-mono uppercase">
+                <div className="flex items-center justify-between text-indigo-950/80">
+                  <span>Why Each Ranked Coin Is Not Trading</span>
+                  <span>{rankedSignalReasonRows.length} shown</span>
+                </div>
+                <p className="mt-1 text-[9px] normal-case tracking-normal text-indigo-950/70">
+                  One explicit reason per currently ranked coin. Open positions are marked as already on exchange, and HOLD rows show the actual reject reasons.
+                </p>
+                <div className="mt-2 space-y-2 max-h-[320px] overflow-y-auto custom-scrollbar pr-1">
+                  {rankedSignalReasonRows.map((entry) => (
+                    <div key={`ranked-reason-${entry.symbol}`} className="border border-indigo-200 bg-white/70 px-2 py-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="font-black text-[11px] text-indigo-950">{entry.symbol}</span>
+                          <span className={`rounded-sm px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wide ${entry.lifecycle.className}`}>
+                            {entry.lifecycle.label}
+                          </span>
+                          <span className={`rounded-sm px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wide ${entry.eligibility.className}`}>
+                            {entry.eligibility.label}
+                          </span>
+                        </div>
+                        <span className="text-[9px] text-indigo-900/70">
+                          {entry.signal} | {formatSignalAge(entry.foundAt)}
+                        </span>
+                      </div>
+                      <div className="mt-1 text-[9px] normal-case tracking-normal text-indigo-950/80">
+                        {entry.reason}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
               <div className="flex items-center justify-between">
                 <h3 className="font-mono text-[12px] uppercase tracking-[0.2em] opacity-75">Top Ranked Signals</h3>
                 <span className="text-[10px] font-mono uppercase opacity-50">{visibleSignalTablePicks.length} shown{usingPersistedRankedSignals ? ' | last non-empty' : ''}{hasHiddenStaleRankedSignals ? ' | stale hidden' : ''}</span>
@@ -7057,6 +7161,9 @@ export default function App() {
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Max Symbols / Scan" detail={CRITERIA_HELP.maxSymbolsPerScan} />
                       <input type="number" min="20" max={SCAN_SHORTLIST_SAFE_CAP} step="10" value={maxSymbolsPerScan} onChange={(e) => setMaxSymbolsPerScan(Math.max(20, Math.min(SCAN_SHORTLIST_SAFE_CAP, parseInt(e.target.value, 10) || 20)))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
+                    </label>
+                    <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Live Auto Scan Limit" detail={CRITERIA_HELP.liveAutoScanLimit} />
+                      <input type="number" min="20" max={SCAN_SHORTLIST_SAFE_CAP} step="10" value={liveAutoScanLimit} onChange={(e) => setLiveAutoScanLimit(Math.max(20, Math.min(SCAN_SHORTLIST_SAFE_CAP, parseInt(e.target.value, 10) || 20)))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />
                     </label>
                     <label className="text-[18px] uppercase opacity-70"><CriteriaInfoLabel text="Soft Cooldown (m)" detail={CRITERIA_HELP.softCooldownMinutes} />
                       <input type="number" min="1" step="1" value={softCooldownMinutes} onChange={(e) => setSoftCooldownMinutes(Math.max(1, parseInt(e.target.value, 10) || 1))} className="mt-2 w-full h-12 bg-black/40 border border-white/10 rounded-sm px-3 py-2 text-[18px] font-mono" />

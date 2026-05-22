@@ -43,6 +43,10 @@ async function startServer() {
   const publicExchangeInfoCache = new Map<string, { symbols: any[]; updatedAt: number }>();
   let publicTicker24hCache: { rows: any[]; updatedAt: number } | null = null;
   let privateBalanceCache: { payload: any; updatedAt: number } | null = null;
+  const binanceServerTimeState = {
+    offsetMs: 0,
+    syncedAt: 0,
+  };
   type PublicKlineCacheEntry = { payload: any[]; updatedAt: number; source: string };
   const publicKlineCache = new Map<string, PublicKlineCacheEntry>();
   const inflightPublicKlineRequests = new Map<string, Promise<PublicKlineCacheEntry | null>>();
@@ -193,6 +197,66 @@ async function startServer() {
     );
   };
 
+  const isBinanceTimestampErrorMessage = (message: string) => {
+    const normalized = String(message || '').toLowerCase();
+    return (
+      normalized.includes('-1021') ||
+      normalized.includes('timestamp for this request is outside of the recvwindow') ||
+      normalized.includes('recvwindow')
+    );
+  };
+
+  const syncBinanceServerTimeOffset = async (force = false) => {
+    const now = Date.now();
+    if (!force && binanceServerTimeState.syncedAt > 0 && (now - binanceServerTimeState.syncedAt) < 60_000) {
+      return binanceServerTimeState.offsetMs;
+    }
+
+    const endpoints = [
+      'https://fapi.binance.com/fapi/v1/time',
+      'https://api.binance.com/api/v3/time',
+    ];
+
+    for (const endpoint of endpoints) {
+      try {
+        const response = await fetch(endpoint, {
+          headers: { 'User-Agent': 'TradeEdge-Bot/1.0' },
+        });
+        if (!response.ok) continue;
+        const payload: any = await response.json().catch(() => null);
+        const serverTime = Number(payload?.serverTime || 0);
+        if (Number.isFinite(serverTime) && serverTime > 0) {
+          binanceServerTimeState.offsetMs = serverTime - Date.now();
+          binanceServerTimeState.syncedAt = Date.now();
+          return binanceServerTimeState.offsetMs;
+        }
+      } catch {
+        // Fall through to the next endpoint.
+      }
+    }
+
+    return binanceServerTimeState.offsetMs;
+  };
+
+  const buildBinanceSignedQuery = async (
+    apiSecret: string,
+    params: Record<string, string>,
+    options?: { forceTimeSync?: boolean },
+  ) => {
+    const offsetMs = await syncBinanceServerTimeOffset(options?.forceTimeSync === true);
+    const query = new URLSearchParams({
+      ...params,
+      timestamp: String(Date.now() + offsetMs),
+    });
+    const queryString = query.toString();
+    const signature = crypto
+      .createHmac('sha256', apiSecret)
+      .update(queryString)
+      .digest('hex');
+
+    return { queryString, signature };
+  };
+
   app.use(cors());
   app.use(express.json());
   app.use((req, res, next) => {
@@ -207,67 +271,69 @@ async function startServer() {
   // Direct Binance API helper for positions (bypasses CCXT method issues)
   const fetchBinancePositionsViaHttp = async (apiKey: string, apiSecret: string): Promise<{ positions: any[]; authError: boolean; message?: string }> => {
     try {
-      const timestamp = Date.now();
-      const params = new URLSearchParams({ timestamp: String(timestamp) });
-      const queryString = params.toString();
-      
-      const signature = crypto
-        .createHmac('sha256', apiSecret)
-        .update(queryString)
-        .digest('hex');
-
       const endpoints = [
-        { label: 'fapi-position-risk', url: `https://fapi.binance.com/fapi/v2/positionRisk?${queryString}&signature=${signature}` },
-        { label: 'papi-um-position-risk', url: `https://papi.binance.com/papi/v1/um/positionRisk?${queryString}&signature=${signature}` },
+        { label: 'fapi-position-risk', baseUrl: 'https://fapi.binance.com', path: '/fapi/v2/positionRisk' },
+        { label: 'papi-um-position-risk', baseUrl: 'https://papi.binance.com', path: '/papi/v1/um/positionRisk' },
       ];
 
-      let sawAuthError = false;
-      let lastMessage = '';
-      const endpointErrors: string[] = [];
+      for (let requestAttempt = 0; requestAttempt < 2; requestAttempt++) {
+        let sawAuthError = false;
+        let lastMessage = '';
+        let sawTimestampError = false;
+        const endpointErrors: string[] = [];
+        const { queryString, signature } = await buildBinanceSignedQuery(apiSecret, {}, { forceTimeSync: requestAttempt > 0 });
 
-      for (const endpoint of endpoints) {
-        const response = await fetch(endpoint.url, {
-          method: 'GET',
-          headers: {
-            'X-MBX-APIKEY': apiKey,
-            'Content-Type': 'application/json',
-          },
-        });
+        for (const endpoint of endpoints) {
+          const response = await fetch(`${endpoint.baseUrl}${endpoint.path}?${queryString}&signature=${signature}`, {
+            method: 'GET',
+            headers: {
+              'X-MBX-APIKEY': apiKey,
+              'Content-Type': 'application/json',
+            },
+          });
 
-        if (!response.ok) {
-          const text = await response.text();
-          lastMessage = text;
-          const authError = response.status === 401 || isBinanceAuthErrorMessage(text);
-          sawAuthError = sawAuthError || authError;
-          endpointErrors.push(`${endpoint.label}:${response.status}:${text.substring(0, 100)}`);
+          if (!response.ok) {
+            const text = await response.text();
+            lastMessage = text;
+            const authError = response.status === 401 || isBinanceAuthErrorMessage(text);
+            sawAuthError = sawAuthError || authError;
+            sawTimestampError = sawTimestampError || isBinanceTimestampErrorMessage(text);
+            endpointErrors.push(`${endpoint.label}:${response.status}:${text.substring(0, 100)}`);
+            continue;
+          }
+
+          const data = await response.json();
+          if (Array.isArray(data)) {
+            binanceRouteHealth.positions = endpoint.label === 'papi-um-position-risk' ? 'PAPI UM' : 'FAPI';
+            binanceRouteHealth.updatedAt = Date.now();
+            logWithThrottle(
+              'log',
+              `direct-http-positions-${endpoint.label}-${data.length}`,
+              `[TradeEdge] Direct Binance HTTP: Got ${data.length} positions from ${endpoint.label}`,
+              2 * 60 * 1000,
+            );
+            return { positions: data, authError: false };
+          }
+        }
+
+        if (sawTimestampError && requestAttempt === 0) {
           continue;
         }
 
-        const data = await response.json();
-        if (Array.isArray(data)) {
-          binanceRouteHealth.positions = endpoint.label === 'papi-um-position-risk' ? 'PAPI UM' : 'FAPI';
-          binanceRouteHealth.updatedAt = Date.now();
-          logWithThrottle(
-            'log',
-            `direct-http-positions-${endpoint.label}-${data.length}`,
-            `[TradeEdge] Direct Binance HTTP: Got ${data.length} positions from ${endpoint.label}`,
-            2 * 60 * 1000,
+        if (endpointErrors.length > 0) {
+          const msg = endpointErrors.slice(0, 2).join(' | ');
+          const level = sawAuthError ? 'warn' : 'log';
+          logOnce(
+            level,
+            `binance-position-risk-all-failed-${sawAuthError ? 'auth' : sawTimestampError ? 'timestamp' : 'other'}`,
+            `[TradeEdge] Binance positionRisk fallback exhausted: ${msg}`,
           );
-          return { positions: data, authError: false };
         }
+
+        return { positions: [], authError: sawAuthError, message: lastMessage || 'positionRisk unavailable' };
       }
 
-      if (endpointErrors.length > 0) {
-        const msg = endpointErrors.slice(0, 2).join(' | ');
-        const level = sawAuthError ? 'warn' : 'log';
-        logOnce(
-          level,
-          `binance-position-risk-all-failed-${sawAuthError ? 'auth' : 'other'}`,
-          `[TradeEdge] Binance positionRisk fallback exhausted: ${msg}`,
-        );
-      }
-
-      return { positions: [], authError: sawAuthError, message: lastMessage || 'positionRisk unavailable' };
+      return { positions: [], authError: false, message: 'positionRisk unavailable' };
     } catch (e: any) {
       console.warn(`[TradeEdge] Direct Binance HTTP request failed: ${e?.message}`);
       const errMsg = String(e?.message || '');
@@ -291,32 +357,33 @@ async function startServer() {
     accountData?: any;
   }> => {
     const signedGet = async (baseUrl: string, endpoint: string) => {
-      const timestamp = Date.now();
-      const params = new URLSearchParams({ timestamp: String(timestamp) });
-      const queryString = params.toString();
-      const signature = crypto
-        .createHmac('sha256', apiSecret)
-        .update(queryString)
-        .digest('hex');
+      for (let requestAttempt = 0; requestAttempt < 2; requestAttempt++) {
+        const { queryString, signature } = await buildBinanceSignedQuery(apiSecret, {}, { forceTimeSync: requestAttempt > 0 });
+        const url = `${baseUrl}${endpoint}?${queryString}&signature=${signature}`;
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: {
+            'X-MBX-APIKEY': apiKey,
+            'Content-Type': 'application/json',
+          },
+        });
 
-      const url = `${baseUrl}${endpoint}?${queryString}&signature=${signature}`;
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-          'X-MBX-APIKEY': apiKey,
-          'Content-Type': 'application/json',
-        },
-      });
+        const text = await response.text();
+        let data: any = null;
+        try {
+          data = text ? JSON.parse(text) : null;
+        } catch {
+          data = null;
+        }
 
-      const text = await response.text();
-      let data: any = null;
-      try {
-        data = text ? JSON.parse(text) : null;
-      } catch {
-        data = null;
+        if (!response.ok && isBinanceTimestampErrorMessage(text) && requestAttempt === 0) {
+          continue;
+        }
+
+        return { ok: response.ok, status: response.status, text, data };
       }
 
-      return { ok: response.ok, status: response.status, text, data };
+      return { ok: false, status: 500, text: 'timestamp sync retry exhausted', data: null };
     };
 
     try {
@@ -393,41 +460,45 @@ async function startServer() {
         return { dualSidePosition: cachedBinancePositionMode.dualSidePosition };
       }
 
-      const timestamp = Date.now();
-      const recvWindow = '5000';
-      const params = new URLSearchParams({ timestamp: String(timestamp), recvWindow });
-      const queryString = params.toString();
-      const signature = crypto
-        .createHmac('sha256', apiSecret)
-        .update(queryString)
-        .digest('hex');
-
       const endpoints = [
         'https://fapi.binance.com/fapi/v1/positionSide/dual',
         'https://papi.binance.com/papi/v1/um/positionSide/dual',
       ];
 
-      for (const endpoint of endpoints) {
-        const url = `${endpoint}?${queryString}&signature=${signature}`;
-        const response = await fetch(url, {
-          method: 'GET',
-          headers: {
-            'X-MBX-APIKEY': apiKey,
-            'Content-Type': 'application/json',
-          },
-        });
+      for (let requestAttempt = 0; requestAttempt < 2; requestAttempt++) {
+        const { queryString, signature } = await buildBinanceSignedQuery(apiSecret, { recvWindow: '5000' }, { forceTimeSync: requestAttempt > 0 });
+        let sawTimestampError = false;
 
-        if (!response.ok) continue;
+        for (const endpoint of endpoints) {
+          const url = `${endpoint}?${queryString}&signature=${signature}`;
+          const response = await fetch(url, {
+            method: 'GET',
+            headers: {
+              'X-MBX-APIKEY': apiKey,
+              'Content-Type': 'application/json',
+            },
+          });
 
-        const json: any = await response.json();
-        const raw = json?.dualSidePosition;
-        const dualSidePosition = typeof raw === 'boolean' ? raw : String(raw || '').toLowerCase() === 'true';
+          if (!response.ok) {
+            const text = await response.text();
+            sawTimestampError = sawTimestampError || isBinanceTimestampErrorMessage(text);
+            continue;
+          }
 
-        cachedBinancePositionMode = {
-          dualSidePosition,
-          fetchedAt: Date.now(),
-        };
-        return { dualSidePosition };
+          const json: any = await response.json();
+          const raw = json?.dualSidePosition;
+          const dualSidePosition = typeof raw === 'boolean' ? raw : String(raw || '').toLowerCase() === 'true';
+
+          cachedBinancePositionMode = {
+            dualSidePosition,
+            fetchedAt: Date.now(),
+          };
+          return { dualSidePosition };
+        }
+
+        if (!sawTimestampError) {
+          break;
+        }
       }
 
       return { dualSidePosition: null };
@@ -476,43 +547,43 @@ async function startServer() {
     let sawAuthError = false;
 
     for (const candidate of endpoints) {
-      const query = new URLSearchParams({
-        ...params,
-        recvWindow: params.recvWindow || '5000',
-        timestamp: String(Date.now()),
-      });
-      const queryString = query.toString();
-      const signature = crypto
-        .createHmac('sha256', apiSecret)
-        .update(queryString)
-        .digest('hex');
+      for (let requestAttempt = 0; requestAttempt < 2; requestAttempt++) {
+        const { queryString, signature } = await buildBinanceSignedQuery(apiSecret, {
+          ...params,
+          recvWindow: params.recvWindow || '5000',
+        }, { forceTimeSync: requestAttempt > 0 });
 
-      const response = await fetch(`${candidate.baseUrl}${candidate.endpoint}?${queryString}&signature=${signature}`, {
-        headers: {
-          'X-MBX-APIKEY': apiKey,
-          'Content-Type': 'application/json',
-        },
-      });
+        const response = await fetch(`${candidate.baseUrl}${candidate.endpoint}?${queryString}&signature=${signature}`, {
+          headers: {
+            'X-MBX-APIKEY': apiKey,
+            'Content-Type': 'application/json',
+          },
+        });
 
-      const text = await response.text();
-      let parsed: any = null;
-      try {
-        parsed = text ? JSON.parse(text) : null;
-      } catch {
-        parsed = null;
-      }
+        const text = await response.text();
+        let parsed: any = null;
+        try {
+          parsed = text ? JSON.parse(text) : null;
+        } catch {
+          parsed = null;
+        }
 
-      if (response.ok) {
-        return {
-          label: candidate.label,
-          data: parsed,
-        };
-      }
+        if (response.ok) {
+          return {
+            label: candidate.label,
+            data: parsed,
+          };
+        }
 
-      const errorMessage = String(parsed?.msg || parsed?.message || text || response.statusText || 'unknown error');
-      lastMessage = errorMessage;
-      if (isBinanceAuthErrorMessage(errorMessage)) {
-        sawAuthError = true;
+        const errorMessage = String(parsed?.msg || parsed?.message || text || response.statusText || 'unknown error');
+        lastMessage = errorMessage;
+        if (isBinanceAuthErrorMessage(errorMessage)) {
+          sawAuthError = true;
+        }
+        if (isBinanceTimestampErrorMessage(errorMessage) && requestAttempt === 0) {
+          continue;
+        }
+        break;
       }
     }
 
@@ -1037,8 +1108,15 @@ async function startServer() {
               const accountInfo = accountFallback.accountData;
               const walletBalance = Number(
                 accountInfo?.totalWalletBalance ??
+                accountInfo?.totalCrossWalletBalance ??
+                0,
+              );
+              const accountEquity = Number(
+                accountInfo?.actualEquity ??
+                accountInfo?.accountEquity ??
                 accountInfo?.totalMarginBalance ??
                 accountInfo?.totalCrossWalletBalance ??
+                accountInfo?.totalWalletBalance ??
                 0,
               );
               const availableBalance = Number(
@@ -1048,7 +1126,7 @@ async function startServer() {
                 0,
               );
 
-              if (accountInfo && Number.isFinite(walletBalance) && walletBalance >= 0) {
+              if (accountInfo && (Number.isFinite(walletBalance) || Number.isFinite(accountEquity))) {
                 logWithThrottle(
                   'warn',
                   'sync-binance-balance-http-fallback',
@@ -1059,8 +1137,8 @@ async function startServer() {
                   total: walletBalance > 0 ? { USDT: walletBalance } : {},
                   info: accountInfo,
                 };
-                if (walletBalance > 0) {
-                  papiActualEquity = walletBalance;
+                if (Number.isFinite(accountEquity) && accountEquity > 0) {
+                  papiActualEquity = accountEquity;
                 }
                 if (Number.isFinite(availableBalance) && availableBalance >= 0) {
                   papiAvailableBalance = availableBalance;
@@ -1495,9 +1573,11 @@ async function startServer() {
           {};
         const pmCandidates = [
           papiActualEquity,
-          Number(info.totalWalletBalance),
+          Number(info.actualEquity),
+          Number(info.accountEquity),
           Number(info.totalMarginBalance),
           Number(info.totalCrossWalletBalance),
+          Number(info.totalWalletBalance),
           Number(info.totalInitialMargin),
           Number(info.totalAvailableBalance),
         ].filter(v => Number.isFinite(v) && v > 0);
@@ -2070,158 +2150,168 @@ async function startServer() {
               throw new Error('Binance API keys unavailable for direct order fallback.');
             }
 
-            const timestamp = Date.now();
-            const body = new URLSearchParams({
-              symbol: raw,
-              side: String(side || '').toUpperCase(),
-              type: 'MARKET',
-              quantity: String(finalAmount),
-              recvWindow: '5000',
-              timestamp: String(timestamp),
-            });
-
-            if (params?.positionSide) body.set('positionSide', String(params.positionSide));
-            if (params?.reduceOnly === true) body.set('reduceOnly', 'true');
-
-            const query = body.toString();
-            const signature = crypto.createHmac('sha256', binanceSecret).update(query).digest('hex');
             const orderEndpoints = [
               'https://fapi.binance.com/fapi/v1/order',
               'https://papi.binance.com/papi/v1/um/order',
             ];
 
             let lastErr = 'unknown order error';
-            for (const endpoint of orderEndpoints) {
-              const response = await fetch(endpoint, {
-                method: 'POST',
-                headers: {
-                  'X-MBX-APIKEY': binanceKey,
-                  'Content-Type': 'application/x-www-form-urlencoded',
-                },
-                body: `${query}&signature=${signature}`,
-              });
-
-              const text = await response.text();
-              if (!response.ok) {
-                lastErr = text;
-                continue;
-              }
-
-              let json: any = {};
-              try {
-                json = text ? JSON.parse(text) : {};
-              } catch {
-                json = {};
-              }
-
-              binanceRouteHealth.orders = endpoint.includes('/papi/') ? 'PAPI UM' : 'FAPI';
-              binanceRouteHealth.updatedAt = Date.now();
-
-              return {
-                id: json?.orderId,
-                clientOrderId: json?.clientOrderId,
-                info: json,
+            for (let requestAttempt = 0; requestAttempt < 2; requestAttempt++) {
+              const baseParams: Record<string, string> = {
+                symbol: raw,
+                side: String(side || '').toUpperCase(),
+                type: 'MARKET',
+                quantity: String(finalAmount),
+                recvWindow: '5000',
               };
+              if (params?.positionSide) baseParams.positionSide = String(params.positionSide);
+              if (params?.reduceOnly === true) baseParams.reduceOnly = 'true';
+              const { queryString, signature } = await buildBinanceSignedQuery(binanceSecret, baseParams, { forceTimeSync: requestAttempt > 0 });
+              let sawTimestampError = false;
+
+              for (const endpoint of orderEndpoints) {
+                const response = await fetch(endpoint, {
+                  method: 'POST',
+                  headers: {
+                    'X-MBX-APIKEY': binanceKey,
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                  },
+                  body: `${queryString}&signature=${signature}`,
+                });
+
+                const text = await response.text();
+                if (!response.ok) {
+                  lastErr = text;
+                  sawTimestampError = sawTimestampError || isBinanceTimestampErrorMessage(text);
+                  continue;
+                }
+
+                let json: any = {};
+                try {
+                  json = text ? JSON.parse(text) : {};
+                } catch {
+                  json = {};
+                }
+
+                binanceRouteHealth.orders = endpoint.includes('/papi/') ? 'PAPI UM' : 'FAPI';
+                binanceRouteHealth.updatedAt = Date.now();
+
+                return {
+                  id: json?.orderId,
+                  clientOrderId: json?.clientOrderId,
+                  info: json,
+                };
+              }
+
+              if (!sawTimestampError) {
+                break;
+              }
             }
 
             throw new Error(`binance ${lastErr}`);
           };
 
+          const retryVariants: Record<string, any>[] = [];
+          const pushVariant = (params: Record<string, any>) => {
+            const key = JSON.stringify(params, Object.keys(params).sort());
+            if (!retryVariants.some(v => JSON.stringify(v, Object.keys(v).sort()) === key)) {
+              retryVariants.push(params);
+            }
+          };
+
           try {
             order = await submitMarketOrder(orderParams);
           } catch (primaryErr: any) {
-            const primaryMsg = String(primaryErr?.message || '');
-            const isPositionModeMismatch = /position side does not match|positionSide|hedge mode|\b-4061\b|\"code\":-4061/i.test(primaryMsg);
-            const isReduceOnlyNotRequired = /reduceOnly.+not required|Parameter 'reduceOnly' sent when not required|\"code\":-1106/i.test(primaryMsg);
-            const isReduceOnlyRejected = /reduceonly order is rejected|\"code\":-2022/i.test(primaryMsg);
+            const primaryMessage = String(primaryErr?.message || '');
+            const isPositionModeMismatch = /position side|hedge mode|one-way mode|dual side/i.test(primaryMessage);
+            const isReduceOnlyRejected = wantsReduceOnly && /reduceonly|reduce only/i.test(primaryMessage);
+            const isReduceOnlyNotRequired = /reduceonly not required|reduce-only order is rejected|parameter reduceonly/i.test(primaryMessage);
 
-            const retryVariants: Record<string, any>[] = [];
-            const pushVariant = (params: Record<string, any>) => {
-              const key = JSON.stringify(params, Object.keys(params).sort());
-              if (!retryVariants.some(v => JSON.stringify(v, Object.keys(v).sort()) === key)) {
-                retryVariants.push(params);
+            try {
+              order = await submitMarketOrderDirectHttp(orderParams);
+            } catch (directErr: any) {
+              const fallbackMessage = String(directErr?.message || primaryMessage);
+              const fallbackPositionModeMismatch = isPositionModeMismatch || /position side|hedge mode|one-way mode|dual side/i.test(fallbackMessage);
+              const fallbackReduceOnlyRejected = isReduceOnlyRejected || (wantsReduceOnly && /reduceonly|reduce only/i.test(fallbackMessage));
+              const fallbackReduceOnlyNotRequired = isReduceOnlyNotRequired || /reduceonly not required|reduce-only order is rejected|parameter reduceonly/i.test(fallbackMessage);
+
+              if (fallbackPositionModeMismatch) {
+                const bothVariant = { ...orderParams, positionSide: 'BOTH' };
+                pushVariant(bothVariant);
+                const noSideVariant = { ...orderParams };
+                delete noSideVariant.positionSide;
+                pushVariant(noSideVariant);
+                pushVariant({ positionSide: 'BOTH' });
+                pushVariant({});
               }
-            };
 
-            if (isPositionModeMismatch) {
-              // Try BOTH for one-way accounts first, then omit positionSide entirely.
-              const bothVariant = { ...orderParams, positionSide: 'BOTH' };
-              pushVariant(bothVariant);
-              const noSideVariant = { ...orderParams };
-              delete noSideVariant.positionSide;
-              pushVariant(noSideVariant);
-
-              // Strict fallbacks: remove optional flags that can conflict with account mode.
-              pushVariant({ positionSide: 'BOTH' });
-              pushVariant({});
-            }
-
-            if (isReduceOnlyNotRequired) {
-              const noReduceVariant = { ...orderParams };
-              delete noReduceVariant.reduceOnly;
-              pushVariant(noReduceVariant);
-            }
-
-            if (isReduceOnlyRejected && wantsReduceOnly) {
-              const reducibleExposure = await loadReducibleExposure();
-              if (!reducibleExposure) {
-                return res.json({
-                  status: 'skipped',
-                  message: `reduceOnly skipped: ${raw} exposure was already closed before retry`,
-                });
+              if (fallbackReduceOnlyNotRequired) {
+                const noReduceVariant = { ...orderParams };
+                delete noReduceVariant.reduceOnly;
+                pushVariant(noReduceVariant);
               }
-              finalAmount = Math.min(finalAmount, reducibleExposure.amount);
-              try {
-                finalAmount = parseFloat(client.amountToPrecision(ccxtSymbol, finalAmount));
-              } catch {
-                // Keep numeric fallback.
+
+              if (fallbackReduceOnlyRejected && wantsReduceOnly) {
+                const reducibleExposure = await loadReducibleExposure();
+                if (!reducibleExposure) {
+                  return res.json({
+                    status: 'skipped',
+                    message: `reduceOnly skipped: ${raw} exposure was already closed before retry`,
+                  });
+                }
+                finalAmount = Math.min(finalAmount, reducibleExposure.amount);
+                try {
+                  finalAmount = parseFloat(client.amountToPrecision(ccxtSymbol, finalAmount));
+                } catch {
+                  // Keep numeric fallback.
+                }
+                if (!validPositionSide && reducibleExposure.positionSide) {
+                  pushVariant({ ...orderParams, positionSide: reducibleExposure.positionSide, reduceOnly: true });
+                }
+                pushVariant({ ...orderParams, positionSide: 'BOTH', reduceOnly: true });
               }
-              if (!validPositionSide && reducibleExposure.positionSide) {
-                pushVariant({ ...orderParams, positionSide: reducibleExposure.positionSide, reduceOnly: true });
+
+              if (fallbackPositionModeMismatch && fallbackReduceOnlyNotRequired) {
+                pushVariant({ positionSide: 'BOTH' });
+                pushVariant({});
               }
-              pushVariant({ ...orderParams, positionSide: 'BOTH', reduceOnly: true });
-            }
 
-            // Combined fallback: same strict variants should be re-tried if both errors occur together.
-            if (isPositionModeMismatch && isReduceOnlyNotRequired) {
-              pushVariant({ positionSide: 'BOTH' });
-              pushVariant({});
-            }
-
-            if (retryVariants.length === 0) {
-              throw primaryErr;
-            }
-
-            let lastRetryErr: any = primaryErr;
-            for (const retryParams of retryVariants) {
-              try {
-                order = await submitMarketOrder(retryParams);
-                lastRetryErr = null;
-                break;
-              } catch (retryErr: any) {
-                lastRetryErr = retryErr;
+              if (retryVariants.length === 0) {
+                throw directErr;
               }
-            }
 
-            if (!order) {
+              let lastRetryErr: any = directErr;
               for (const retryParams of retryVariants) {
                 try {
-                  order = await submitMarketOrderDirectHttp(retryParams);
+                  order = await submitMarketOrder(retryParams);
                   lastRetryErr = null;
                   break;
                 } catch (retryErr: any) {
                   lastRetryErr = retryErr;
                 }
               }
-            }
 
-            if (!order && lastRetryErr) {
-              throw lastRetryErr;
+              if (!order) {
+                for (const retryParams of retryVariants) {
+                  try {
+                    order = await submitMarketOrderDirectHttp(retryParams);
+                    lastRetryErr = null;
+                    break;
+                  } catch (retryErr: any) {
+                    lastRetryErr = retryErr;
+                  }
+                }
+              }
+
+              if (!order && lastRetryErr) {
+                throw lastRetryErr;
+              }
             }
           }
-      }
+
       
       res.json({ status: 'success', order });
+    }
     } catch (error: any) {
       const msg = String(error?.message || 'Unknown order failure');
       const unsupported = msg.includes('does not have market symbol') || msg.includes('UNSUPPORTED MARKET') || msg.includes('SYMBOL SKIPPED');
@@ -2632,6 +2722,33 @@ async function startServer() {
               return;
             }
           }
+
+          if (marketType === 'futures') {
+            const fallbackSymbols = cachedExchangeInfo?.symbols?.length
+              ? cachedExchangeInfo.symbols.map((symbol: any) => ({ ...symbol, marketType: symbol.marketType || 'futures' }))
+              : loadFallbackFuturesExchangeInfo();
+            if (fallbackSymbols.length > 0) {
+              logWithThrottle(
+                'warn',
+                `exchangeInfo-futures-fallback-${response.status}`,
+                `[TradeEdge] exchangeInfo: Binance futures request failed (${response.status}), serving fallback futures metadata (${fallbackSymbols.length} symbols)`,
+                60000,
+              );
+              fallbackSymbols.forEach((s: any) => mergedSymbols.push({ ...s, marketType: 'futures' }));
+              return;
+            }
+          }
+
+          if (marketType === 'spot') {
+            logWithThrottle(
+              'warn',
+              `exchangeInfo-spot-skip-${response.status}`,
+              `[TradeEdge] exchangeInfo: Binance spot request failed (${response.status}), skipping spot metadata for this response`,
+              60000,
+            );
+            return;
+          }
+
           throw new Error(`Binance exchangeInfo failed (${marketType})`);
         };
 
