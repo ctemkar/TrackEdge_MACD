@@ -181,6 +181,13 @@ const PARAMETER_DEFAULTS = {
   fullUniverseMode: false,
 } as const;
 
+const PROFITABLE_LIVE_RUNTIME_GATES = {
+  autoEntryMinScore: 7.2,
+  minEdgeAfterFrictionPct: 0.35,
+  maxConcurrentTrades: 6,
+  liveEntriesPerCycle: 1,
+} as const;
+
 const NON_TRADABLE_QUOTE_BASES = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
 const LIVE_PORTFOLIO_GROSS_EXPOSURE_MULTIPLIER = 4.5;
 const COOLDOWNS_ENABLED = false;
@@ -1041,6 +1048,15 @@ export default function App() {
     const saved = localStorage.getItem('te_max_concurrent_trades');
     return saved ? (parseInt(saved, 10) || 15) : 15;
   });
+  const effectiveLiveAutoEntryMinScore = isRealMode
+    ? Math.max(autoEntryMinScore, PROFITABLE_LIVE_RUNTIME_GATES.autoEntryMinScore)
+    : autoEntryMinScore;
+  const effectiveLiveMinEdgeAfterFrictionPct = isRealMode
+    ? Math.max(minEdgeAfterFrictionPct, PROFITABLE_LIVE_RUNTIME_GATES.minEdgeAfterFrictionPct)
+    : minEdgeAfterFrictionPct;
+  const effectiveLiveEntriesPerCycle = isRealMode
+    ? Math.min(liveEntriesPerCycle, PROFITABLE_LIVE_RUNTIME_GATES.liveEntriesPerCycle)
+    : liveEntriesPerCycle;
   const [maxDrawdownPercent, setMaxDrawdownPercent] = useState(() => {
     const saved = localStorage.getItem('te_max_drawdown_percent');
     return saved ? (parseFloat(saved) || 10) : 10;
@@ -1392,8 +1408,8 @@ export default function App() {
   const getDesiredLiveEntryNotional = React.useCallback((confidenceScore: number | undefined, tradableCapital: number) => {
     const minLiveNotional = Math.max(1, liveMinOrderNotional);
     const availableCapital = Math.max(0, tradableCapital);
-    const strongSignalSizing = Number.isFinite(confidenceScore) && confidenceScore !== undefined && isStrongLiveSignal(confidenceScore, autoEntryMinScore);
-    const confidenceFloor = Math.min(9.5, Math.max(0, autoEntryMinScore));
+    const strongSignalSizing = Number.isFinite(confidenceScore) && confidenceScore !== undefined && isStrongLiveSignal(confidenceScore, effectiveLiveAutoEntryMinScore);
+    const confidenceFloor = Math.min(9.5, Math.max(0, effectiveLiveAutoEntryMinScore));
     const normalizedConfidence = Number.isFinite(confidenceScore) && confidenceScore !== undefined
       ? Math.max(0, Math.min(1, (confidenceScore - confidenceFloor) / Math.max(0.5, 10 - confidenceFloor)))
       : 0;
@@ -1430,7 +1446,7 @@ export default function App() {
     }
 
     return allocation;
-  }, [autoEntryMinScore, isDefensiveMode, liveMinOrderNotional, maxLiveOrderNotional]);
+  }, [effectiveLiveAutoEntryMinScore, isDefensiveMode, liveMinOrderNotional, maxLiveOrderNotional]);
 
   React.useEffect(() => {
     holdingsRef.current = holdings;
@@ -2537,8 +2553,8 @@ export default function App() {
           setExecutionFeedback({ type: 'warning', message: `Manual override for ${tradeSymbol}: ${symbolRiskBlock.reason}.` });
         }
 
-        if (Number.isFinite(confidenceScore) && confidenceScore !== undefined && confidenceScore < autoEntryMinScore) {
-          const confidenceMsg = `confidence ${confidenceScore.toFixed(1)} below live minimum ${autoEntryMinScore.toFixed(1)}`;
+        if (Number.isFinite(confidenceScore) && confidenceScore !== undefined && confidenceScore < effectiveLiveAutoEntryMinScore) {
+          const confidenceMsg = `confidence ${confidenceScore.toFixed(1)} below live minimum ${effectiveLiveAutoEntryMinScore.toFixed(1)}`;
           if (!allowManualOverride) {
             addLog(`TRADE SKIPPED: ${tradeSymbol} ${confidenceMsg}.`, 'warning');
             setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${confidenceMsg}.` });
@@ -2551,8 +2567,8 @@ export default function App() {
         }
 
         const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(type, price, tradePlan, estimatedRoundTripFrictionBps);
-        if (edgeAfterFrictionPct !== null && edgeAfterFrictionPct < minEdgeAfterFrictionPct) {
-          const edgeMsg = `edge after friction ${edgeAfterFrictionPct.toFixed(2)}% below ${minEdgeAfterFrictionPct.toFixed(2)}%`;
+        if (edgeAfterFrictionPct !== null && edgeAfterFrictionPct < effectiveLiveMinEdgeAfterFrictionPct) {
+          const edgeMsg = `edge after friction ${edgeAfterFrictionPct.toFixed(2)}% below ${effectiveLiveMinEdgeAfterFrictionPct.toFixed(2)}%`;
           if (!allowManualOverride) {
             addLog(`TRADE SKIPPED: ${tradeSymbol} ${edgeMsg}.`, 'warning');
             setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${edgeMsg}.` });
@@ -3199,7 +3215,7 @@ export default function App() {
         }
       }
     }
-  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, maxLiveOrderNotional, autoEntryMinScore, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes, hardReentryCooldownMinutes, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional, getBufferedLiveCapital, liveMarginBufferPct, getLiveEntryCapacityBlock, getEntryRetryLock, setEntryRetryLock, clearEntryRetryLock, clearExchangeProtection, serverStatus, liveEntryDelayMs, scanIntervalSec]);
+  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, maxLiveOrderNotional, effectiveLiveAutoEntryMinScore, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes, hardReentryCooldownMinutes, estimatedRoundTripFrictionBps, effectiveLiveMinEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional, getBufferedLiveCapital, liveMarginBufferPct, getLiveEntryCapacityBlock, getEntryRetryLock, setEntryRetryLock, clearEntryRetryLock, clearExchangeProtection, serverStatus, liveEntryDelayMs, scanIntervalSec]);
 
   const managePlannedExit = React.useCallback((holding: Holding, price: number, signal?: StrategySignal | null, cycleId?: number) => {
     const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
@@ -4560,7 +4576,9 @@ export default function App() {
       const currentAutoTrade = autoTradeRef.current;
       const currentExecutionEnabled = currentAutoTrade && hasLiveExecutionControl();
       const currentHoldings = holdingsRef.current;
-      const currentMaxTrades = maxConcurrentTradesRef.current;
+      const currentMaxTrades = isRealMode
+        ? Math.min(maxConcurrentTradesRef.current, PROFITABLE_LIVE_RUNTIME_GATES.maxConcurrentTrades)
+        : maxConcurrentTradesRef.current;
       const entryLockActive = entryLockUntilRef.current > Date.now();
       const scanNow = Date.now();
 
@@ -4591,8 +4609,8 @@ export default function App() {
           : [];
 
       const MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE = 0;
-      const relaxedAutoEntryMinScore = isRealMode ? Math.max(0, autoEntryMinScore - 0.8) : autoEntryMinScore;
-      const relaxedMinEdgeAfterFrictionPct = isRealMode ? Math.max(0, minEdgeAfterFrictionPct - 0.2) : minEdgeAfterFrictionPct;
+      const relaxedAutoEntryMinScore = effectiveLiveAutoEntryMinScore;
+      const relaxedMinEdgeAfterFrictionPct = effectiveLiveMinEdgeAfterFrictionPct;
 
       const isShortFacingLocalUpwardMomentum = (pick: MarketScanResult) => {
         const positiveDay = (pick.change24h || 0) > 0.75;
@@ -4805,7 +4823,7 @@ export default function App() {
         const eligibleBuyCount = entries.filter(entry => entry.side === 'BUY').length;
         const eligibleSellCount = entries.filter(entry => entry.side === 'SELL').length;
         const baseAvailableSlots = Math.max(0, currentMaxTrades - currentHoldings.length);
-        const perCycleEntryCap = Math.max(1, liveEntriesPerCycle);
+        const perCycleEntryCap = Math.max(1, effectiveLiveEntriesPerCycle);
         const effectiveBaseAvailableSlots = Math.min(baseAvailableSlots, perCycleEntryCap);
         if (effectiveBaseAvailableSlots > 0) {
           const openSideCounts = currentHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
@@ -4934,7 +4952,7 @@ export default function App() {
       setScanning(false);
       setTimeout(() => setIsBotActive(false), 2000);
     }
-  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, autoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, liveEntriesPerCycle, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode, isUnsupportedLiveScanSymbol, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional, getBufferedLiveCapital, maxSymbolsPerScan, liveAutoScanLimit]);
+  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, effectiveLiveAutoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, effectiveLiveEntriesPerCycle, strategyConfig, liveQuoteAllowlistInput, fullUniverseMode, isUnsupportedLiveScanSymbol, estimatedRoundTripFrictionBps, effectiveLiveMinEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional, getBufferedLiveCapital, maxSymbolsPerScan, liveAutoScanLimit]);
  // Removed 'scanning' from dependencies
 
   React.useEffect(() => {
