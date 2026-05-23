@@ -1674,6 +1674,12 @@ export default function App() {
   }, [claimLiveControl, isRealMode]);
 
   React.useEffect(() => {
+    if (isRealMode || !autoTrade) return;
+    if (!liveControllerTabId) return;
+    setIsRealMode(true);
+  }, [autoTrade, isRealMode, liveControllerTabId]);
+
+  React.useEffect(() => {
     const handleStorage = (event: StorageEvent) => {
       if (!event.key) return;
 
@@ -2140,6 +2146,9 @@ export default function App() {
         const syncedBalance = Number.isFinite(liveEquity) && liveEquity > 0 ? liveEquity : usdt;
         const syncedAvailable = Number.isFinite(liveAvailable) && liveAvailable >= 0 ? liveAvailable : usdt;
         const syncedUnrealized = Number(data?.unrealizedPnl);
+        const syncedPositionCount = data?.positions && typeof data.positions === 'object'
+          ? Object.keys(data.positions).length
+          : 0;
         const nextFilteredSyncSymbols = Array.isArray(data?.filteredSymbols)
           ? data.filteredSymbols
               .map((entry: any) => ({
@@ -2151,6 +2160,9 @@ export default function App() {
         setBalance(syncedBalance);
         setAvailableFunds(syncedAvailable);
         setLiveUnrealizedPnl(Number.isFinite(syncedUnrealized) ? syncedUnrealized : 0);
+        if (!isRealMode && autoTradeRef.current && (Boolean(liveControllerTabId) || syncedPositionCount > 0 || syncedBalance > 0)) {
+          setIsRealMode(true);
+        }
         setFilteredSyncSymbols(nextFilteredSyncSymbols);
         setServerConfig(prev => prev ? {
           ...prev,
@@ -2364,7 +2376,7 @@ export default function App() {
       isSyncingRef.current = false;
       setIsSyncing(false);
     }
-  }, [addLog, applyBenchmarkCapital, reportSyncError, serverConfig?.outboundIp, benchmarkCapital, holdings.length, isRealMode, marketPicks, holdingPrices, pushTradeEvent]);
+  }, [addLog, applyBenchmarkCapital, reportSyncError, serverConfig?.outboundIp, benchmarkCapital, holdings.length, isRealMode, liveControllerTabId, marketPicks, holdingPrices, pushTradeEvent]);
 
   React.useEffect(() => {
     syncRealBalanceRef.current = syncRealBalance;
