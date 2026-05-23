@@ -153,6 +153,32 @@ That means:
 
 Entry locks and safety locks should stop new autonomous entries. They must not freeze portfolio value refresh, balance sync, or position visibility.
 
+Exchange-native protection is the primary live exit mechanism.
+
+That means:
+
+1. Live positions should be protected on Binance with exchange-native stop-loss and take-profit orders.
+2. App-side real-mode auto-exit churn should not act as the primary closer when exchange protection is active.
+3. Real-mode protection arming must carry the actual position amount and correct position side for one-way vs hedge mode.
+4. Live protection failures must be surfaced clearly and must not silently appear as healthy protection.
+
+Displayed live account values must come from Binance account sync, not reconstructed local estimates when Binance equity is available.
+
+That means:
+
+1. Portfolio value in live mode should reflect exchange-reported equity.
+2. Available funds in live mode should reflect exchange-reported available balance.
+3. Live account sync should continue while live mode is active, even if autonomous trading is off.
+4. Local cached state must not be allowed to masquerade as fresh Binance portfolio state.
+
+Trade plans must respect hard operator risk floors.
+
+That means:
+
+1. Stops must not be tighter than the configured minimum live stop-loss floor.
+2. Take-profit targets must not be tighter than the configured minimum target floor.
+3. When strategy-generated plans are tighter than those floors, the enforced runtime plan should widen them rather than silently preserving the tighter plan.
+
 ### Manual Operator Control
 
 The operator must be able to manually act from Top Ranked Signals.
@@ -175,6 +201,14 @@ After emergency liquidation:
 2. Re-entry should wait for the hard cooldown to expire.
 3. A later ranked scan should determine whether the symbol still merits a BUY or SELL review.
 4. The operator should be able to act manually from that review surface once a fresh ranked match exists.
+
+Manual liquidation must suspend autonomous trading first.
+
+That means:
+
+1. The system should disable autonomous entry submission before starting a bulk liquidation pass.
+2. Live execution control should be released before liquidation continues.
+3. After the first close pass, the system should resync with Binance and retry any positions still reported open.
 
 The system should preserve operator visibility into whether a liquidated symbol is still worth trading later, without reflexively re-entering it.
 
@@ -234,10 +268,19 @@ Persist at minimum:
 5. Last completed ranked market picks.
 6. Last completed scan summaries, blocked/deferred/pre-filter diagnostics, and universe/source metadata.
 7. Post-liquidation review queue state.
+8. Active position sort preferences.
 
 Do not clear scan archive or ranked snapshots during ordinary resets unless the operator explicitly clears them.
 
 Persisted state must be hydrated defensively. Older or partially populated localStorage entries must not crash rendering or blank the app.
+
+Autonomous control persistence must be conservative.
+
+That means:
+
+1. Turning autonomous mode off must be written immediately to durable state.
+2. Tabs that lose live execution control must not continue to preserve or reassert autonomous-on state.
+3. Disabling autonomous mode must cancel in-flight autonomous scan cycles as early as possible.
 
 ## UX Principles
 
@@ -258,6 +301,8 @@ The operator should be able to answer these questions instantly:
 4. What are the best current ranked opportunities?
 5. How old are those opportunities?
 6. What happened in prior scan cycles?
+7. Why is autonomous trading locked or paused right now?
+8. Whether displayed portfolio value is coming from Binance live sync.
 7. Why is the bot not trading?
 
 ## Engineering Standards
