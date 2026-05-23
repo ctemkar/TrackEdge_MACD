@@ -1676,7 +1676,12 @@ export default function App() {
       }
 
       if (event.key === 'te_real_mode') {
-        setIsRealMode(event.newValue === 'true');
+        const nextIsRealMode = event.newValue === 'true';
+        const controllerTabId = localStorage.getItem(LIVE_CONTROL_TAB_KEY) || liveControllerTabId;
+        if (!nextIsRealMode && controllerTabId === appTabIdRef.current) {
+          return;
+        }
+        setIsRealMode(nextIsRealMode);
       }
 
       if (event.key === LIVE_CONTROL_TAB_KEY) {
@@ -1730,7 +1735,7 @@ export default function App() {
 
     window.addEventListener('storage', handleStorage);
     return () => window.removeEventListener('storage', handleStorage);
-  }, [addLog, releaseLiveControl]);
+  }, [addLog, liveControllerTabId, releaseLiveControl]);
 
   React.useEffect(() => {
     const handleBeforeUnload = () => {
@@ -2223,16 +2228,17 @@ export default function App() {
           }).filter((h): h is Holding => h !== null);
 
           const existingHoldings = holdingsRef.current;
+            const maxTransientEmptySyncs = 8;
           const shouldPreserveExistingHoldings = isRealMode
             && existingHoldings.length > 0
             && freshHoldings.length === 0
             && nextFilteredSyncSymbols.length === 0
-            && consecutiveEmptyPositionSyncsRef.current < 2;
+              && consecutiveEmptyPositionSyncsRef.current < maxTransientEmptySyncs;
 
           if (shouldPreserveExistingHoldings) {
             consecutiveEmptyPositionSyncsRef.current += 1;
             freshHoldings = existingHoldings;
-            addLog(`SYNC WARNING: Binance returned an empty position snapshot while ${existingHoldings.length} live holding${existingHoldings.length === 1 ? '' : 's'} were already tracked. Preserving current positions until the exchange confirms the flat state.`, 'warning');
+              addLog(`SYNC WARNING: Binance returned an empty position snapshot while ${existingHoldings.length} live holding${existingHoldings.length === 1 ? '' : 's'} were already tracked. Preserving current positions until the exchange confirms the flat state (${consecutiveEmptyPositionSyncsRef.current}/${maxTransientEmptySyncs}).`, 'warning');
           } else {
             consecutiveEmptyPositionSyncsRef.current = freshHoldings.length === 0 ? consecutiveEmptyPositionSyncsRef.current : 0;
             setHoldings(freshHoldings);
@@ -3503,7 +3509,6 @@ export default function App() {
     localStorage.setItem('te_benchmark_capital', benchmarkCapital.toString());
     localStorage.setItem('te_benchmark_set_at', benchmarkSetAt > 0 ? String(benchmarkSetAt) : '');
     localStorage.setItem('te_auto_trade', autoTrade.toString());
-    localStorage.setItem('te_real_mode', isRealMode.toString());
     localStorage.setItem('te_active_position_sort_rules', JSON.stringify(activePositionSortRules));
     localStorage.setItem('te_stop_loss_percent', stopLossPercent.toString());
     localStorage.setItem('te_take_profit_percent', takeProfitPercent.toString());
@@ -3542,6 +3547,17 @@ export default function App() {
     localStorage.setItem('te_hard_failure_lock_minutes', hardFailureLockMinutes.toString());
     localStorage.setItem('te_strategy_config', JSON.stringify(strategyConfig));
   }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, benchmarkSetAt, autoTrade, isRealMode, activePositionSortRules, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, liveMarginBufferPct, hardReentryCooldownMinutes, minEdgeAfterFrictionPct, estimatedRoundTripFrictionBps, symbolDailyLossLimit, symbolDailyFlipLimit, accountDailyLossLimit, marginStopLossPct, fastAdverseMoveExitPct, dailyEquityAnchorDate, dailyEquityAnchor, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, liveAutoScanLimit, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
+
+  useEffect(() => {
+    const controllerTabId = localStorage.getItem(LIVE_CONTROL_TAB_KEY) || liveControllerTabId;
+    const shouldPersist = isRealMode || controllerTabId === appTabIdRef.current || !controllerTabId;
+    if (!shouldPersist) return;
+
+    const nextValue = isRealMode.toString();
+    if (localStorage.getItem('te_real_mode') !== nextValue) {
+      localStorage.setItem('te_real_mode', nextValue);
+    }
+  }, [isRealMode, liveControllerTabId]);
 
   useEffect(() => {
     if (!isRealMode || !Number.isFinite(balance) || balance <= 0) return;
@@ -5173,7 +5189,14 @@ export default function App() {
       ? computedPnl
       : exchangePnl;
 
-    return { mark, contracts, pnl };
+    // Display the estimated result if the position were closed now, net of configured friction.
+    const entryNotional = Math.max(0, Number(h.entryPrice || 0) * contracts);
+    const estimatedFriction = entryNotional > 0
+      ? entryNotional * (Math.max(0, estimatedRoundTripFrictionBps) / 10000)
+      : 0;
+    const netPnl = pnl - estimatedFriction;
+
+    return { mark, contracts, pnl: netPnl };
   };
 
   const computedUnrealizedPnl = holdings.reduce((sum, h) => {
@@ -5551,7 +5574,7 @@ export default function App() {
     { key: 'stopPrice', label: 'Stop Price' },
     { key: 'margin', label: 'Margin' },
     { key: 'notional', label: 'Notional' },
-    { key: 'unrealizedPnl', label: 'Unrealized P&L' },
+    { key: 'unrealizedPnl', label: 'Projected Exit P&L' },
     { key: 'pnlPct', label: 'P&L %' },
     { key: 'riskGuard', label: 'Risk Guard' },
     { key: 'action', label: 'Action Control', rightAlign: true },

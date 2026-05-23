@@ -56,6 +56,7 @@ async function startServer() {
   const PRIVATE_BALANCE_STALE_WHILE_BLOCKED_MS = 2 * 60 * 1000;
   const MAX_PUBLIC_KLINE_CACHE_ENTRIES = 2200;
   const PUBLIC_KLINE_STALE_WHILE_BLOCKED_MS = 20 * 60 * 1000;
+  const DEFAULT_BINANCE_RECV_WINDOW = '15000';
   const throttledLogState = new Map<string, number>();
   const logOnceState = new Set<string>();
   const routeHitState = new Map<string, { count: number; lastLoggedAt: number; latestSample: string }>();
@@ -219,15 +220,19 @@ async function startServer() {
 
     for (const endpoint of endpoints) {
       try {
+        const requestStartedAt = Date.now();
         const response = await fetch(endpoint, {
           headers: { 'User-Agent': 'TradeEdge-Bot/1.0' },
         });
+        const requestCompletedAt = Date.now();
         if (!response.ok) continue;
         const payload: any = await response.json().catch(() => null);
         const serverTime = Number(payload?.serverTime || 0);
         if (Number.isFinite(serverTime) && serverTime > 0) {
-          binanceServerTimeState.offsetMs = serverTime - Date.now();
-          binanceServerTimeState.syncedAt = Date.now();
+          const roundTripMs = Math.max(0, requestCompletedAt - requestStartedAt);
+          const estimatedLocalServerSampleTime = requestStartedAt + Math.round(roundTripMs / 2);
+          binanceServerTimeState.offsetMs = serverTime - estimatedLocalServerSampleTime;
+          binanceServerTimeState.syncedAt = requestCompletedAt;
           return binanceServerTimeState.offsetMs;
         }
       } catch {
@@ -246,6 +251,7 @@ async function startServer() {
     const offsetMs = await syncBinanceServerTimeOffset(options?.forceTimeSync === true);
     const query = new URLSearchParams({
       ...params,
+      recvWindow: params.recvWindow || DEFAULT_BINANCE_RECV_WINDOW,
       timestamp: String(Date.now() + offsetMs),
     });
     const queryString = query.toString();
@@ -553,7 +559,7 @@ async function startServer() {
       for (let requestAttempt = 0; requestAttempt < 2; requestAttempt++) {
         const { queryString, signature } = await buildBinanceSignedQuery(apiSecret, {
           ...params,
-          recvWindow: params.recvWindow || '5000',
+          recvWindow: params.recvWindow || DEFAULT_BINANCE_RECV_WINDOW,
         }, { forceTimeSync: requestAttempt > 0 });
 
         const signedPayload = `${queryString}&signature=${signature}`;
@@ -631,6 +637,32 @@ async function startServer() {
       const message = String(error?.message || 'portfolio margin account unavailable');
       return {
         accountData: null,
+        authError: isBinanceAuthErrorMessage(message),
+        message,
+      };
+    }
+  };
+
+  const fetchBinancePortfolioMarginBalanceViaHttp = async (
+    apiKey: string,
+    apiSecret: string,
+  ): Promise<{
+    rows: any[];
+    authError: boolean;
+    message?: string;
+  }> => {
+    try {
+      const response = await fetchBinanceSignedJson(apiKey, apiSecret, [
+        { label: 'papi-balance', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/balance' },
+      ], {});
+      return {
+        rows: Array.isArray(response?.data) ? response.data : [],
+        authError: false,
+      };
+    } catch (error: any) {
+      const message = String(error?.message || 'portfolio margin balance unavailable');
+      return {
+        rows: [],
         authError: isBinanceAuthErrorMessage(message),
         message,
       };
@@ -965,20 +997,13 @@ async function startServer() {
       }
 
       const amount = Number(rawAmount.toFixed(8));
-      const timestamp = Date.now();
-      const recvWindow = 5000;
-      const params = new URLSearchParams({
+      const recvWindow = DEFAULT_BINANCE_RECV_WINDOW;
+      const { queryString, signature } = await buildBinanceSignedQuery(apiSecret, {
         type,
         asset,
         amount: amount.toString(),
-        timestamp: String(timestamp),
-        recvWindow: String(recvWindow),
+        recvWindow,
       });
-      const queryString = params.toString();
-      const signature = crypto
-        .createHmac('sha256', apiSecret)
-        .update(queryString)
-        .digest('hex');
 
       const url = `https://api.binance.com/sapi/v1/asset/transfer?${queryString}&signature=${signature}`;
       const response = await fetch(url, {
@@ -1108,6 +1133,7 @@ async function startServer() {
       let balanceData: any;
       let papiAccountEquity: number | null = null;
       let papiAvailableBalance: number | null = null;
+      let papiBalanceUnrealizedPnl: number | null = null;
       if (client.id === 'gemini') {
         try {
           // Fetch all possible sub-accounts for Gemini
@@ -1221,6 +1247,17 @@ async function startServer() {
               }
               if (Number.isFinite(availableBalance) && availableBalance >= 0) {
                 papiAvailableBalance = availableBalance;
+              }
+            }
+
+            const pmBalance = await fetchBinancePortfolioMarginBalanceViaHttp(preferredBinance.key, preferredBinance.secret);
+            if (pmBalance.rows.length > 0) {
+              const unrealizedPnl = pmBalance.rows.reduce((sum: number, row: any) => {
+                const value = Number(row?.umUnrealizedPNL || 0);
+                return sum + (Number.isFinite(value) ? value : 0);
+              }, 0);
+              if (Number.isFinite(unrealizedPnl)) {
+                papiBalanceUnrealizedPnl = unrealizedPnl;
               }
             }
           }
@@ -1603,6 +1640,10 @@ async function startServer() {
           60 * 1000,
         );
 
+        if (Number.isFinite(papiBalanceUnrealizedPnl)) {
+          totalUnrealizedPnl = papiBalanceUnrealizedPnl as number;
+        }
+
         // ALSO add UM unrealized PnL from the account info (UM = Unified Margin positions in futures)
         if (Array.isArray(b.info) && totalUnrealizedPnl === 0) {
           const umPnlSum = b.info.reduce((sum: number, row: any) => {
@@ -1661,7 +1702,7 @@ async function startServer() {
           }
         }
 
-        if (portfolioMarginEquity && portfolioMarginEquity > cashTotal) {
+        if (portfolioMarginEquity && portfolioMarginEquity > 0) {
           cashTotal = portfolioMarginEquity;
         }
 
