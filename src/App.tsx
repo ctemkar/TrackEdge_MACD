@@ -1663,6 +1663,10 @@ export default function App() {
 
       if (event.key === 'te_auto_trade') {
         const nextAutoTrade = event.newValue === 'true';
+        const controllerTabId = localStorage.getItem(LIVE_CONTROL_TAB_KEY) || liveControllerTabId;
+        if (!nextAutoTrade && controllerTabId === appTabIdRef.current) {
+          return;
+        }
         autoTradeRef.current = nextAutoTrade;
         setAutoTrade(nextAutoTrade);
         if (!nextAutoTrade) {
@@ -1689,9 +1693,6 @@ export default function App() {
         setLiveControllerTabId(nextController);
         setShowLiveControlLockPrompt(false);
         if (nextController && nextController !== appTabIdRef.current && autoTradeRef.current) {
-          autoTradeRef.current = false;
-          setAutoTrade(false);
-          localStorage.setItem('te_auto_trade', 'false');
           setExecutionFeedback({ type: 'warning', message: 'Autonomous control moved to another tab. This tab is now read-only.' });
           addLog('AUTONOMOUS CONTROL TRANSFERRED: another tab is now the live controller.', 'warning');
         }
@@ -2091,8 +2092,8 @@ export default function App() {
         } else if (isAuthFailedStatus || isAuthError) {
           setPrivateSyncBlockedUntil(0);
           message = authRetryAt
-            ? `Live trading disabled until ${authRetryAt}`
-            : `Live trading disabled until ${(new Date(authBlockedUntil || Date.now() + 60000)).toLocaleTimeString()}`;
+            ? `Live futures auth degraded until ${authRetryAt}. Live mode stays on, but exchange sync and new entries are paused.`
+            : `Live futures auth degraded until ${(new Date(authBlockedUntil || Date.now() + 60000)).toLocaleTimeString()}. Live mode stays on, but exchange sync and new entries are paused.`;
           setAuthDegradedMessage(message);
           if (hasAuthBlock) {
             entryLockUntilRef.current = Math.max(entryLockUntilRef.current, authBlockedUntil);
@@ -3508,7 +3509,6 @@ export default function App() {
     localStorage.setItem('te_seed', seedCapital.toString());
     localStorage.setItem('te_benchmark_capital', benchmarkCapital.toString());
     localStorage.setItem('te_benchmark_set_at', benchmarkSetAt > 0 ? String(benchmarkSetAt) : '');
-    localStorage.setItem('te_auto_trade', autoTrade.toString());
     localStorage.setItem('te_active_position_sort_rules', JSON.stringify(activePositionSortRules));
     localStorage.setItem('te_stop_loss_percent', stopLossPercent.toString());
     localStorage.setItem('te_take_profit_percent', takeProfitPercent.toString());
@@ -3547,6 +3547,17 @@ export default function App() {
     localStorage.setItem('te_hard_failure_lock_minutes', hardFailureLockMinutes.toString());
     localStorage.setItem('te_strategy_config', JSON.stringify(strategyConfig));
   }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, benchmarkSetAt, autoTrade, isRealMode, activePositionSortRules, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, liveMarginBufferPct, hardReentryCooldownMinutes, minEdgeAfterFrictionPct, estimatedRoundTripFrictionBps, symbolDailyLossLimit, symbolDailyFlipLimit, accountDailyLossLimit, marginStopLossPct, fastAdverseMoveExitPct, dailyEquityAnchorDate, dailyEquityAnchor, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, liveAutoScanLimit, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
+
+  useEffect(() => {
+    const controllerTabId = localStorage.getItem(LIVE_CONTROL_TAB_KEY) || liveControllerTabId;
+    const shouldPersist = autoTrade || controllerTabId === appTabIdRef.current || !controllerTabId;
+    if (!shouldPersist) return;
+
+    const nextValue = autoTrade.toString();
+    if (localStorage.getItem('te_auto_trade') !== nextValue) {
+      localStorage.setItem('te_auto_trade', nextValue);
+    }
+  }, [autoTrade, liveControllerTabId]);
 
   useEffect(() => {
     const controllerTabId = localStorage.getItem(LIVE_CONTROL_TAB_KEY) || liveControllerTabId;
