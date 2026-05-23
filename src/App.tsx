@@ -18,6 +18,72 @@ const LIVE_CONTROL_FOCUS_REQUEST_KEY = 'te_live_controller_focus_request';
 const LIVE_CONTROL_CLOSE_OTHERS_KEY = 'te_live_close_other_tabs_request';
 const DEFAULT_MARGIN_STOP_LOSS_PCT = 12;
 const DEFAULT_FAST_ADVERSE_MOVE_EXIT_PCT = 1.2;
+const MIN_ENFORCED_STOP_LOSS_PCT = 3;
+const MIN_ENFORCED_TAKE_PROFIT_PCT = 8;
+
+type EnforcedTradePlan = NonNullable<StrategySignal['tradePlan']>;
+
+const clampStopLossPercent = (value: number) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return MIN_ENFORCED_STOP_LOSS_PCT;
+  return Math.max(MIN_ENFORCED_STOP_LOSS_PCT, numeric);
+};
+
+const clampTakeProfitPercent = (value: number) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return MIN_ENFORCED_TAKE_PROFIT_PCT;
+  return Math.max(MIN_ENFORCED_TAKE_PROFIT_PCT, numeric);
+};
+
+const buildEnforcedTradePlan = (
+  entryPrice: number,
+  side: 'LONG' | 'SHORT',
+  plan: Partial<EnforcedTradePlan> | undefined,
+  fallbackStopLossPercent: number,
+  fallbackTakeProfitPercent: number,
+): EnforcedTradePlan => {
+  const safeEntryPrice = Number(entryPrice);
+  const stopLossPct = clampStopLossPercent(fallbackStopLossPercent);
+  const takeProfitPct = clampTakeProfitPercent(fallbackTakeProfitPercent);
+  const fallbackStopPrice = side === 'SHORT'
+    ? safeEntryPrice * (1 + (stopLossPct / 100))
+    : safeEntryPrice * (1 - (stopLossPct / 100));
+  const fallbackTakeProfitPrice = side === 'SHORT'
+    ? safeEntryPrice * (1 - (takeProfitPct / 100))
+    : safeEntryPrice * (1 + (takeProfitPct / 100));
+  const rawStopPrice = Number(plan?.stopPrice);
+  const rawTp1Price = Number(plan?.tp1Price);
+  const rawTp2Price = Number(plan?.tp2Price);
+  const minStopPrice = side === 'SHORT'
+    ? safeEntryPrice * (1 + (MIN_ENFORCED_STOP_LOSS_PCT / 100))
+    : safeEntryPrice * (1 - (MIN_ENFORCED_STOP_LOSS_PCT / 100));
+  const minTakeProfitPrice = side === 'SHORT'
+    ? safeEntryPrice * (1 - (MIN_ENFORCED_TAKE_PROFIT_PCT / 100))
+    : safeEntryPrice * (1 + (MIN_ENFORCED_TAKE_PROFIT_PCT / 100));
+
+  const stopPriceBase = Number.isFinite(rawStopPrice) && rawStopPrice > 0 ? rawStopPrice : fallbackStopPrice;
+  const tp1PriceBase = Number.isFinite(rawTp1Price) && rawTp1Price > 0 ? rawTp1Price : fallbackTakeProfitPrice;
+  const tp2PriceBase = Number.isFinite(rawTp2Price) && rawTp2Price > 0 ? rawTp2Price : fallbackTakeProfitPrice;
+
+  const stopPrice = side === 'SHORT'
+    ? Math.max(stopPriceBase, minStopPrice)
+    : Math.min(stopPriceBase, minStopPrice);
+  const tp1Price = side === 'SHORT'
+    ? Math.min(tp1PriceBase, minTakeProfitPrice)
+    : Math.max(tp1PriceBase, minTakeProfitPrice);
+  const tp2Price = side === 'SHORT'
+    ? Math.min(tp2PriceBase, tp1Price, minTakeProfitPrice)
+    : Math.max(tp2PriceBase, tp1Price, minTakeProfitPrice);
+  const trailingBufferPct = Number(plan?.trailingBufferPct);
+
+  return {
+    stopPrice: Number(stopPrice.toFixed(8)),
+    tp1Price: Number(tp1Price.toFixed(8)),
+    tp2Price: Number(tp2Price.toFixed(8)),
+    riskPerUnit: Number(Math.max(Math.abs(safeEntryPrice - stopPrice), safeEntryPrice * 0.005).toFixed(8)),
+    trailingBufferPct: Number((Number.isFinite(trailingBufferPct) && trailingBufferPct > 0 ? trailingBufferPct : 0.012).toFixed(4)),
+  };
+};
 
 const getLocalDayKey = () => {
   const now = new Date();
@@ -81,8 +147,8 @@ const CRITERIA_HELP: Record<string, string> = {
 
 const PARAMETER_DEFAULTS = {
   maxConcurrentTrades: 10,
-  takeProfitPercent: 8,
-  stopLossPercent: 3.5,
+  takeProfitPercent: MIN_ENFORCED_TAKE_PROFIT_PCT,
+  stopLossPercent: MIN_ENFORCED_STOP_LOSS_PCT,
   maxDrawdownPercent: 10,
   isDefensiveMode: false,
   autoEntryMinScore: 6.0,
@@ -454,11 +520,11 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [stopLossPercent, setStopLossPercent] = useState(() => {
     const saved = localStorage.getItem('te_stop_loss_percent');
-    return saved ? (parseFloat(saved) || 3.5) : 3.5;
+    return saved ? clampStopLossPercent(parseFloat(saved)) : MIN_ENFORCED_STOP_LOSS_PCT;
   });
   const [takeProfitPercent, setTakeProfitPercent] = useState(() => {
     const saved = localStorage.getItem('te_take_profit_percent');
-    return saved ? (parseFloat(saved) || 8) : 8;
+    return saved ? clampTakeProfitPercent(parseFloat(saved)) : MIN_ENFORCED_TAKE_PROFIT_PCT;
   });
   const [autoEntryMinScore, setAutoEntryMinScore] = useState(() => {
     const saved = localStorage.getItem('te_auto_entry_min_score');
@@ -1433,10 +1499,12 @@ export default function App() {
 
   React.useEffect(() => {
     if (!autoTrade) {
+      currentScanCycleRef.current = 0;
       scanningRef.current = false;
       setScanning(false);
       setIsBotActive(false);
       setScanProgress({ current: 0, total: 0 });
+      setNextScanSec(0);
     }
   }, [autoTrade]);
 
@@ -1539,6 +1607,14 @@ export default function App() {
         const nextAutoTrade = event.newValue === 'true';
         autoTradeRef.current = nextAutoTrade;
         setAutoTrade(nextAutoTrade);
+        if (!nextAutoTrade) {
+          currentScanCycleRef.current = 0;
+          scanningRef.current = false;
+          setScanning(false);
+          setIsBotActive(false);
+          setScanProgress({ current: 0, total: 0 });
+          setNextScanSec(0);
+        }
       }
 
       if (event.key === 'te_real_mode') {
@@ -1796,8 +1872,20 @@ export default function App() {
     if (!isRealMode || String(serverConfig?.exchange || '').toLowerCase() !== 'binance') return false;
     const symbol = normalizeLiveFuturesSymbol(holding.symbol);
     const amount = Math.abs(Number(holding.amount || holding.contracts || 0));
-    const stopPrice = Number(holding.stopPrice || 0);
-    const takeProfitPrice = Number(holding.tp2Price || 0);
+    const enforcedPlan = buildEnforcedTradePlan(
+      Number(holding.entryPrice || 0),
+      holding.side,
+      {
+        stopPrice: holding.stopPrice,
+        tp1Price: holding.tp1Price,
+        tp2Price: holding.tp2Price,
+        trailingBufferPct: holding.trailingBufferPct,
+      },
+      stopLossPercent,
+      takeProfitPercent,
+    );
+    const stopPrice = Number(enforcedPlan.stopPrice || 0);
+    const takeProfitPrice = Number(enforcedPlan.tp2Price || 0);
     if (!symbol || !Number.isFinite(amount) || amount <= 0 || (!Number.isFinite(stopPrice) && !Number.isFinite(takeProfitPrice))) return false;
 
     const protectionKey = `${symbol}:${holding.side}`;
@@ -1861,7 +1949,7 @@ export default function App() {
     } finally {
       delete liveProtectionInflightRef.current[protectionKey];
     }
-  }, [addLog, isRealMode, serverConfig?.exchange]);
+  }, [addLog, isRealMode, serverConfig?.exchange, stopLossPercent, takeProfitPercent]);
 
   const syncRealBalance = React.useCallback(async (options?: { ignoreEntryLock?: boolean }) => {
     const ignoreEntryLock = options?.ignoreEntryLock === true;
@@ -3457,24 +3545,26 @@ export default function App() {
   const currentHoldingContracts = Number(currentHolding?.contracts || currentHolding?.amount || 0);
   const currentHoldingNotional = Number(currentHolding?.notional || (currentHoldingContracts * Number(currentHolding?.entryPrice || 0)) || 0);
   const currentHoldingMargin = Number(currentHolding?.initialMargin || (currentHoldingNotional > 0 ? currentHoldingNotional / 5 : 0) || 0);
-  const stopLossPrice = currentHolding
-    ? (currentHolding.side === 'SHORT'
-      ? currentHolding.entryPrice * (1 + stopLossPercent / 100)
-      : currentHolding.entryPrice * (1 - stopLossPercent / 100))
-    : 0;
+  const currentHoldingPlan = currentHolding
+    ? buildEnforcedTradePlan(
+        currentHolding.entryPrice,
+        currentHolding.side,
+        {
+          stopPrice: currentHolding.stopPrice,
+          tp1Price: currentHolding.tp1Price,
+          tp2Price: currentHolding.tp2Price,
+          trailingBufferPct: currentHolding.trailingBufferPct,
+        },
+        stopLossPercent,
+        takeProfitPercent,
+      )
+    : null;
+  const stopLossPrice = currentHoldingPlan?.stopPrice || 0;
   const currentHoldingRiskPerUnit = currentHolding
     ? Math.max(Math.abs(currentHolding.entryPrice - stopLossPrice), currentHolding.entryPrice * 0.005)
     : 0;
-  const currentHoldingTp1Price = currentHolding
-    ? (currentHolding.tp1Price || (currentHolding.side === 'SHORT'
-      ? currentHolding.entryPrice - (currentHoldingRiskPerUnit * 1.25)
-      : currentHolding.entryPrice + (currentHoldingRiskPerUnit * 1.25)))
-    : 0;
-  const currentHoldingTp2Price = currentHolding
-    ? (currentHolding.tp2Price || (currentHolding.side === 'SHORT'
-      ? currentHolding.entryPrice - (currentHoldingRiskPerUnit * 2.4)
-      : currentHolding.entryPrice + (currentHoldingRiskPerUnit * 2.4)))
-    : 0;
+  const currentHoldingTp1Price = currentHoldingPlan?.tp1Price || 0;
+  const currentHoldingTp2Price = currentHoldingPlan?.tp2Price || 0;
   const currentHoldingStopPctFromEntry = currentHolding?.entryPrice
     ? (Math.abs(stopLossPrice - currentHolding.entryPrice) / currentHolding.entryPrice) * 100
     : 0;
@@ -3987,6 +4077,11 @@ export default function App() {
   // Market Scanner Logic
   const performScan = React.useCallback(async (manual = false) => {
     if (scanningRef.current) return;
+    if (!manual && !autoTradeRef.current) {
+      setScanProgress({ current: 0, total: 0 });
+      setNextScanSec(0);
+      return;
+    }
     if (rateLimitedUntilRef.current > Date.now()) {
       setScanProgress({ current: 0, total: 0 });
       return;
@@ -4656,6 +4751,7 @@ export default function App() {
             });
             if (!streamLiveEntriesDuringScan) {
               for (const { side, pick } of selectedTrades) {
+                if (!autoTradeRef.current || currentScanCycleRef.current !== cycleId) break;
                 if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
                   pushScanSkipEvent(`SKIP: ${pick.symbol} blocked because quote assets are treated as cash, not tradable base positions`, cycleId);
                   continue;
@@ -4815,13 +4911,21 @@ export default function App() {
     };
 
     loadData();
-    void performScanRef.current();
-    setNextScanSec(scanIntervalSec);
+    if (autoTradeRef.current) {
+      void performScanRef.current();
+      setNextScanSec(scanIntervalSec);
+    } else {
+      setNextScanSec(0);
+    }
 
     const refreshInterval = setInterval(() => {
       loadData(true);
-      void performScanRef.current();
-      setNextScanSec(scanIntervalSec);
+      if (autoTradeRef.current) {
+        void performScanRef.current();
+        setNextScanSec(scanIntervalSec);
+      } else {
+        setNextScanSec(0);
+      }
     }, scanIntervalSec * 1000);
 
     const countdownInterval = setInterval(() => {
@@ -4842,7 +4946,7 @@ export default function App() {
       clearInterval(refreshInterval);
       clearInterval(countdownInterval);
     };
-  }, [symbol, isRealMode, serverConfig?.exchange, serverStatus, scanIntervalSec]);
+  }, [autoTrade, symbol, isRealMode, serverConfig?.exchange, serverStatus, scanIntervalSec]);
 
   // Dedicated Portfolio Price Watcher (WebSocket first, polling fallback inside subscribeToTicker)
   useEffect(() => {
@@ -6225,6 +6329,8 @@ export default function App() {
                       claimLiveControl();
                     }
                     if (!newState) {
+                      currentScanCycleRef.current = 0;
+                      scanningRef.current = false;
                       releaseLiveControl();
                     }
                     autoTradeRef.current = newState;
