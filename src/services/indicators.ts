@@ -367,10 +367,15 @@ export function evaluateStrategy(
     directionalVolumeMomentumScore: number,
     directionalRiskRewardScore: number,
   ) => {
-    const weighted = (directionalMacdScore * 0.30)
-      + (directionalTrendScore * 0.30)
-      + (directionalVolumeMomentumScore * 0.20)
-      + (directionalRiskRewardScore * 0.20);
+    const macdWeight = 0.30 * Math.max(0.1, config.contextMacdScore);
+    const trendWeight = (0.20 * Math.max(0.1, config.contextTrendScore)) + (0.10 * Math.max(0.1, config.contextEmaScore));
+    const volumeWeight = 0.20 * Math.max(0.1, config.contextVolumeScore);
+    const riskWeight = 0.20 * Math.max(0.1, config.contextRsiScore);
+    const totalWeight = macdWeight + trendWeight + volumeWeight + riskWeight;
+    const weighted = ((directionalMacdScore * macdWeight)
+      + (directionalTrendScore * trendWeight)
+      + (directionalVolumeMomentumScore * volumeWeight)
+      + (directionalRiskRewardScore * riskWeight)) / Math.max(0.0001, totalWeight);
 
     return Math.min(config.maxScore, Number(weighted.toFixed(1)));
   };
