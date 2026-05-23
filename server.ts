@@ -2436,6 +2436,9 @@ async function startServer() {
       const requestedProtectionSide = requestedPositionSide === 'LONG' || requestedPositionSide === 'SHORT' || requestedPositionSide === 'BOTH'
         ? requestedPositionSide
         : undefined;
+      const protectionDirection = requestedProtectionSide === 'LONG' || requestedProtectionSide === 'SHORT'
+        ? requestedProtectionSide
+        : null;
       const positionMode = await fetchBinancePositionModeViaHttp(apiKey, apiSecret);
       const effectivePositionSide: 'LONG' | 'SHORT' | 'BOTH' = positionMode.dualSidePosition === true
         ? requestedProtectionSide === 'LONG' || requestedProtectionSide === 'SHORT'
@@ -2496,7 +2499,7 @@ async function startServer() {
       }
 
       const positionSide = effectivePositionSide;
-      const closeSide = positionSide === 'SHORT' ? 'BUY' : 'SELL';
+      const closeSide = protectionDirection === 'SHORT' ? 'BUY' : 'SELL';
       const protectionAmount = normalizeOrderAmount(amountInput);
       const stopPrice = normalizeStopPrice(stopPriceInput);
       const takeProfitPrice = normalizeStopPrice(takeProfitPriceInput);
@@ -2517,7 +2520,7 @@ async function startServer() {
       const skipped: Array<{ type: string; stopPrice: number; reason: string }> = [];
       const isTriggerStillValid = (type: 'STOP_MARKET' | 'TAKE_PROFIT_MARKET', triggerPrice: number) => {
         if (!currentPrice) return true;
-        if (positionSide === 'SHORT') {
+        if (protectionDirection === 'SHORT') {
           return type === 'STOP_MARKET' ? triggerPrice > currentPrice : triggerPrice < currentPrice;
         }
         return type === 'STOP_MARKET' ? triggerPrice < currentPrice : triggerPrice > currentPrice;
