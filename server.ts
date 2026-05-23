@@ -2367,6 +2367,7 @@ async function startServer() {
 
       const action = String(req.body?.action || 'ensure').toLowerCase();
       const symbol = String(req.body?.symbol || '').toUpperCase().replace('/', '').replace(':', '');
+      const amountInput = Math.abs(Number(req.body?.amount || 0));
       const requestedPositionSide = String(req.body?.positionSide || '').toUpperCase();
       const stopPriceInput = Number(req.body?.stopPrice);
       const takeProfitPriceInput = Number(req.body?.takeProfitPrice);
@@ -2401,6 +2402,15 @@ async function startServer() {
       }
 
       const ccxtSymbol = String(resolvedMarket.symbol);
+      const normalizeOrderAmount = (value: number) => {
+        if (!Number.isFinite(value) || value <= 0) return null;
+        try {
+          const precise = Number(client.amountToPrecision(ccxtSymbol, value));
+          return Number.isFinite(precise) && precise > 0 ? precise : value;
+        } catch {
+          return value;
+        }
+      };
       const normalizeStopPrice = (value: number) => {
         if (!Number.isFinite(value) || value <= 0) return null;
         try {
@@ -2414,6 +2424,9 @@ async function startServer() {
       const orderEndpoints: BinanceSignedEndpoint[] = [
         { label: 'FAPI', baseUrl: 'https://fapi.binance.com', endpoint: '/fapi/v1/order' },
         { label: 'PAPI UM', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/order' },
+      ];
+      const pmAlgoOrderEndpoints: BinanceSignedEndpoint[] = [
+        { label: 'PAPI UM ALGO', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/algo/order' },
       ];
       const openOrderEndpoints: BinanceSignedEndpoint[] = [
         { label: 'FAPI', baseUrl: 'https://fapi.binance.com', endpoint: '/fapi/v1/openOrders' },
@@ -2432,6 +2445,26 @@ async function startServer() {
       });
 
       const cancelled: Array<{ orderId: string; type: string }> = [];
+      const buildProtectionClientAlgoId = (type: 'STOP_MARKET' | 'TAKE_PROFIT_MARKET') => {
+        const sideToken = requestedPositionSide === 'SHORT' ? 'S' : requestedPositionSide === 'LONG' ? 'L' : 'B';
+        const typeToken = type === 'STOP_MARKET' ? 'sl' : 'tp';
+        return `te_${symbol}_${sideToken}_${typeToken}`.slice(0, 36);
+      };
+      const cancelPmAlgoOrder = async (type: 'STOP_MARKET' | 'TAKE_PROFIT_MARKET') => {
+        const clientAlgoId = buildProtectionClientAlgoId(type);
+        try {
+          await sendBinanceSignedRequest(apiKey, apiSecret, pmAlgoOrderEndpoints, 'DELETE', {
+            clientAlgoId,
+            recvWindow: '5000',
+          });
+          cancelled.push({ orderId: clientAlgoId, type });
+        } catch (error: any) {
+          const message = String(error?.message || error || '');
+          if (!/not found|unknown order|does not exist|order not exist/i.test(message)) {
+            throw error;
+          }
+        }
+      };
       for (const order of protectiveOrders) {
         const orderId = String(order?.orderId || order?.clientOrderId || '');
         if (!orderId) continue;
@@ -2442,6 +2475,8 @@ async function startServer() {
         });
         cancelled.push({ orderId, type: String(order?.type || order?.origType || 'UNKNOWN') });
       }
+      await cancelPmAlgoOrder('STOP_MARKET');
+      await cancelPmAlgoOrder('TAKE_PROFIT_MARKET');
 
       if (action === 'clear') {
         return res.json({ status: 'success', action: 'clear', cancelled });
@@ -2451,6 +2486,7 @@ async function startServer() {
         ? requestedPositionSide
         : 'BOTH';
       const closeSide = positionSide === 'SHORT' ? 'BUY' : 'SELL';
+      const protectionAmount = normalizeOrderAmount(amountInput);
       const stopPrice = normalizeStopPrice(stopPriceInput);
       const takeProfitPrice = normalizeStopPrice(takeProfitPriceInput);
       if (!stopPrice && !takeProfitPrice) {
@@ -2472,17 +2508,46 @@ async function startServer() {
         if (positionSide) {
           params.positionSide = positionSide;
         }
-        const placed = await sendBinanceSignedRequest(apiKey, apiSecret, orderEndpoints, 'POST', params);
-        return placed?.data;
+        try {
+          const placed = await sendBinanceSignedRequest(apiKey, apiSecret, orderEndpoints, 'POST', params);
+          return placed?.data;
+        } catch (error: any) {
+          const message = String(error?.message || error || '');
+          if (!/invalid ordertype/i.test(message)) {
+            throw error;
+          }
+          if (!protectionAmount) {
+            throw new Error(`Protection amount unavailable for ${symbol}.`);
+          }
+
+          const algoParams: Record<string, string> = {
+            algoType: 'CONDITIONAL',
+            symbol,
+            side: closeSide,
+            positionSide,
+            type,
+            quantity: String(protectionAmount),
+            triggerPrice: String(triggerPrice),
+            workingType: 'MARK_PRICE',
+            priceProtect: 'true',
+            clientAlgoId: buildProtectionClientAlgoId(type),
+            recvWindow: '5000',
+          };
+          if (positionSide === 'BOTH') {
+            algoParams.reduceOnly = 'true';
+          }
+          const placed = await sendBinanceSignedRequest(apiKey, apiSecret, pmAlgoOrderEndpoints, 'POST', algoParams);
+          return placed?.data;
+        }
       };
 
       if (stopPrice) {
         const placed = await placeProtectionOrder('STOP_MARKET', stopPrice);
-        armed.push({ type: 'STOP_MARKET', orderId: String(placed?.orderId || placed?.clientOrderId || ''), stopPrice });
+        armed.push({ type: 'STOP_MARKET', orderId: String(placed?.orderId || placed?.clientOrderId || placed?.algoId || placed?.clientAlgoId || ''), stopPrice });
       }
       if (takeProfitPrice) {
         const placed = await placeProtectionOrder('TAKE_PROFIT_MARKET', takeProfitPrice);
-        armed.push({ type: 'TAKE_PROFIT_MARKET', orderId: String(placed?.orderId || placed?.clientOrderId || ''), stopPrice: takeProfitPrice });
+        armed.push({ type: 'TAKE_PROFIT_MARKET', orderId: String(placed?.orderId || placed?.clientOrderId || placed?.algoId || placed?.clientAlgoId || ''), stopPrice: takeProfitPrice });
       }
 
       res.json({ status: 'success', action: 'ensure', cancelled, armed });

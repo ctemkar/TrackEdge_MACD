@@ -1794,9 +1794,10 @@ export default function App() {
   const armExchangeProtection = React.useCallback(async (holding: Holding) => {
     if (!isRealMode || String(serverConfig?.exchange || '').toLowerCase() !== 'binance') return false;
     const symbol = normalizeLiveFuturesSymbol(holding.symbol);
+    const amount = Math.abs(Number(holding.amount || holding.contracts || 0));
     const stopPrice = Number(holding.stopPrice || 0);
     const takeProfitPrice = Number(holding.tp2Price || 0);
-    if (!symbol || (!Number.isFinite(stopPrice) && !Number.isFinite(takeProfitPrice))) return false;
+    if (!symbol || !Number.isFinite(amount) || amount <= 0 || (!Number.isFinite(stopPrice) && !Number.isFinite(takeProfitPrice))) return false;
 
     const protectionKey = `${symbol}:${holding.side}`;
     if (liveProtectionInflightRef.current[protectionKey]) return false;
@@ -1818,6 +1819,7 @@ export default function App() {
         body: JSON.stringify({
           action: 'ensure',
           symbol,
+          amount,
           positionSide: holding.side,
           stopPrice: Number.isFinite(stopPrice) && stopPrice > 0 ? stopPrice : undefined,
           takeProfitPrice: Number.isFinite(takeProfitPrice) && takeProfitPrice > 0 ? takeProfitPrice : undefined,
@@ -4546,28 +4548,12 @@ export default function App() {
         }
         const eligibleBuyCount = entries.filter(entry => entry.side === 'BUY').length;
         const eligibleSellCount = entries.filter(entry => entry.side === 'SELL').length;
-        const baseAvailableSlots = Math.max(0, currentMaxTrades - currentHoldings.length);
-        const boostedAvailableSlots = Math.max(0, (currentMaxTrades + STRONG_LIVE_SIGNAL_EXTRA_SLOTS) - currentHoldings.length);
-        const scanEntryCap = boostedAvailableSlots;
-        const effectiveBaseAvailableSlots = Math.min(baseAvailableSlots, scanEntryCap);
-        const effectiveBoostedAvailableSlots = Math.min(boostedAvailableSlots, scanEntryCap);
-        if (effectiveBoostedAvailableSlots > 0) {
+        const effectiveBaseAvailableSlots = Math.max(0, currentMaxTrades - currentHoldings.length);
+        if (effectiveBaseAvailableSlots > 0) {
           const openSideCounts = currentHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
             acc[holding.side === 'SHORT' ? 'SELL' : 'BUY'] += 1;
             return acc;
           }, { BUY: 0, SELL: 0 });
-          const openSideNotional = currentHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
-            const side = holding.side === 'SHORT' ? 'SELL' : 'BUY';
-            acc[side] += getHoldingActiveNotional(holding);
-            return acc;
-          }, { BUY: 0, SELL: 0 });
-          const totalOpenNotional = openSideNotional.BUY + openSideNotional.SELL;
-          const totalOpenPositions = currentHoldings.length;
-          const shortCountShare = totalOpenPositions > 0 ? openSideCounts.SELL / totalOpenPositions : 0;
-          const shortNotionalShare = totalOpenNotional > 0 ? openSideNotional.SELL / totalOpenNotional : 0;
-          const shortBookDominant = totalOpenPositions >= 4
-            && openSideCounts.SELL >= (openSideCounts.BUY + 3)
-            && (shortCountShare >= 0.75 || shortNotionalShare >= 0.75);
           const realFreeCapital = Math.max(0, availableFunds);
           const realTradableCapital = realFreeCapital;
           if (isRealMode && realFreeCapital < liveMinOrderNotional) {
@@ -4581,15 +4567,13 @@ export default function App() {
           let queuedNotional = 0;
 
           entries.forEach((entry) => {
-            const underlyingKey = getSymbolRiskIdentity(entry.pick.symbol).key;
             const directionalScore = getDirectionalEntryScore(entry.side, entry.pick.signal.score);
-            const strongSignal = isStrongLiveSignal(directionalScore, relaxedAutoEntryMinScore);
-            const matchingHolding = currentHoldings.find((h) => getSymbolRiskIdentity(h.symbol).key === underlyingKey && h.side === (entry.side === 'SELL' ? 'SHORT' : 'LONG'));
+            const matchingHolding = currentHoldings.find((h) => getSymbolRiskIdentity(h.symbol).key === getSymbolRiskIdentity(entry.pick.symbol).key && h.side === (entry.side === 'SELL' ? 'SHORT' : 'LONG'));
             const desiredNotional = getDesiredLiveEntryNotional(directionalScore, realTradableCapital);
             const currentHoldingNotional = matchingHolding ? getHoldingActiveNotional(matchingHolding, entry.pick.lastPrice) : 0;
             const incrementalNotional = Math.max(0, desiredNotional - currentHoldingNotional);
 
-            if (selectedTrades.length >= effectiveBoostedAvailableSlots) {
+            if (selectedTrades.length >= effectiveBaseAvailableSlots) {
               deferredTrades.push({
                 symbol: entry.pick.symbol,
                 side: entry.side,
@@ -4622,14 +4606,13 @@ export default function App() {
 
           const selectedCount = selectedTrades.length;
           const deferredCount = deferredTrades.length;
-          const extraStrongTradeCount = Math.max(0, selectedTrades.length - Math.min(selectedTrades.length, effectiveBaseAvailableSlots));
           const coverageSummary = `coverage=${results.length}/${shortlistLimit}/${symbolsToScan.length}`;
           const exposureSummary = `openSides=BUY:${openSideCounts.BUY}|SELL:${openSideCounts.SELL}`;
           addLog(
-            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`,
+            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`,
             selectedCount > 0 ? 'success' : 'info',
           );
-          updateLatestScanArchiveDecision(`SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots}${extraStrongTradeCount > 0 ? `+${extraStrongTradeCount} strong` : ''} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`);
+          updateLatestScanArchiveDecision(`SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`);
           
           if (selectedTrades.length > 0 || deferredTrades.length > 0) {
             // Live mode safety: execute entries sequentially to avoid burst margin failures.
@@ -4675,10 +4658,10 @@ export default function App() {
               }
             }
           } else {
-            pushScanSkipEvent(`SKIP: No eligible entries (BUY=${eligibleBuyCount}, SELL=${eligibleSellCount}, slots=${effectiveBaseAvailableSlots}${effectiveBoostedAvailableSlots > effectiveBaseAvailableSlots ? `+${effectiveBoostedAvailableSlots - effectiveBaseAvailableSlots} strong-only` : ''})`, cycleId);
+            pushScanSkipEvent(`SKIP: No eligible entries (BUY=${eligibleBuyCount}, SELL=${eligibleSellCount}, slots=${effectiveBaseAvailableSlots})`, cycleId);
           }
         } else {
-          pushScanSkipEvent(`SKIP: No free slots (${currentHoldings.length}/${currentMaxTrades}${STRONG_LIVE_SIGNAL_EXTRA_SLOTS > 0 ? ` base, +${STRONG_LIVE_SIGNAL_EXTRA_SLOTS} strong-only` : ''})`, cycleId);
+          pushScanSkipEvent(`SKIP: No free slots (${currentHoldings.length}/${currentMaxTrades})`, cycleId);
         }
 
       }
@@ -5733,28 +5716,8 @@ export default function App() {
     });
     const entries = Array.from(mergedEntries.values()).sort(compareExecutionPriority);
 
-    const openSideCounts = currentHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
-      acc[holding.side === 'SHORT' ? 'SELL' : 'BUY'] += 1;
-      return acc;
-    }, { BUY: 0, SELL: 0 });
-    const openSideNotional = currentHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
-      const side = holding.side === 'SHORT' ? 'SELL' : 'BUY';
-      acc[side] += getHoldingActiveNotional(holding);
-      return acc;
-    }, { BUY: 0, SELL: 0 });
-    const totalOpenNotional = openSideNotional.BUY + openSideNotional.SELL;
-    const totalOpenPositions = currentHoldings.length;
-    const shortCountShare = totalOpenPositions > 0 ? openSideCounts.SELL / totalOpenPositions : 0;
-    const shortNotionalShare = totalOpenNotional > 0 ? openSideNotional.SELL / totalOpenNotional : 0;
-    const shortBookDominant = totalOpenPositions >= 4
-      && openSideCounts.SELL >= (openSideCounts.BUY + 3)
-      && (shortCountShare >= 0.75 || shortNotionalShare >= 0.75);
-
     const baseAvailableSlots = Math.max(0, currentMaxTrades - currentHoldings.length);
-    const boostedAvailableSlots = Math.max(0, (currentMaxTrades + STRONG_LIVE_SIGNAL_EXTRA_SLOTS) - currentHoldings.length);
-    const scanEntryCap = boostedAvailableSlots;
-    const effectiveBaseAvailableSlots = Math.min(baseAvailableSlots, scanEntryCap);
-    const effectiveBoostedAvailableSlots = Math.min(boostedAvailableSlots, scanEntryCap);
+    const effectiveBaseAvailableSlots = baseAvailableSlots;
     const realTradableCapital = Math.max(0, availableFunds);
 
     if (isRealMode && realTradableCapital < liveMinOrderNotional) {
@@ -5773,42 +5736,18 @@ export default function App() {
 
     const selectedEntries = new Set<string>();
     const deferredByKey = new Map<string, string>();
-    const selectedUnderlyingKeys = new Set<string>();
-    const selectedCohorts = new Map<string, number>();
     let queuedNotional = 0;
-    const maxLiveEntriesPerCohortPerCycle = 0;
-    const relaxedAutoEntryMinScore = isRealMode ? Math.max(0, autoEntryMinScore - 0.8) : autoEntryMinScore;
 
     entries.forEach((entry) => {
-      const underlyingKey = getSymbolRiskIdentity(entry.pick.symbol).key;
       const directionalScore = getDirectionalEntryScore(entry.side, entry.pick.signal.score);
-      const strongSignal = isStrongLiveSignal(directionalScore, relaxedAutoEntryMinScore);
-      const cohortKey = (() => {
-        const parts = getCompactUsdSymbolParts(entry.pick.symbol);
-        const quote = parts?.quote || 'OTHER';
-        const priceBucket = entry.pick.lastPrice < 0.01
-          ? 'MICRO'
-          : entry.pick.lastPrice < 0.1
-            ? 'LOW'
-            : entry.pick.lastPrice < 1
-              ? 'MID'
-              : 'HIGH';
-        const moveMagnitude = Math.abs(entry.pick.change24h || 0);
-        const moveBucket = moveMagnitude >= 8 ? 'EXPLOSIVE' : moveMagnitude >= 4 ? 'FAST' : 'NORMAL';
-        return `${entry.side}:${quote}:${entry.pick.signal.trend}:${priceBucket}:${moveBucket}`;
-      })();
-      const matchingHolding = currentHoldings.find((holding) => getSymbolRiskIdentity(holding.symbol).key === underlyingKey && holding.side === (entry.side === 'SELL' ? 'SHORT' : 'LONG'));
+      const matchingHolding = currentHoldings.find((holding) => getSymbolRiskIdentity(holding.symbol).key === getSymbolRiskIdentity(entry.pick.symbol).key && holding.side === (entry.side === 'SELL' ? 'SHORT' : 'LONG'));
       const desiredNotional = getDesiredLiveEntryNotional(directionalScore, realTradableCapital);
       const currentHoldingNotional = matchingHolding ? getHoldingActiveNotional(matchingHolding, entry.pick.lastPrice) : 0;
       const incrementalNotional = Math.max(0, desiredNotional - currentHoldingNotional);
       const selectionKey = `${entry.side}:${normalizeLiveFuturesSymbol(entry.pick.symbol)}`;
 
-      if (selectedEntries.size >= effectiveBoostedAvailableSlots) {
+      if (selectedEntries.size >= effectiveBaseAvailableSlots) {
         deferredByKey.set(selectionKey, 'all live slots filled this cycle');
-        return;
-      }
-      if (selectedEntries.size >= effectiveBaseAvailableSlots && !strongSignal) {
-        deferredByKey.set(selectionKey, 'reserved extra slots for stronger setups');
         return;
       }
       const capacityBlock = getLiveEntryCapacityBlock({
@@ -5821,23 +5760,9 @@ export default function App() {
         deferredByKey.set(selectionKey, capacityBlock);
         return;
       }
-      if (selectedUnderlyingKeys.has(underlyingKey)) {
-        deferredByKey.set(selectionKey, `underlying already selected this cycle (${underlyingKey})`);
-        return;
-      }
-      if (entry.side === 'SELL' && shortBookDominant) {
-        deferredByKey.set(selectionKey, `portfolio rebalance: short exposure already dominant (${openSideCounts.SELL} shorts vs ${openSideCounts.BUY} longs)`);
-        return;
-      }
-      if (maxLiveEntriesPerCohortPerCycle > 0 && (selectedCohorts.get(cohortKey) || 0) >= maxLiveEntriesPerCohortPerCycle) {
-        deferredByKey.set(selectionKey, 'correlation throttle: similar momentum cohort already selected');
-        return;
-      }
 
       selectedEntries.add(selectionKey);
       queuedNotional += incrementalNotional;
-      selectedUnderlyingKeys.add(underlyingKey);
-      selectedCohorts.set(cohortKey, (selectedCohorts.get(cohortKey) || 0) + 1);
     });
 
     visibleSignalTablePicks.forEach((pick) => {
