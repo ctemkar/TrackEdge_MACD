@@ -4,6 +4,8 @@ import { TrendingUp, Activity, ShieldAlert, ShieldCheck, Info, Wallet, DollarSig
 import { motion, AnimatePresence } from 'motion/react';
 import { fetchBinanceData, fetchLatestPrice, subscribeToTicker, fetchAllSymbols, fetchTopSymbolsByVolume, fetchTicker24hStats, getPublicDataSourceSnapshot, fetchLiveAccountAudit, LiveAccountAuditSnapshot } from './services/binance';
 import { calculateIndicators, evaluateStrategy, Candle, DEFAULT_STRATEGY_CONFIG, IndicatorResult, StrategyConfig, StrategySignal } from './services/indicators';
+import { computeMarkovRegime, getRegimeTradeAdjustments, getRegimeWeightAdjustments } from './services/regime';
+import { pickReplacementOpportunity } from './services/rebalance';
 import { scanMarket, MarketScanResult, getLowHistorySnapshot } from './services/scanner';
 import { BacktestModule } from './components/BacktestModule';
 
@@ -324,6 +326,19 @@ const getHoldFallbackSide = (score: number): 'BUY' | 'SELL' => {
 const summarizeRejectReasons = (reasons?: string[], limit: number = 2) => {
   if (!reasons || reasons.length === 0) return '';
   return reasons.slice(0, limit).join(' | ');
+};
+
+const extractRegimeReasonLabel = (reason?: string) => {
+  if (!reason) return null;
+  const match = reason.match(/(Markov [^)]+?)(?:\)|$)/i);
+  return match ? match[1] : null;
+};
+
+const getRegimeReasonBadgeClass = (label?: string | null) => {
+  if (!label) return 'border-slate-200 bg-slate-50 text-slate-600';
+  if (/countertrend/i.test(label)) return 'border-rose-200 bg-rose-50 text-rose-700';
+  if (/aligned/i.test(label)) return 'border-emerald-200 bg-emerald-50 text-emerald-700';
+  return 'border-slate-200 bg-slate-50 text-slate-600';
 };
 
 const formatSignalAge = (foundAt: number) => {
@@ -2712,8 +2727,9 @@ export default function App() {
           setExecutionFeedback({ type: 'warning', message: `Manual override for ${tradeSymbol}: ${directionalExposureBlock}.` });
         }
 
-        if (Number.isFinite(confidenceScore) && confidenceScore !== undefined && confidenceScore < effectiveLiveAutoEntryMinScore) {
-          const confidenceMsg = `confidence ${confidenceScore.toFixed(1)} below live minimum ${effectiveLiveAutoEntryMinScore.toFixed(1)}`;
+        const regimeAdjustedRequirements = getRegimeAdjustedTradeRequirements(type === 'SELL' ? 'SELL' : 'BUY');
+        if (Number.isFinite(confidenceScore) && confidenceScore !== undefined && confidenceScore < regimeAdjustedRequirements.minScore) {
+          const confidenceMsg = `confidence ${confidenceScore.toFixed(1)} below live minimum ${regimeAdjustedRequirements.minScore.toFixed(1)} (${regimeAdjustedRequirements.label})`;
           if (!allowManualOverride) {
             addLog(`TRADE SKIPPED: ${tradeSymbol} ${confidenceMsg}.`, 'warning');
             setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${confidenceMsg}.` });
@@ -2726,8 +2742,8 @@ export default function App() {
         }
 
         const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(type, price, tradePlan, estimatedRoundTripFrictionBps);
-        if (edgeAfterFrictionPct !== null && edgeAfterFrictionPct < effectiveLiveMinEdgeAfterFrictionPct) {
-          const edgeMsg = `edge after friction ${edgeAfterFrictionPct.toFixed(2)}% below ${effectiveLiveMinEdgeAfterFrictionPct.toFixed(2)}%`;
+        if (edgeAfterFrictionPct !== null && edgeAfterFrictionPct < regimeAdjustedRequirements.minEdgeAfterFrictionPct) {
+          const edgeMsg = `edge after friction ${edgeAfterFrictionPct.toFixed(2)}% below ${regimeAdjustedRequirements.minEdgeAfterFrictionPct.toFixed(2)}% (${regimeAdjustedRequirements.label})`;
           if (!allowManualOverride) {
             addLog(`TRADE SKIPPED: ${tradeSymbol} ${edgeMsg}.`, 'warning');
             setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${edgeMsg}.` });
@@ -4007,6 +4023,38 @@ export default function App() {
     setStrategyConfig(prev => ({ ...prev, ...partial }));
   }, []);
 
+  const markovRegimeSummary = React.useMemo(() => {
+    return computeMarkovRegime(scanArchive, scanSignalSummary);
+  }, [scanArchive, scanSignalSummary]);
+
+  const markovArchiveRegimeById = React.useMemo(() => {
+    const chronologicalArchive = [...scanArchive].reverse();
+    const byId = new Map<string, ReturnType<typeof computeMarkovRegime>>();
+
+    chronologicalArchive.forEach((entry, index) => {
+      const priorArchive = chronologicalArchive.slice(0, index);
+      const regime = computeMarkovRegime(priorArchive, entry);
+      byId.set(entry.id, regime);
+    });
+
+    return byId;
+  }, [scanArchive]);
+
+  const currentRegimeAccentClass = markovRegimeSummary.state === 'BULL'
+    ? 'border-emerald-200 bg-emerald-50/70 text-emerald-800'
+    : markovRegimeSummary.state === 'BEAR'
+      ? 'border-rose-200 bg-rose-50/70 text-rose-800'
+      : 'border-slate-200 bg-slate-50/80 text-slate-700';
+
+  const getRegimeAdjustedTradeRequirements = React.useCallback((side: 'BUY' | 'SELL') => {
+    const adjustment = getRegimeTradeAdjustments(markovRegimeSummary, side);
+    return {
+      minScore: Number(Math.max(0, Math.min(10, effectiveLiveAutoEntryMinScore + adjustment.minScoreDelta)).toFixed(1)),
+      minEdgeAfterFrictionPct: Number(Math.max(0, effectiveLiveMinEdgeAfterFrictionPct + adjustment.minEdgeDelta).toFixed(2)),
+      label: adjustment.label,
+    };
+  }, [effectiveLiveAutoEntryMinScore, effectiveLiveMinEdgeAfterFrictionPct, markovRegimeSummary]);
+
   const adaptiveStrategyConfig = React.useMemo(() => {
     const recentClosedTrades = tradeHistory
       .filter((trade) => {
@@ -4023,23 +4071,12 @@ export default function App() {
     let volumeMultiplier = 1;
     let emaMultiplier = 1;
     let rsiMultiplier = 1;
-
-    const bullishRegime = scanSignalSummary.buy >= Math.max(3, Math.ceil(scanSignalSummary.sell * 1.35));
-    const bearishRegime = scanSignalSummary.sell >= Math.max(3, Math.ceil(scanSignalSummary.buy * 1.35));
-
-    if (bullishRegime || bearishRegime) {
-      macdMultiplier += 0.06;
-      trendMultiplier += 0.10;
-      emaMultiplier += 0.08;
-      volumeMultiplier += 0.04;
-      rsiMultiplier -= 0.05;
-    } else if (scanSignalSummary.updatedAt > 0) {
-      macdMultiplier -= 0.04;
-      trendMultiplier -= 0.06;
-      volumeMultiplier += 0.05;
-      emaMultiplier -= 0.03;
-      rsiMultiplier += 0.10;
-    }
+    const regimeWeightAdjustments = getRegimeWeightAdjustments(markovRegimeSummary);
+    macdMultiplier += regimeWeightAdjustments.macdDelta;
+    trendMultiplier += regimeWeightAdjustments.trendDelta;
+    volumeMultiplier += regimeWeightAdjustments.volumeDelta;
+    emaMultiplier += regimeWeightAdjustments.emaDelta;
+    rsiMultiplier += regimeWeightAdjustments.rsiDelta;
 
     if (recentClosedTrades.length >= 8) {
       const wins = recentClosedTrades.filter((trade) => (trade.pnl || 0) > 0).length;
@@ -4069,7 +4106,7 @@ export default function App() {
       contextEmaScore: Number((strategyConfig.contextEmaScore * clampMultiplier(emaMultiplier)).toFixed(2)),
       contextRsiScore: Number((strategyConfig.contextRsiScore * clampMultiplier(rsiMultiplier)).toFixed(2)),
     };
-  }, [isManualLiquidationReason, scanSignalSummary.buy, scanSignalSummary.sell, scanSignalSummary.updatedAt, strategyConfig, tradeHistory]);
+  }, [isManualLiquidationReason, markovRegimeSummary, strategyConfig, tradeHistory]);
 
   React.useEffect(() => {
     strategyConfigRef.current = adaptiveStrategyConfig;
@@ -4876,8 +4913,6 @@ export default function App() {
           : [];
 
       const MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE = 0;
-      const relaxedAutoEntryMinScore = effectiveLiveAutoEntryMinScore;
-      const relaxedMinEdgeAfterFrictionPct = effectiveLiveMinEdgeAfterFrictionPct;
 
       const isShortFacingLocalUpwardMomentum = (pick: MarketScanResult) => {
         const positiveDay = (pick.change24h || 0) > 0.75;
@@ -4920,6 +4955,9 @@ export default function App() {
       };
 
       const getEntryBlockReason = ({ side, pick }: { side: 'BUY' | 'SELL'; pick: MarketScanResult }) => {
+        const regimeAdjustedRequirements = getRegimeAdjustedTradeRequirements(side);
+        const relaxedAutoEntryMinScore = regimeAdjustedRequirements.minScore;
+        const relaxedMinEdgeAfterFrictionPct = regimeAdjustedRequirements.minEdgeAfterFrictionPct;
         const pickRiskKey = getSymbolRiskIdentity(pick.symbol).key;
         const desiredHoldingSide: 'LONG' | 'SHORT' = side === 'SELL' ? 'SHORT' : 'LONG';
         const matchingHolding = currentHoldings.find((h) => getSymbolRiskIdentity(h.symbol).key === pickRiskKey && h.side === desiredHoldingSide);
@@ -4968,7 +5006,7 @@ export default function App() {
             return `retry lock ${minutesRemaining}m remaining (${retryLock.reason})`;
           }
           if (directionalConfidence < relaxedAutoEntryMinScore) {
-            return `confidence ${directionalConfidence.toFixed(1)} below ${relaxedAutoEntryMinScore.toFixed(1)}`;
+            return `confidence ${directionalConfidence.toFixed(1)} below ${relaxedAutoEntryMinScore.toFixed(1)} (${regimeAdjustedRequirements.label})`;
           }
           const desiredNotional = getDesiredLiveEntryNotional(directionalConfidence, getBufferedLiveCapital(availableFunds));
           if (side === 'SELL' && isShortFacingLocalUpwardMomentum(pick)) {
@@ -4995,7 +5033,7 @@ export default function App() {
           }
           const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(side, pick.lastPrice, pick.signal.tradePlan, estimatedRoundTripFrictionBps);
           if (edgeAfterFrictionPct !== null && edgeAfterFrictionPct < relaxedMinEdgeAfterFrictionPct) {
-            return `edge ${edgeAfterFrictionPct.toFixed(2)}% below ${relaxedMinEdgeAfterFrictionPct.toFixed(2)}%`;
+            return `edge ${edgeAfterFrictionPct.toFixed(2)}% below ${relaxedMinEdgeAfterFrictionPct.toFixed(2)}% (${regimeAdjustedRequirements.label})`;
           }
         }
         if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
@@ -5092,85 +5130,19 @@ export default function App() {
         const baseAvailableSlots = Math.max(0, currentMaxTrades - currentHoldings.length);
         const perCycleEntryCap = Math.max(1, effectiveLiveEntriesPerCycle);
         const effectiveBaseAvailableSlots = Math.min(baseAvailableSlots, perCycleEntryCap);
-        const replacementFrictionBufferPct = Math.max(0.05, estimatedRoundTripFrictionBps / 100);
         const scanResultsByRiskKey = new Map(
           results.map((result) => [getSymbolRiskIdentity(result.symbol).key, result] as const)
         );
         const findReplacementOpportunity = (entry: { side: 'BUY' | 'SELL'; pick: MarketScanResult }) => {
-          if (!isRealMode || baseAvailableSlots > 0) return null;
-
-          const candidateEdgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(
-            entry.side,
-            entry.pick.lastPrice,
-            entry.pick.signal.tradePlan,
+          return pickReplacementOpportunity({
+            isRealMode,
+            baseAvailableSlots,
             estimatedRoundTripFrictionBps,
-          );
-          if (candidateEdgeAfterFrictionPct === null) return null;
-
-          const candidateDirectionalScore = getDirectionalEntryScore(entry.side, entry.pick.signal.score);
-          const desiredHoldingSide: 'LONG' | 'SHORT' = entry.side === 'SELL' ? 'SHORT' : 'LONG';
-
-          const weakestHolding = currentHoldings
-            .filter((holding) => holding.side === desiredHoldingSide)
-            .map((holding) => {
-              const holdingRiskKey = getSymbolRiskIdentity(holding.symbol).key;
-              const holdingResult = scanResultsByRiskKey.get(holdingRiskKey);
-              const holdingOrderSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'SELL' : 'BUY';
-              const holdingDirectionalScore = holdingResult
-                ? getDirectionalEntryScore(holdingOrderSide, holdingResult.signal.score)
-                : 0;
-              const holdingEdgeAfterFrictionPct = holdingResult
-                ? getExpectedEdgeAfterFrictionPct(
-                    holdingOrderSide,
-                    holdingResult.lastPrice,
-                    holdingResult.signal.tradePlan,
-                    estimatedRoundTripFrictionBps,
-                  )
-                : null;
-              const edgeImprovementPct = candidateEdgeAfterFrictionPct - (holdingEdgeAfterFrictionPct ?? 0);
-              const directionalImprovement = candidateDirectionalScore - holdingDirectionalScore;
-              const priorityImprovement = (entry.pick.priorityRank || 0) - (holdingResult?.priorityRank || 0);
-              const closePrice = holdingPricesRef.current[holding.symbol] || holding.entryPrice;
-              const replaceable = Boolean(closePrice)
-                && edgeImprovementPct > replacementFrictionBufferPct
-                && (
-                  !holdingResult
-                  || holdingResult.signal.overall === 'HOLD'
-                  || directionalImprovement >= 0.6
-                  || priorityImprovement >= 2
-                );
-
-              return {
-                holding,
-                closePrice,
-                holdingResult,
-                holdingDirectionalScore,
-                holdingEdgeAfterFrictionPct,
-                edgeImprovementPct,
-                directionalImprovement,
-                priorityImprovement,
-                replaceable,
-              };
-            })
-            .filter((candidate) => candidate.replaceable)
-            .sort((a, b) => {
-              const aEdge = Number.isFinite(a.holdingEdgeAfterFrictionPct) ? Number(a.holdingEdgeAfterFrictionPct) : Infinity;
-              const bEdge = Number.isFinite(b.holdingEdgeAfterFrictionPct) ? Number(b.holdingEdgeAfterFrictionPct) : Infinity;
-              if (aEdge !== bEdge) return aEdge - bEdge;
-              if ((a.holdingResult?.priorityRank || 0) !== (b.holdingResult?.priorityRank || 0)) {
-                return (a.holdingResult?.priorityRank || 0) - (b.holdingResult?.priorityRank || 0);
-              }
-              return b.edgeImprovementPct - a.edgeImprovementPct;
-            })[0];
-
-          if (!weakestHolding) return null;
-
-          return {
             entry,
-            holding: weakestHolding.holding,
-            closePrice: weakestHolding.closePrice,
-            reason: `replacement edge +${weakestHolding.edgeImprovementPct.toFixed(2)}% after friction vs ${weakestHolding.holding.symbol}`,
-          };
+            currentHoldings,
+            scanResultsByRiskKey,
+            holdingPrices: holdingPricesRef.current,
+          });
         };
         if (effectiveBaseAvailableSlots > 0) {
           const openSideCounts = currentHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
@@ -5361,7 +5333,7 @@ export default function App() {
       setScanning(false);
       setTimeout(() => setIsBotActive(false), 2000);
     }
-  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, effectiveLiveAutoEntryMinScore, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, effectiveLiveEntriesPerCycle, adaptiveStrategyConfig, liveQuoteAllowlistInput, fullUniverseMode, isUnsupportedLiveScanSymbol, estimatedRoundTripFrictionBps, effectiveLiveMinEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional, getBufferedLiveCapital, maxSymbolsPerScan, liveAutoScanLimit]);
+  }, [symbol, executeTrade, stopLossPercent, takeProfitPercent, addLog, isRealMode, cooldowns, serverConfig?.exchange, pushScanSkipEvent, availableFunds, balance, setRateLimitUntil, liveMinOrderNotional, lowMarginLockMinutes, liveEntryDelayMs, effectiveLiveEntriesPerCycle, adaptiveStrategyConfig, liveQuoteAllowlistInput, fullUniverseMode, isUnsupportedLiveScanSymbol, estimatedRoundTripFrictionBps, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional, getBufferedLiveCapital, maxSymbolsPerScan, liveAutoScanLimit, getRegimeAdjustedTradeRequirements]);
  // Removed 'scanning' from dependencies
 
   React.useEffect(() => {
@@ -6290,14 +6262,15 @@ export default function App() {
         } else {
           const directionalSide = pick.signal.overall === 'SELL' ? 'SELL' : 'BUY';
           const directionalConfidence = getDirectionalEntryScore(directionalSide, pick.signal.score);
-          const relaxedAutoEntryMinScore = isRealMode ? Math.max(0, autoEntryMinScore - 0.8) : autoEntryMinScore;
-          const relaxedMinEdgeAfterFrictionPct = isRealMode ? Math.max(0, minEdgeAfterFrictionPct - 0.2) : minEdgeAfterFrictionPct;
+          const regimeAdjustedRequirements = getRegimeAdjustedTradeRequirements(directionalSide);
+          const relaxedAutoEntryMinScore = isRealMode ? Math.max(0, regimeAdjustedRequirements.minScore - 0.8) : autoEntryMinScore;
+          const relaxedMinEdgeAfterFrictionPct = isRealMode ? Math.max(0, regimeAdjustedRequirements.minEdgeAfterFrictionPct - 0.2) : minEdgeAfterFrictionPct;
           if (isRealMode && directionalConfidence < relaxedAutoEntryMinScore) {
-            reason = `confidence ${directionalConfidence.toFixed(1)} below ${relaxedAutoEntryMinScore.toFixed(1)}`;
+            reason = `confidence ${directionalConfidence.toFixed(1)} below ${relaxedAutoEntryMinScore.toFixed(1)} (${regimeAdjustedRequirements.label})`;
           } else {
             const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(directionalSide, pick.lastPrice, pick.signal.tradePlan, estimatedRoundTripFrictionBps);
             if (isRealMode && edgeAfterFrictionPct !== null && edgeAfterFrictionPct < relaxedMinEdgeAfterFrictionPct) {
-              reason = `edge ${edgeAfterFrictionPct.toFixed(2)}% below ${relaxedMinEdgeAfterFrictionPct.toFixed(2)}%`;
+              reason = `edge ${edgeAfterFrictionPct.toFixed(2)}% below ${relaxedMinEdgeAfterFrictionPct.toFixed(2)}% (${regimeAdjustedRequirements.label})`;
             } else if (isRealMode) {
               const directionalExposureBlock = getLiveDirectionalExposureBlock({
                 side: directionalSide,
@@ -6331,7 +6304,7 @@ export default function App() {
       detail: `${pick.signal.overall} passed base checks`,
       className: 'bg-emerald-100 text-emerald-700',
     };
-  }, [serverConfig?.exchange, isRealMode, maxConcurrentTrades, liveQuoteAllowlist, fullUniverseMode, holdings, cooldowns, isUnsupportedLiveScanSymbol, autoEntryMinScore, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getLiveDirectionalExposureBlock]);
+  }, [serverConfig?.exchange, isRealMode, maxConcurrentTrades, liveQuoteAllowlist, fullUniverseMode, holdings, cooldowns, isUnsupportedLiveScanSymbol, autoEntryMinScore, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getLiveDirectionalExposureBlock, getRegimeAdjustedTradeRequirements]);
 
   const rankedSignalStatuses = React.useMemo(() => {
     const now = Date.now();
@@ -7199,6 +7172,32 @@ export default function App() {
               </div>
             </div>
 
+            <div className={`mt-3 border px-3 py-2 text-[10px] font-mono uppercase ${currentRegimeAccentClass}`}>
+              <div className="flex items-center justify-between gap-3">
+                <span>Markov Day Regime</span>
+                <span className="font-black tracking-[0.2em]">{markovRegimeSummary.state}</span>
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-4">
+                <div className="border border-current/10 bg-white/50 px-2 py-1">
+                  <span className="opacity-50">Observation</span>
+                  <p className="font-black text-[13px]">{markovRegimeSummary.currentObservation}</p>
+                </div>
+                <div className="border border-current/10 bg-white/50 px-2 py-1">
+                  <span className="opacity-50">Confidence</span>
+                  <p className="font-black text-[13px]">{(markovRegimeSummary.confidence * 100).toFixed(0)}%</p>
+                </div>
+                <div className="border border-current/10 bg-white/50 px-2 py-1">
+                  <span className="opacity-50">Bull / Bear</span>
+                  <p className="font-black text-[13px]">{(markovRegimeSummary.bullProbability * 100).toFixed(0)} / {(markovRegimeSummary.bearProbability * 100).toFixed(0)}</p>
+                </div>
+                <div className="border border-current/10 bg-white/50 px-2 py-1">
+                  <span className="opacity-50">Neutral</span>
+                  <p className="font-black text-[13px]">{(markovRegimeSummary.neutralProbability * 100).toFixed(0)}%</p>
+                </div>
+              </div>
+              <p className="mt-2 opacity-70">Trade thresholds and adaptive weights now follow this regime instead of a raw buy-vs-sell snapshot.</p>
+            </div>
+
             <div className="mt-3 border border-gray-300 bg-gray-50/80 px-3 py-2 text-[10px] font-mono uppercase">
               <div className="flex items-center justify-between text-gray-800/80">
                 <span>Why Coins Were Rejected</span>
@@ -7336,6 +7335,16 @@ export default function App() {
                 <div className="mt-2 space-y-2">
                   {scanBlockedSummary.topBlocked.map((entry) => (
                     <div key={`blocked-${entry.symbol}-${entry.reason}`} className="border border-rose-200 bg-white/60 px-2 py-2">
+                      {(() => {
+                        const regimeLabel = extractRegimeReasonLabel(entry.reason);
+                        return regimeLabel ? (
+                          <div className="mb-1 flex justify-end">
+                            <span className={`border px-1.5 py-0.5 text-[8px] font-mono uppercase ${getRegimeReasonBadgeClass(regimeLabel)}`}>
+                              {regimeLabel}
+                            </span>
+                          </div>
+                        ) : null;
+                      })()}
                       <div className="flex items-center justify-between gap-2">
                         <span className="font-black text-[11px] text-rose-950">{entry.symbol}</span>
                         <span className="text-[9px] text-rose-900/70">{entry.side} | score {(entry.score ?? 0).toFixed(1)} | rank {(entry.priorityRank ?? 0).toFixed(2)}</span>
@@ -8648,6 +8657,16 @@ export default function App() {
                                      <span className={`text-[10px] font-black ${trade.type === 'BUY' ? 'text-emerald-600' : 'text-rose-600'}`}>{trade.type}</span>
                                      <span className="text-[9px] font-mono opacity-60">${formatPrice(trade.price)}</span>
                                      {trade.reason && <span className="text-[8px] opacity-40">{trade.reason}</span>}
+                                     {(() => {
+                                       const regimeLabel = extractRegimeReasonLabel(trade.reason);
+                                       return regimeLabel ? (
+                                         <div className="mt-1">
+                                           <span className={`border px-1.5 py-0.5 text-[8px] font-mono uppercase ${getRegimeReasonBadgeClass(regimeLabel)}`}>
+                                             {regimeLabel}
+                                           </span>
+                                         </div>
+                                       ) : null;
+                                     })()}
                                   </div>
                                </td>
                                <td className="px-3 py-2 text-right">
@@ -8834,7 +8853,23 @@ export default function App() {
                             <p className="text-[10px] font-mono uppercase tracking-[0.18em] opacity-60">{new Date(entry.completedAt).toLocaleString()}</p>
                             <p className="mt-1 text-[10px] font-mono text-slate-900">{entry.summary}</p>
                           </div>
-                          <span className="text-[9px] font-mono uppercase opacity-50">{entry.analyzed}/{entry.total}</span>
+                          <div className="flex flex-col items-end gap-1">
+                            <span className="text-[9px] font-mono uppercase opacity-50">{entry.analyzed}/{entry.total}</span>
+                            {(() => {
+                              const archivedRegime = markovArchiveRegimeById.get(entry.id);
+                              if (!archivedRegime) return null;
+                              const regimeClass = archivedRegime.state === 'BULL'
+                                ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                : archivedRegime.state === 'BEAR'
+                                  ? 'border-rose-200 bg-rose-50 text-rose-700'
+                                  : 'border-slate-200 bg-slate-50 text-slate-600';
+                              return (
+                                <span className={`border px-1.5 py-0.5 text-[8px] font-mono uppercase ${regimeClass}`}>
+                                  {archivedRegime.state} {(archivedRegime.confidence * 100).toFixed(0)}%
+                                </span>
+                              );
+                            })()}
+                          </div>
                         </div>
                         {entry.decision && (
                           <p className="mt-2 text-[9px] font-mono text-slate-700">{entry.decision}</p>
