@@ -611,6 +611,32 @@ async function startServer() {
     return await sendBinanceSignedRequest(apiKey, apiSecret, endpoints, 'GET', params);
   };
 
+  const fetchBinancePortfolioMarginAccountViaHttp = async (
+    apiKey: string,
+    apiSecret: string,
+  ): Promise<{
+    accountData: any | null;
+    authError: boolean;
+    message?: string;
+  }> => {
+    try {
+      const response = await fetchBinanceSignedJson(apiKey, apiSecret, [
+        { label: 'papi-account', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/account' },
+      ], {});
+      return {
+        accountData: response?.data || null,
+        authError: false,
+      };
+    } catch (error: any) {
+      const message = String(error?.message || 'portfolio margin account unavailable');
+      return {
+        accountData: null,
+        authError: isBinanceAuthErrorMessage(message),
+        message,
+      };
+    }
+  };
+
   const fetchBinanceAccountAuditViaHttp = async (
     apiKey: string,
     apiSecret: string,
@@ -1080,7 +1106,7 @@ async function startServer() {
       }
 
       let balanceData: any;
-      let papiActualEquity: number | null = null;
+      let papiAccountEquity: number | null = null;
       let papiAvailableBalance: number | null = null;
       if (client.id === 'gemini') {
         try {
@@ -1157,7 +1183,7 @@ async function startServer() {
                   info: accountInfo,
                 };
                 if (Number.isFinite(accountEquity) && accountEquity > 0) {
-                  papiActualEquity = accountEquity;
+                  papiAccountEquity = accountEquity;
                 }
                 if (Number.isFinite(availableBalance) && availableBalance >= 0) {
                   papiAvailableBalance = availableBalance;
@@ -1175,11 +1201,35 @@ async function startServer() {
         }
 
         try {
+          const preferredBinance = getPreferredBinanceCredentials();
+          if (preferredBinance.key && preferredBinance.secret) {
+            const pmAccount = await fetchBinancePortfolioMarginAccountViaHttp(preferredBinance.key, preferredBinance.secret);
+            if (pmAccount.accountData) {
+              const accountEquity = Number(
+                pmAccount.accountData.accountEquity ??
+                pmAccount.accountData.actualEquity ??
+                pmAccount.accountData.totalMarginBalance ??
+                0,
+              );
+              const availableBalance = Number(
+                pmAccount.accountData.totalAvailableBalance ??
+                pmAccount.accountData.virtualMaxWithdrawAmount ??
+                0,
+              );
+              if (Number.isFinite(accountEquity) && accountEquity > 0) {
+                papiAccountEquity = accountEquity;
+              }
+              if (Number.isFinite(availableBalance) && availableBalance >= 0) {
+                papiAvailableBalance = availableBalance;
+              }
+            }
+          }
+
           const papiAccount = await (client as any).papiGetAccount?.();
           if (papiAccount) {
-            const actual = Number(papiAccount.actualEquity || papiAccount.accountEquity);
+            const actual = Number(papiAccount.accountEquity || papiAccount.actualEquity);
             const available = Number(papiAccount.totalAvailableBalance || papiAccount.virtualMaxWithdrawAmount);
-            if (Number.isFinite(actual) && actual > 0) papiActualEquity = actual;
+            if (!Number.isFinite(papiAccountEquity) && Number.isFinite(actual) && actual > 0) papiAccountEquity = actual;
             if (Number.isFinite(available) && available >= 0) papiAvailableBalance = available;
           }
         } catch {
@@ -1591,7 +1641,7 @@ async function startServer() {
             .sort((a: any, c: any) => Number(c.totalWalletBalance || 0) - Number(a.totalWalletBalance || 0))[0] ||
           {};
         const pmCandidates = [
-          papiActualEquity,
+          papiAccountEquity,
           Number(info.actualEquity),
           Number(info.accountEquity),
           Number(info.totalMarginBalance),

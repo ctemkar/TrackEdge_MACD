@@ -1089,6 +1089,14 @@ export default function App() {
   const lastRateLimitWarnAtRef = React.useRef(0);
   const dismissedSyncErrorRef = React.useRef<{ message: string; until: number } | null>(null);
 
+  React.useEffect(() => {
+    if (entryLockUntil <= Date.now()) return;
+    if (entryLockReason !== 'Entry lock engaged after hard exchange failure (margin).') return;
+    entryLockUntilRef.current = 0;
+    setEntryLockUntil(0);
+    setEntryLockReason(null);
+  }, [entryLockReason, entryLockUntil]);
+
   // Auto-dismiss toast after 8s for warnings/errors, 4s for success/info
   React.useEffect(() => {
     if (!executionFeedback) return;
@@ -3035,13 +3043,15 @@ export default function App() {
         }
 
         if (isMarginOrFundsFailure || isAuthFailure) {
-          // Keep autonomous mode running; lock entries instead of switching the system off.
-          lockEntries(hardFailureLockMinutes * 60 * 1000, `Entry lock engaged after hard exchange failure (${isAuthFailure ? 'auth/permission' : 'margin'}).`);
           if (isAuthFailure) {
+            // Auth/permission failures are account-wide; pause all new live entries.
+            lockEntries(hardFailureLockMinutes * 60 * 1000, 'Entry lock engaged after hard exchange failure (auth/permission).');
             setIsRealMode(false);
             addLog('LIVE MODE DISABLED: Exchange auth/permission failure detected.', 'warning');
           } else {
-            addLog('ENTRY LOCK ENGAGED: Margin insufficient. Review leverage/available margin before retrying.', 'warning');
+            // Margin/funds failures are usually symbol/order-size specific; keep the block local.
+            addLog(`SYMBOL ENTRY LOCK ENGAGED: ${tradeSymbol} margin insufficient. Only this symbol is paused for retry.`, 'warning');
+            setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: margin insufficient. This symbol is paused temporarily; the rest of the bot can continue.` });
           }
         }
 
@@ -3610,7 +3620,17 @@ export default function App() {
     return () => clearInterval(timer);
   }, [isRealMode, loadLiveAccountAudit]);
 
-  const shouldMaintainLiveAccountSync = isRealMode;
+  const shouldMaintainLiveAccountSync = isRealMode || (
+    lastExchangeSyncSnapshot.updatedAt > 0
+    && holdings.length > 0
+    && holdings.some((holding) => (
+      Boolean(holding.exchange)
+      || (Number.isFinite(Number(holding.markPrice)) && Number(holding.markPrice) > 0)
+      || (Number.isFinite(Number(holding.initialMargin)) && Number(holding.initialMargin) > 0)
+      || (Number.isFinite(Number(holding.notional)) && Math.abs(Number(holding.notional)) > 0)
+      || Number.isFinite(Number(holding.unrealizedPnl))
+    ))
+  );
 
   useEffect(() => {
     if (!shouldMaintainLiveAccountSync) return;
@@ -5105,8 +5125,21 @@ export default function App() {
     }
   }, [currentPrice, strategy, autoTrade, holdings, symbol, executeTrade, maxConcurrentTrades, holdingPrices, cooldowns, isRealMode, managePlannedExit]);
 
+  const hasExchangeSyncedHoldings = holdings.some((holding) => (
+    Boolean(holding.exchange)
+    || (Number.isFinite(Number(holding.markPrice)) && Number(holding.markPrice) > 0)
+    || (Number.isFinite(Number(holding.initialMargin)) && Number(holding.initialMargin) > 0)
+    || (Number.isFinite(Number(holding.notional)) && Math.abs(Number(holding.notional)) > 0)
+    || Number.isFinite(Number(holding.unrealizedPnl))
+  ));
+  const useExchangeAccountMetrics = isRealMode || (
+    lastExchangeSyncSnapshot.updatedAt > 0
+    && holdings.length > 0
+    && hasExchangeSyncedHoldings
+  );
+
   const calculateEquity = () => {
-    if (isRealMode) {
+    if (useExchangeAccountMetrics) {
       return balance;
     }
 
@@ -5147,7 +5180,7 @@ export default function App() {
     return sum + resolveHoldingPnl(h).pnl;
   }, 0);
   const hasOpenPositions = holdings.length > 0;
-  const displayedUnrealizedRisk = isRealMode
+  const displayedUnrealizedRisk = useExchangeAccountMetrics
     ? (hasOpenPositions ? computedUnrealizedPnl : liveUnrealizedPnl)
     : computedUnrealizedPnl;
   const scanDisplayTotal = scanProgress.total > 0 ? scanProgress.total : availableSymbols.length;
@@ -5263,7 +5296,7 @@ export default function App() {
   const pnlPercent = benchmarkCapital > 0 ? (pnl / benchmarkCapital) * 100 : 0;
   const basisDelta = pnl;
   const openPnl = displayedUnrealizedRisk;
-  const currentDailyEquityLoss = isRealMode && dailyEquityAnchorDate === getLocalDayKey() && dailyEquityAnchor > 0
+  const currentDailyEquityLoss = useExchangeAccountMetrics && dailyEquityAnchorDate === getLocalDayKey() && dailyEquityAnchor > 0
     ? Math.max(0, dailyEquityAnchor - equity)
     : 0;
   const trackedRealizedPnl = React.useMemo(() => {
@@ -5275,9 +5308,9 @@ export default function App() {
       return sum + trade.pnl;
     }, 0);
   }, [tradeHistory]);
-  const totalPnl = isRealMode ? (trackedRealizedPnl + openPnl) : basisDelta;
-  const realizedPnl = isRealMode ? trackedRealizedPnl : (totalPnl - openPnl);
-  const exchangeFreeMargin = isRealMode ? availableFunds : balance;
+  const totalPnl = useExchangeAccountMetrics ? (trackedRealizedPnl + openPnl) : basisDelta;
+  const realizedPnl = useExchangeAccountMetrics ? trackedRealizedPnl : (totalPnl - openPnl);
+  const exchangeFreeMargin = useExchangeAccountMetrics ? availableFunds : balance;
   const liveAuditSummary = liveAccountAudit?.summary;
   const liveAuditReconciledDelta = isRealMode ? ((liveAuditSummary?.netIncome || 0) + openPnl) : 0;
   const liveAuditResidualDelta = isRealMode ? (basisDelta - liveAuditReconciledDelta) : 0;
@@ -5331,7 +5364,7 @@ export default function App() {
   }, [liveAccountAudit]);
   const remainingLiveSlots = Math.max(0, maxConcurrentTrades - holdings.length);
   const liveBufferedFreeMargin = getBufferedLiveCapital(exchangeFreeMargin);
-  const deployableLiveMargin = isRealMode
+  const deployableLiveMargin = useExchangeAccountMetrics
     ? Math.max(0, Math.min(liveBufferedFreeMargin, remainingLiveSlots * Math.max(1, maxLiveOrderNotional)))
     : balance;
   const displayedAvailableFunds = exchangeFreeMargin;
@@ -7795,7 +7828,7 @@ export default function App() {
           )}
           <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2 xl:grid-cols-3">
             <MetricBox 
-              icon={<Wallet className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
+              icon={<Wallet className={useExchangeAccountMetrics ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Portfolio Value"
               value={`$${equity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
               trend={pnl >= 0 ? 'up' : 'down'}
@@ -7808,45 +7841,45 @@ export default function App() {
                 </button>
               }
               subValue={
-                isRealMode
+                useExchangeAccountMetrics
                   ? `Exchange Free $${exchangeFreeMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | Safe To Deploy $${deployableLiveMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
                   : `Available $${displayedAvailableFunds.toLocaleString(undefined, { minimumFractionDigits: 2 })}`
               }
             />
             <MetricBox 
-              icon={<TrendingUp className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
+              icon={<TrendingUp className={useExchangeAccountMetrics ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Current P&L"
               value={`${openPnl >= 0 ? '+' : '-'}$${Math.abs(openPnl).toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 4 })}`}
               trend={openPnl >= 0 ? 'up' : 'down'}
               subValue="Unrealized (Open Positions)"
             />
             <MetricBox 
-              icon={<DollarSign className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
-              label={isRealMode ? 'Tracked P&L' : 'Total P&L'}
+              icon={<DollarSign className={useExchangeAccountMetrics ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
+              label={useExchangeAccountMetrics ? 'Tracked P&L' : 'Total P&L'}
               value={`${totalPnl >= 0 ? '+' : '-'}$${Math.abs(totalPnl).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
               trend={totalPnl >= 0 ? 'up' : 'down'}
-              subValue={isRealMode
+              subValue={useExchangeAccountMetrics
                 ? `Realized ${realizedPnl >= 0 ? '+' : '-'}$${Math.abs(realizedPnl).toFixed(2)} | Open ${openPnl >= 0 ? '+' : '-'}$${Math.abs(openPnl).toFixed(2)} | Basis ${basisDelta >= 0 ? '+' : '-'}$${Math.abs(basisDelta).toFixed(2)}`
                 : `Realized ${realizedPnl >= 0 ? '+' : '-'}$${Math.abs(realizedPnl).toFixed(2)} | Open ${openPnl >= 0 ? '+' : '-'}$${Math.abs(openPnl).toFixed(2)}`}
             />
             <MetricBox 
-              icon={<Zap className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
+              icon={<Zap className={useExchangeAccountMetrics ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Network Status"
-              value={isSyncing ? "SYNCING..." : (isRealMode ? "LIVE" : "PAPER")}
+              value={isSyncing ? "SYNCING..." : (useExchangeAccountMetrics ? (isRealMode ? "LIVE" : "SYNCED") : "PAPER")}
               subValue={serverConfig?.exchange
                 ? `${serverConfig.exchange.toUpperCase()} | ${holdings.length}/${maxConcurrentTrades} slots${entryLockActive ? ' | lock' : ''} | ${scanDataSource}`
                 : "SIMULATION"}
             />
             <MetricBox 
-              icon={<DollarSign className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
-              label={isRealMode ? "Deployable Now" : "Available Margin"}
-              value={`$${(isRealMode ? deployableLiveMargin : displayedAvailableFunds).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-              subValue={isRealMode
+              icon={<DollarSign className={useExchangeAccountMetrics ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
+              label={useExchangeAccountMetrics ? "Available Margin" : "Available Margin"}
+              value={`$${(useExchangeAccountMetrics ? displayedAvailableFunds : displayedAvailableFunds).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+              subValue={useExchangeAccountMetrics
                 ? `Exchange Free $${exchangeFreeMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | ${remainingLiveSlots} slots @ $${maxLiveOrderNotional.toFixed(0)}`
                 : "Simulated Capital"}
             />
             <MetricBox 
-              icon={<Activity className={isRealMode ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
+              icon={<Activity className={useExchangeAccountMetrics ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Budget Efficiency"
               value={`${investedPct.toFixed(1)}%`}
               subValue={`Entry capital $${grossInvestedCapital.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | Margin used ${usedMarginPct.toFixed(1)}%`}
