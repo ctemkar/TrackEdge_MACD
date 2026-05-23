@@ -788,6 +788,22 @@ export default function App() {
     direction: ActivePositionSortDirection;
   }
 
+  const ACTIVE_POSITION_SORT_KEYS = new Set<ActivePositionSortKey>([
+    'exchange',
+    'side',
+    'symbol',
+    'contracts',
+    'entryPrice',
+    'markPrice',
+    'stopPrice',
+    'margin',
+    'notional',
+    'unrealizedPnl',
+    'pnlPct',
+    'riskGuard',
+    'action',
+  ]);
+
   type ExecutionStatus = 'FILLED' | 'SUBMITTED' | 'SKIPPED' | 'FAILED' | 'UNCONFIRMED' | 'SYNC_REMOVED';
   interface TradeEvent {
     type: 'BUY' | 'SELL';
@@ -977,7 +993,26 @@ export default function App() {
       return [];
     }
   });
-  const [activePositionSortRules, setActivePositionSortRules] = useState<ActivePositionSortRule[]>([]);
+  const [activePositionSortRules, setActivePositionSortRules] = useState<ActivePositionSortRule[]>(() => {
+    const saved = localStorage.getItem('te_active_position_sort_rules');
+    if (!saved) return [];
+    try {
+      const parsed = JSON.parse(saved);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.flatMap((rule): ActivePositionSortRule[] => {
+        const key = String(rule?.key || '');
+        const direction = rule?.direction === 'asc' || rule?.direction === 'desc'
+          ? rule.direction
+          : null;
+        if (!ACTIVE_POSITION_SORT_KEYS.has(key as ActivePositionSortKey) || !direction) {
+          return [];
+        }
+        return [{ key: key as ActivePositionSortKey, direction }];
+      });
+    } catch {
+      return [];
+    }
+  });
   
   const [tradeHistory, setTradeHistory] = useState<TradeEvent[]>(() => {
     const saved = localStorage.getItem('te_history');
@@ -1581,6 +1616,20 @@ export default function App() {
     setExecutionFeedback({ type: 'success', message: 'This tab took live control and asked the other tabs to close.' });
     addLog('LIVE CONTROL TAKEOVER: this tab is now the controller and the other tabs were asked to close.', 'warning');
   }, [addLog, claimLiveControl]);
+
+  const suspendAutonomousTrading = React.useCallback((reason: string) => {
+    currentScanCycleRef.current = 0;
+    scanningRef.current = false;
+    autoTradeRef.current = false;
+    setAutoTrade(false);
+    setScanning(false);
+    setIsBotActive(false);
+    setScanProgress({ current: 0, total: 0 });
+    setNextScanSec(0);
+    localStorage.setItem('te_auto_trade', 'false');
+    releaseLiveControl();
+    addLog(reason, 'warning');
+  }, [addLog, releaseLiveControl]);
 
   const applyBenchmarkCapital = React.useCallback((nextValue: number, nextTimestamp: number = Date.now()) => {
     setBenchmarkCapital(nextValue);
@@ -3276,7 +3325,7 @@ export default function App() {
     const confirmed = window.confirm(`LIQUIDATION PROTOCOL: Close all ${holdings.length} active positions at market price?`);
     if (!confirmed) return;
     
-    addLog(`LIQUIDATION START: Closing ${holdings.length} vectors...`, 'warning');
+    suspendAutonomousTrading(`LIQUIDATION START: Autonomous trading suspended. Closing ${holdings.length} vectors...`);
     
     const currentPositions = [...holdings];
     const liquidationStartedAt = Date.now();
@@ -3292,6 +3341,22 @@ export default function App() {
       }
     }
 
+    await syncRealBalance();
+
+    const remainingPositions = [...holdingsRef.current];
+    if (remainingPositions.length > 0) {
+      addLog(`LIQUIDATION RETRY: ${remainingPositions.length} positions still reported open after first pass. Retrying close orders...`, 'warning');
+      for (const h of remainingPositions) {
+        const price = holdingPricesRef.current[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice);
+        if (!price) continue;
+        const closeSide: 'BUY' | 'SELL' = h.side === 'SHORT' ? 'BUY' : 'SELL';
+        attempted++;
+        await executeTrade(closeSide, h.symbol, price, 'EMERGENCY_LIQUIDATION_RETRY', h.id, undefined, undefined, h.amount, undefined, { bypassDuplicateOrderLockout: true });
+        await new Promise(r => setTimeout(r, 600));
+      }
+      await syncRealBalance();
+    }
+
     const unresolved = holdingsRef.current.length;
     if (unresolved > 0) {
       addLog(`LIQUIDATION INCOMPLETE: ${attempted} close orders sent, ${unresolved} positions still open.`, 'warning');
@@ -3303,7 +3368,7 @@ export default function App() {
   const forceLiquidateAll = React.useCallback(async (reason: string) => {
     if (holdings.length === 0) return;
 
-    addLog(`FORCED LIQUIDATION: ${reason}. Closing ${holdings.length} active positions...`, 'warning');
+    suspendAutonomousTrading(`FORCED LIQUIDATION: ${reason}. Autonomous trading suspended. Closing ${holdings.length} active positions...`);
 
     const currentPositions = [...holdings];
     const liquidationStartedAt = Date.now();
@@ -3316,7 +3381,19 @@ export default function App() {
       await executeTrade(closeSide, h.symbol, price, reason, h.id);
       await new Promise(r => setTimeout(r, 600));
     }
-  }, [holdings, holdingPrices, symbol, currentPrice, executeTrade, addLog, queueLiquidationReview]);
+
+    await syncRealBalance();
+
+    const remainingPositions = [...holdingsRef.current];
+    for (const h of remainingPositions) {
+      const price = holdingPricesRef.current[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice);
+      if (!price) continue;
+      const closeSide: 'BUY' | 'SELL' = h.side === 'SHORT' ? 'BUY' : 'SELL';
+      await executeTrade(closeSide, h.symbol, price, `${reason}_RETRY`, h.id, undefined, undefined, h.amount, undefined, { bypassDuplicateOrderLockout: true });
+      await new Promise(r => setTimeout(r, 600));
+    }
+    await syncRealBalance();
+  }, [holdings, holdingPrices, symbol, currentPrice, executeTrade, queueLiquidationReview, suspendAutonomousTrading, syncRealBalance]);
 
   const confirmAndClosePosition = React.useCallback((holding: Holding, markPrice: number) => {
     const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
@@ -3410,6 +3487,7 @@ export default function App() {
     localStorage.setItem('te_benchmark_set_at', benchmarkSetAt > 0 ? String(benchmarkSetAt) : '');
     localStorage.setItem('te_auto_trade', autoTrade.toString());
     localStorage.setItem('te_real_mode', isRealMode.toString());
+    localStorage.setItem('te_active_position_sort_rules', JSON.stringify(activePositionSortRules));
     localStorage.setItem('te_stop_loss_percent', stopLossPercent.toString());
     localStorage.setItem('te_take_profit_percent', takeProfitPercent.toString());
     localStorage.setItem('te_use_bnb_fees', useBNBFees.toString());
@@ -3446,7 +3524,7 @@ export default function App() {
     localStorage.setItem('te_close_failure_lock_minutes', closeFailureLockMinutes.toString());
     localStorage.setItem('te_hard_failure_lock_minutes', hardFailureLockMinutes.toString());
     localStorage.setItem('te_strategy_config', JSON.stringify(strategyConfig));
-  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, benchmarkSetAt, autoTrade, isRealMode, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, liveMarginBufferPct, hardReentryCooldownMinutes, minEdgeAfterFrictionPct, estimatedRoundTripFrictionBps, symbolDailyLossLimit, symbolDailyFlipLimit, accountDailyLossLimit, marginStopLossPct, fastAdverseMoveExitPct, dailyEquityAnchorDate, dailyEquityAnchor, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, liveAutoScanLimit, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
+  }, [balance, availableFunds, holdings, tradeHistory, seedCapital, benchmarkCapital, benchmarkSetAt, autoTrade, isRealMode, activePositionSortRules, stopLossPercent, takeProfitPercent, useBNBFees, maxConcurrentTrades, maxDrawdownPercent, isDefensiveMode, autoEntryMinScore, liveMinOrderNotional, maxLiveOrderNotional, liveMarginBufferPct, hardReentryCooldownMinutes, minEdgeAfterFrictionPct, estimatedRoundTripFrictionBps, symbolDailyLossLimit, symbolDailyFlipLimit, accountDailyLossLimit, marginStopLossPct, fastAdverseMoveExitPct, dailyEquityAnchorDate, dailyEquityAnchor, liveQuoteAllowlistInput, scanIntervalSec, holdingPollIntervalSec, maxSymbolsPerScan, liveAutoScanLimit, duplicateOrderLockoutSec, liveEntryDelayMs, liveEntriesPerCycle, minPaperAllocation, softCooldownMinutes, successCooldownMinutes, paperLossCooldownMinutes, lowMarginLockMinutes, closeFailureLockMinutes, hardFailureLockMinutes, strategyConfig]);
 
   useEffect(() => {
     if (!isRealMode || !Number.isFinite(balance) || balance <= 0) return;
