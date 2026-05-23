@@ -1606,6 +1606,7 @@ export default function App() {
     const claimedTabId = claimLiveControl();
     autoTradeRef.current = true;
     setAutoTrade(true);
+    localStorage.setItem('te_auto_trade', 'true');
     setShowLiveControlLockPrompt(false);
 
     localStorage.setItem(LIVE_CONTROL_CLOSE_OTHERS_KEY, JSON.stringify({
@@ -1675,6 +1676,9 @@ export default function App() {
         setLiveControllerTabId(nextController);
         setShowLiveControlLockPrompt(false);
         if (nextController && nextController !== appTabIdRef.current && autoTradeRef.current) {
+          autoTradeRef.current = false;
+          setAutoTrade(false);
+          localStorage.setItem('te_auto_trade', 'false');
           setExecutionFeedback({ type: 'warning', message: 'Autonomous control moved to another tab. This tab is now read-only.' });
           addLog('AUTONOMOUS CONTROL TRANSFERRED: another tab is now the live controller.', 'warning');
         }
@@ -1698,6 +1702,9 @@ export default function App() {
         try {
           const payload = JSON.parse(event.newValue) as { requesterTabId?: string; requestedAt?: number };
           if (payload.requesterTabId && payload.requesterTabId !== appTabIdRef.current) {
+            autoTradeRef.current = false;
+            setAutoTrade(false);
+            localStorage.setItem('te_auto_trade', 'false');
             releaseLiveControl();
             setShowLiveControlLockPrompt(false);
             setExecutionFeedback({ type: 'warning', message: 'Another tab took live control and asked this tab to close.' });
@@ -3603,7 +3610,7 @@ export default function App() {
     return () => clearInterval(timer);
   }, [isRealMode, loadLiveAccountAudit]);
 
-  const shouldMaintainLiveAccountSync = isRealMode && (autoTrade || holdings.length > 0);
+  const shouldMaintainLiveAccountSync = isRealMode;
 
   useEffect(() => {
     if (!shouldMaintainLiveAccountSync) return;
@@ -6413,6 +6420,7 @@ export default function App() {
                     }
                     autoTradeRef.current = newState;
                     setAutoTrade(newState);
+                    localStorage.setItem('te_auto_trade', newState ? 'true' : 'false');
                     addLog(`SYSTEM UPDATE: Autonomous Execution ${newState ? 'ENGAGED' : 'SUSPENDED'}`, newState ? 'success' : 'warning');
                   }}
                   title={autoTrade ? "Disable Auto-Trading" : "Enable Auto-Trading"}

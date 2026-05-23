@@ -1597,8 +1597,6 @@ async function startServer() {
           Number(info.totalMarginBalance),
           Number(info.totalCrossWalletBalance),
           Number(info.totalWalletBalance),
-          Number(info.totalInitialMargin),
-          Number(info.totalAvailableBalance),
         ].filter(v => Number.isFinite(v) && v > 0);
 
         if (pmCandidates.length > 0) {
