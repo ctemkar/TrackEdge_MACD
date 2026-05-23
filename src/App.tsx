@@ -984,6 +984,7 @@ export default function App() {
   const [showLiveControlLockPrompt, setShowLiveControlLockPrompt] = useState(false);
   const [controllerTabAttentionUntil, setControllerTabAttentionUntil] = useState(0);
   const [entryLockUntil, setEntryLockUntil] = useState(0);
+  const [entryLockReason, setEntryLockReason] = useState<string | null>(null);
   const lastRateLimitWarnAtRef = React.useRef(0);
   const dismissedSyncErrorRef = React.useRef<{ message: string; until: number } | null>(null);
 
@@ -1937,7 +1938,9 @@ export default function App() {
             : `Live trading disabled until ${(new Date(authBlockedUntil || Date.now() + 60000)).toLocaleTimeString()}`;
           setAuthDegradedMessage(message);
           if (hasAuthBlock) {
+            entryLockUntilRef.current = Math.max(entryLockUntilRef.current, authBlockedUntil);
             setEntryLockUntil(authBlockedUntil);
+            setEntryLockReason('exchange auth/permission lock');
           }
         } else if (message.includes('-1021')) {
           message = 'TIMESTAMP REJECTED. Your local clock may be out of sync with exchange servers.';
@@ -1951,7 +1954,9 @@ export default function App() {
       const data = await resp.json();
       if (data.status === 'success' || data.status === 'cached') {
         setPrivateSyncBlockedUntil(0);
+        entryLockUntilRef.current = 0;
         setEntryLockUntil(0);
+        setEntryLockReason(null);
         reportSyncError(null);
         const liveEquity = Number(data.equity);
         const usdt = Number(data?.balance?.USDT || 0);
@@ -2403,14 +2408,28 @@ export default function App() {
 
       const lockEntries = (ms: number, why: string) => {
         const until = Date.now() + ms;
+        entryLockUntilRef.current = Math.max(entryLockUntilRef.current, until);
         setEntryLockUntil(prev => Math.max(prev, until));
+        setEntryLockReason(why);
         addLog(`ENTRY LOCK: ${why}`, 'warning');
       };
 
       const clearEntryLock = () => {
         if (entryLockUntilRef.current > Date.now()) {
+          entryLockUntilRef.current = 0;
           setEntryLockUntil(0);
+          setEntryLockReason(null);
         }
+      };
+
+      const pauseNewLiveEntriesAfterOpen = (why: string) => {
+        if (!isRealMode) return;
+        const pauseMs = Math.max(liveEntryDelayMs, scanIntervalSec * 1000);
+        if (pauseMs <= 0) return;
+        const until = Date.now() + pauseMs;
+        entryLockUntilRef.current = Math.max(entryLockUntilRef.current, until);
+        setEntryLockUntil(prev => Math.max(prev, until));
+        setEntryLockReason(why);
       };
 
       const applyOptimisticLiveFill = (
@@ -2692,6 +2711,9 @@ export default function App() {
             const orderId = result?.order?.id || result?.order?.clientOrderId || result?.order?.info?.orderId;
             clearPendingCloseSync(tradeSymbol);
             applyOptimisticLiveFill(type, tradeSymbol, amount, price, time);
+            if (!closingExisting) {
+              pauseNewLiveEntriesAfterOpen(`post-fill live cooldown after ${tradeSymbol} open`);
+            }
             addLog(`REAL ${type} SUCCESS: ${tradeSymbol} [Verified by order response; position-risk endpoint unavailable]`, 'success');
             setExecutionFeedback({ type: 'success', message: `${type} confirmed on exchange for ${tradeSymbol}.` });
             pushTradeEvent({
@@ -2740,6 +2762,7 @@ export default function App() {
             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * exitCooldownMinutes) }));
           } else {
             applyOptimisticLiveFill(type, tradeSymbol, amount, price, time);
+            pauseNewLiveEntriesAfterOpen(`post-fill live cooldown after ${tradeSymbol} open`);
             pushTradeEvent({
               type,
               symbol: tradeSymbol,
@@ -2765,8 +2788,8 @@ export default function App() {
         const msg = String(e?.message || 'Unknown order failure');
         const isMarginOrFundsFailure = /-2019|margin is insufficient|insufficient margin|insufficient balance/i.test(msg);
         const isAuthFailure = /-2015|invalid api-key|invalid api key|ip|permissions for action|whitelist/i.test(msg);
-        const unsupportedMarketFailure = /(SYMBOL SKIPPED|UNSUPPORTED MARKET|does not have market symbol)/i.test(msg);
-        const softSkip = /(SYMBOL SKIPPED|UNSUPPORTED MARKET|does not have market symbol|INVALID ORDER SIZE|ORDER SIZE UNDERFLOW|allocation below|Unable to size|No open position|Duplicate order lockout)/i.test(msg);
+        const unsupportedMarketFailure = /(SYMBOL SKIPPED|UNSUPPORTED MARKET|does not have market symbol|-4411|agreement signature is required|sign the agreement)/i.test(msg);
+        const softSkip = /(SYMBOL SKIPPED|UNSUPPORTED MARKET|does not have market symbol|INVALID ORDER SIZE|ORDER SIZE UNDERFLOW|allocation below|Unable to size|No open position|Duplicate order lockout|-4411|agreement signature is required|sign the agreement)/i.test(msg);
 
         if (softSkip) {
           if (unsupportedMarketFailure) {
@@ -2806,6 +2829,8 @@ export default function App() {
             clearEntryLock();
             clearPendingCloseSync(tradeSymbol);
             void clearExchangeProtection(tradeSymbol, heldSide === 'SHORT' ? 'SHORT' : 'LONG');
+          } else {
+            pauseNewLiveEntriesAfterOpen(`post-fill live cooldown after ${tradeSymbol} open`);
           }
           pushTradeEvent({
             type,
@@ -3013,7 +3038,7 @@ export default function App() {
         }
       }
     }
-  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, maxLiveOrderNotional, autoEntryMinScore, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes, hardReentryCooldownMinutes, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional, getBufferedLiveCapital, liveMarginBufferPct, getLiveEntryCapacityBlock, getEntryRetryLock, setEntryRetryLock, clearEntryRetryLock, clearExchangeProtection, serverStatus]);
+  }, [symbol, holdings, maxConcurrentTrades, useBNBFees, isRealMode, balance, syncRealBalance, addLog, isDefensiveMode, serverConfig?.exchange, pushTradeEvent, duplicateOrderLockoutSec, liveMinOrderNotional, maxLiveOrderNotional, autoEntryMinScore, closeFailureLockMinutes, softCooldownMinutes, successCooldownMinutes, minPaperAllocation, paperLossCooldownMinutes, hardFailureLockMinutes, hardReentryCooldownMinutes, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getDesiredLiveEntryNotional, getHoldingActiveNotional, getBufferedLiveCapital, liveMarginBufferPct, getLiveEntryCapacityBlock, getEntryRetryLock, setEntryRetryLock, clearEntryRetryLock, clearExchangeProtection, serverStatus, liveEntryDelayMs, scanIntervalSec]);
 
   const managePlannedExit = React.useCallback((holding: Holding, price: number, signal?: StrategySignal | null, cycleId?: number) => {
     const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
@@ -3085,6 +3110,10 @@ export default function App() {
       return didChange ? next : prev;
     });
 
+    if (isRealMode) {
+      return;
+    }
+
     const technicalInvalidation = holding.side === 'LONG' ? price <= stopPrice : price >= stopPrice;
     const priceProfitTargetHit = holding.side === 'LONG' ? price >= tp2Price : price <= tp2Price;
     const hitTp1 = holding.side === 'LONG' ? price >= tp1Price : price <= tp1Price;
@@ -3149,7 +3178,7 @@ export default function App() {
       }
       return;
     }
-  }, [executeTrade, stopLossPercent, takeProfitPercent, holdingPollIntervalSec]);
+  }, [executeTrade, isRealMode, stopLossPercent, takeProfitPercent, holdingPollIntervalSec]);
 
 
 
@@ -4548,7 +4577,9 @@ export default function App() {
         }
         const eligibleBuyCount = entries.filter(entry => entry.side === 'BUY').length;
         const eligibleSellCount = entries.filter(entry => entry.side === 'SELL').length;
-        const effectiveBaseAvailableSlots = Math.max(0, currentMaxTrades - currentHoldings.length);
+        const baseAvailableSlots = Math.max(0, currentMaxTrades - currentHoldings.length);
+        const perCycleEntryCap = Math.max(1, liveEntriesPerCycle);
+        const effectiveBaseAvailableSlots = Math.min(baseAvailableSlots, perCycleEntryCap);
         if (effectiveBaseAvailableSlots > 0) {
           const openSideCounts = currentHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
             acc[holding.side === 'SHORT' ? 'SELL' : 'BUY'] += 1;
@@ -4558,7 +4589,9 @@ export default function App() {
           const realTradableCapital = realFreeCapital;
           if (isRealMode && realFreeCapital < liveMinOrderNotional) {
             const marginLockUntil = Date.now() + (lowMarginLockMinutes * 60 * 1000);
+            entryLockUntilRef.current = Math.max(entryLockUntilRef.current, marginLockUntil);
             setEntryLockUntil(prev => Math.max(prev, marginLockUntil));
+            setEntryLockReason('free margin below live minimum order threshold');
             pushScanSkipEvent(`SKIP: Free margin too low for minimum order ($${realFreeCapital.toFixed(2)} < $${liveMinOrderNotional.toFixed(2)})`, cycleId);
             return;
           }
@@ -5124,6 +5157,7 @@ export default function App() {
   const entryLockActive = entryLockUntil > Date.now();
   const entryLockRemainingSec = entryLockActive ? Math.max(1, Math.ceil((entryLockUntil - Date.now()) / 1000)) : 0;
   const entryLockRetryTime = entryLockActive ? new Date(entryLockUntil).toLocaleTimeString() : '';
+  const entryLockReasonLabel = entryLockReason || 'safety lock active';
   const syncErrorLower = (syncError || '').toLowerCase();
   const isAuthDisabledBannerVisible = entryLockActive && (
     syncErrorLower.includes('auth error') ||
@@ -6122,7 +6156,7 @@ export default function App() {
                     reportSyncError(null);
                     if (serverConfig?.hasKeys) {
                       if (entryLockActive) {
-                        addLog('Retrying live Binance handshake despite prior auth lock.', 'info');
+                        addLog(`Retrying live Binance handshake despite prior lock (${entryLockReasonLabel}).`, 'info');
                       }
                       const success = await syncRealBalance({ ignoreEntryLock: true });
                       if (success) {
@@ -6149,7 +6183,7 @@ export default function App() {
                 </button>
                 {entryLockActive && (
                   <span className="text-[10px] font-mono uppercase text-rose-600 ml-1">
-                    Disabled until {entryLockRemainingSec}s
+                    {entryLockReasonLabel} | {entryLockRemainingSec}s
                   </span>
                 )}
              </div>
@@ -6172,7 +6206,7 @@ export default function App() {
                     }
 
                     if (!autoTrade && entryLockActive) {
-                      const lockMessage = `AUTONOMOUS DISABLED BY SAFETY LOCK: retry in ~${entryLockRemainingSec}s.`;
+                      const lockMessage = `AUTONOMOUS DISABLED: ${entryLockReasonLabel}. Retry in ~${entryLockRemainingSec}s.`;
                       setExecutionFeedback({ type: 'warning', message: lockMessage });
                       addLog(lockMessage, 'warning');
                       return;
@@ -6206,7 +6240,7 @@ export default function App() {
                 </button>
                   {!autoTrade && entryLockActive && (
                     <span className="text-[10px] font-mono uppercase text-rose-600">
-                      Disabled by Safety Lock ({entryLockRemainingSec}s)
+                      {entryLockReasonLabel} ({entryLockRemainingSec}s)
                     </span>
                   )}
              </div>

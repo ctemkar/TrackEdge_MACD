@@ -2334,6 +2334,7 @@ async function startServer() {
     } catch (error: any) {
       const msg = String(error?.message || 'Unknown order failure');
       const unsupported = msg.includes('does not have market symbol') || msg.includes('UNSUPPORTED MARKET') || msg.includes('SYMBOL SKIPPED');
+      const agreementRestricted = /-4411|agreement signature is required|sign the agreement/i.test(msg);
       const lowMarginSkip = /allocation below available margin|MIN NOTIONAL ENFORCED|below minimum order/i.test(msg);
 
       if (lowMarginSkip) {
@@ -2342,6 +2343,19 @@ async function startServer() {
           : `allocation below minimum order threshold: ${msg}`;
         console.warn(`[TradeEdge SKIP] ${normalized}`);
         return res.json({ status: 'skipped', message: normalized });
+      }
+
+      if (agreementRestricted) {
+        const raw = String(req.body?.symbol || '').toUpperCase().replace('/', '').replace(':', '');
+        if (raw) {
+          unsupportedSymbolSkips.set(raw, {
+            count: (unsupportedSymbolSkips.get(raw)?.count || 0) + 1,
+            until: Date.now() + (1000 * 60 * 60 * 12),
+            reason: 'exchange agreement required',
+          });
+        }
+        console.warn(`[TradeEdge SKIP] agreement required: ${msg}`);
+        return res.json({ status: 'skipped', message: msg });
       }
 
       if (unsupported) {
