@@ -3052,8 +3052,8 @@ export default function App() {
           if (isAuthFailure) {
             // Auth/permission failures are account-wide; pause all new live entries.
             lockEntries(hardFailureLockMinutes * 60 * 1000, 'Entry lock engaged after hard exchange failure (auth/permission).');
-            setIsRealMode(false);
-            addLog('LIVE MODE DISABLED: Exchange auth/permission failure detected.', 'warning');
+            addLog('LIVE ENTRY LOCK ENGAGED: Exchange auth/permission failure detected. Live mode remains on, but new entries are paused.', 'warning');
+            setExecutionFeedback({ type: 'warning', message: 'Exchange auth/permission failure detected. Live mode stayed on, but new live entries are paused until the lock clears.' });
           } else {
             // Margin/funds failures are usually symbol/order-size specific; keep the block local.
             addLog(`SYMBOL ENTRY LOCK ENGAGED: ${tradeSymbol} margin insufficient. Only this symbol is paused for retry.`, 'warning');
