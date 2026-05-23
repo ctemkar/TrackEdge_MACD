@@ -2433,6 +2433,17 @@ async function startServer() {
         { label: 'PAPI UM', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/openOrders' },
       ];
 
+      const requestedProtectionSide = requestedPositionSide === 'LONG' || requestedPositionSide === 'SHORT' || requestedPositionSide === 'BOTH'
+        ? requestedPositionSide
+        : undefined;
+      const positionMode = await fetchBinancePositionModeViaHttp(apiKey, apiSecret);
+      const effectivePositionSide: 'LONG' | 'SHORT' | 'BOTH' = positionMode.dualSidePosition === true
+        ? requestedProtectionSide === 'LONG' || requestedProtectionSide === 'SHORT'
+          ? requestedProtectionSide
+          : 'BOTH'
+        : 'BOTH';
+      const shouldSendPositionSide = positionMode.dualSidePosition === true && (effectivePositionSide === 'LONG' || effectivePositionSide === 'SHORT');
+
       const listed = await sendBinanceSignedRequest(apiKey, apiSecret, openOrderEndpoints, 'GET', { symbol, recvWindow: '5000' });
       const existingOrders = Array.isArray(listed?.data) ? listed.data : [];
       const protectiveOrders = existingOrders.filter((order: any) => {
@@ -2440,13 +2451,15 @@ async function startServer() {
         const closePosition = String(order?.closePosition || '').toLowerCase() === 'true';
         const reduceOnly = String(order?.reduceOnly || '').toLowerCase() === 'true';
         const positionSide = String(order?.positionSide || '').toUpperCase();
-        const sameSide = !requestedPositionSide || !positionSide || positionSide === requestedPositionSide || positionSide === 'BOTH';
+        const sameSide = effectivePositionSide === 'BOTH'
+          ? !positionSide || positionSide === 'BOTH'
+          : !positionSide || positionSide === effectivePositionSide || positionSide === 'BOTH';
         return sameSide && (type === 'STOP_MARKET' || type === 'TAKE_PROFIT_MARKET') && (closePosition || reduceOnly);
       });
 
       const cancelled: Array<{ orderId: string; type: string }> = [];
       const buildProtectionClientAlgoId = (type: 'STOP_MARKET' | 'TAKE_PROFIT_MARKET') => {
-        const sideToken = requestedPositionSide === 'SHORT' ? 'S' : requestedPositionSide === 'LONG' ? 'L' : 'B';
+        const sideToken = effectivePositionSide === 'SHORT' ? 'S' : effectivePositionSide === 'LONG' ? 'L' : 'B';
         const typeToken = type === 'STOP_MARKET' ? 'sl' : 'tp';
         return `te_${symbol}_${sideToken}_${typeToken}`.slice(0, 36);
       };
@@ -2482,9 +2495,7 @@ async function startServer() {
         return res.json({ status: 'success', action: 'clear', cancelled });
       }
 
-      const positionSide = requestedPositionSide === 'LONG' || requestedPositionSide === 'SHORT' || requestedPositionSide === 'BOTH'
-        ? requestedPositionSide
-        : 'BOTH';
+      const positionSide = effectivePositionSide;
       const closeSide = positionSide === 'SHORT' ? 'BUY' : 'SELL';
       const protectionAmount = normalizeOrderAmount(amountInput);
       const stopPrice = normalizeStopPrice(stopPriceInput);
@@ -2493,19 +2504,37 @@ async function startServer() {
         return res.json({ status: 'success', action: 'ensure', cancelled, armed: [] });
       }
 
+      let currentPrice: number | null = null;
+      try {
+        const ticker = await client.fetchTicker(ccxtSymbol);
+        const rawCurrentPrice = Number(ticker?.last || ticker?.close || ticker?.info?.markPrice || ticker?.info?.lastPrice || 0);
+        currentPrice = Number.isFinite(rawCurrentPrice) && rawCurrentPrice > 0 ? rawCurrentPrice : null;
+      } catch {
+        currentPrice = null;
+      }
+
       const armed: Array<{ type: string; orderId: string; stopPrice: number }> = [];
+      const skipped: Array<{ type: string; stopPrice: number; reason: string }> = [];
+      const isTriggerStillValid = (type: 'STOP_MARKET' | 'TAKE_PROFIT_MARKET', triggerPrice: number) => {
+        if (!currentPrice) return true;
+        if (positionSide === 'SHORT') {
+          return type === 'STOP_MARKET' ? triggerPrice > currentPrice : triggerPrice < currentPrice;
+        }
+        return type === 'STOP_MARKET' ? triggerPrice < currentPrice : triggerPrice > currentPrice;
+      };
       const placeProtectionOrder = async (type: 'STOP_MARKET' | 'TAKE_PROFIT_MARKET', triggerPrice: number) => {
+        const preciseTriggerPrice = client.priceToPrecision(ccxtSymbol, triggerPrice);
         const params: Record<string, string> = {
           symbol,
           side: closeSide,
           type,
-          stopPrice: String(triggerPrice),
+          stopPrice: preciseTriggerPrice,
           closePosition: 'true',
           workingType: 'MARK_PRICE',
           priceProtect: 'true',
           recvWindow: '5000',
         };
-        if (positionSide) {
+        if (shouldSendPositionSide) {
           params.positionSide = positionSide;
         }
         try {
@@ -2519,21 +2548,24 @@ async function startServer() {
           if (!protectionAmount) {
             throw new Error(`Protection amount unavailable for ${symbol}.`);
           }
+          const preciseQuantity = client.amountToPrecision(ccxtSymbol, protectionAmount);
 
           const algoParams: Record<string, string> = {
             algoType: 'CONDITIONAL',
             symbol,
             side: closeSide,
-            positionSide,
             type,
-            quantity: String(protectionAmount),
-            triggerPrice: String(triggerPrice),
+            quantity: preciseQuantity,
+            triggerPrice: preciseTriggerPrice,
             workingType: 'MARK_PRICE',
             priceProtect: 'true',
             clientAlgoId: buildProtectionClientAlgoId(type),
             recvWindow: '5000',
           };
-          if (positionSide === 'BOTH') {
+          if (shouldSendPositionSide) {
+            algoParams.positionSide = positionSide;
+          }
+          if (!shouldSendPositionSide) {
             algoParams.reduceOnly = 'true';
           }
           const placed = await sendBinanceSignedRequest(apiKey, apiSecret, pmAlgoOrderEndpoints, 'POST', algoParams);
@@ -2542,15 +2574,35 @@ async function startServer() {
       };
 
       if (stopPrice) {
-        const placed = await placeProtectionOrder('STOP_MARKET', stopPrice);
-        armed.push({ type: 'STOP_MARKET', orderId: String(placed?.orderId || placed?.clientOrderId || placed?.algoId || placed?.clientAlgoId || ''), stopPrice });
+        if (isTriggerStillValid('STOP_MARKET', stopPrice)) {
+          const placed = await placeProtectionOrder('STOP_MARKET', stopPrice);
+          armed.push({ type: 'STOP_MARKET', orderId: String(placed?.orderId || placed?.clientOrderId || placed?.algoId || placed?.clientAlgoId || ''), stopPrice });
+        } else {
+          skipped.push({
+            type: 'STOP_MARKET',
+            stopPrice,
+            reason: `stop already crossed current price${currentPrice ? ` ${currentPrice}` : ''}`,
+          });
+        }
       }
       if (takeProfitPrice) {
-        const placed = await placeProtectionOrder('TAKE_PROFIT_MARKET', takeProfitPrice);
-        armed.push({ type: 'TAKE_PROFIT_MARKET', orderId: String(placed?.orderId || placed?.clientOrderId || placed?.algoId || placed?.clientAlgoId || ''), stopPrice: takeProfitPrice });
+        if (isTriggerStillValid('TAKE_PROFIT_MARKET', takeProfitPrice)) {
+          const placed = await placeProtectionOrder('TAKE_PROFIT_MARKET', takeProfitPrice);
+          armed.push({ type: 'TAKE_PROFIT_MARKET', orderId: String(placed?.orderId || placed?.clientOrderId || placed?.algoId || placed?.clientAlgoId || ''), stopPrice: takeProfitPrice });
+        } else {
+          skipped.push({
+            type: 'TAKE_PROFIT_MARKET',
+            stopPrice: takeProfitPrice,
+            reason: `take-profit already crossed current price${currentPrice ? ` ${currentPrice}` : ''}`,
+          });
+        }
       }
 
-      res.json({ status: 'success', action: 'ensure', cancelled, armed });
+      if (armed.length === 0 && skipped.length > 0) {
+        throw new Error(skipped.map(entry => `${entry.type} ${entry.reason}`).join(' | '));
+      }
+
+      res.json({ status: 'success', action: 'ensure', cancelled, armed, skipped, currentPrice });
     } catch (error: any) {
       console.error(`[TradeEdge ERROR] Protection Failed: ${error?.message || error}`);
       res.status(500).json({ status: 'error', message: String(error?.message || 'Protection order failure') });
