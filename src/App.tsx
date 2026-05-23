@@ -190,6 +190,7 @@ const PROFITABLE_LIVE_RUNTIME_GATES = {
 
 const NON_TRADABLE_QUOTE_BASES = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
 const LIVE_PORTFOLIO_GROSS_EXPOSURE_MULTIPLIER = 4.5;
+const LIVE_DIRECTIONAL_SIDE_CAP_RATIO = 0.6;
 const COOLDOWNS_ENABLED = false;
 
 const getCompactUsdSymbolParts = (raw: string): { compact: string; base: string; quote: string } | null => {
@@ -234,6 +235,7 @@ const getDirectionalEntryScore = (side: 'BUY' | 'SELL', score: number) => {
 const STRONG_LIVE_SIGNAL_SCORE_BUFFER = 0.2;
 const STRONG_LIVE_SIGNAL_NOTIONAL_MULTIPLIER = 1.5;
 const STRONG_LIVE_SIGNAL_EXTRA_SLOTS = 4;
+const DIRECTIONAL_GATE_OVERRIDE_SCORE_BUFFER = 1.0;
 
 const isStrongLiveSignal = (directionalScore: number, minScore: number) => {
   return directionalScore >= Math.min(10, Math.max(0, minScore) + STRONG_LIVE_SIGNAL_SCORE_BUFFER);
@@ -517,7 +519,7 @@ export default function App() {
     if (!saved) return [];
     try {
       const parsed = JSON.parse(saved);
-      return Array.isArray(parsed) ? parsed as LiquidationReviewEntry[] : [];
+      return Array.isArray(parsed) ? parsed.map((entry) => normalizeLiquidationReviewEntry(entry)) : [];
     } catch {
       return [];
     }
@@ -895,7 +897,24 @@ export default function App() {
     lastReviewedAt: number;
     matchedFoundAt: number | null;
     pick: MarketScanResult | null;
+    source?: 'liquidation' | 'manual' | 'rebalance';
+    exitReason?: string | null;
+    exitSide?: 'LONG' | 'SHORT' | null;
+    exitPrice?: number | null;
   }
+
+  const normalizeLiquidationReviewEntry = (entry: Partial<LiquidationReviewEntry> | null | undefined): LiquidationReviewEntry => ({
+    symbol: String(entry?.symbol || '').toUpperCase(),
+    liquidatedAt: Number(entry?.liquidatedAt || 0),
+    reviewEligibleAt: Number(entry?.reviewEligibleAt || 0),
+    lastReviewedAt: Number(entry?.lastReviewedAt || 0),
+    matchedFoundAt: entry?.matchedFoundAt ? Number(entry.matchedFoundAt) : null,
+    pick: entry?.pick || null,
+    source: entry?.source === 'manual' || entry?.source === 'rebalance' ? entry.source : 'liquidation',
+    exitReason: entry?.exitReason ? String(entry.exitReason) : null,
+    exitSide: entry?.exitSide === 'LONG' || entry?.exitSide === 'SHORT' ? entry.exitSide : null,
+    exitPrice: Number.isFinite(Number(entry?.exitPrice)) && Number(entry?.exitPrice) > 0 ? Number(entry?.exitPrice) : null,
+  });
 
   type LiveLedgerEntry = {
     kind: 'income' | 'trade';
@@ -1405,6 +1424,50 @@ export default function App() {
     return null;
   }, [balance, getLivePortfolioExposureCap, getPortfolioGrossNotional]);
 
+  const getLiveDirectionalExposureBlock = React.useCallback(({
+    side,
+    confidenceScore,
+    openHoldings,
+    queuedSideCounts,
+    maxSlots,
+  }: {
+    side: 'BUY' | 'SELL';
+    confidenceScore?: number;
+    openHoldings: Holding[];
+    queuedSideCounts?: Record<'BUY' | 'SELL', number>;
+    maxSlots?: number;
+  }) => {
+    const totalSlots = Math.max(1, maxSlots || maxConcurrentTradesRef.current || 1);
+    const sideCap = Math.max(1, Math.ceil(totalSlots * LIVE_DIRECTIONAL_SIDE_CAP_RATIO));
+    const imbalanceCap = Math.max(1, Math.floor(totalSlots / 3));
+    const openSideCounts = openHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
+      acc[holding.side === 'SHORT' ? 'SELL' : 'BUY'] += 1;
+      return acc;
+    }, { BUY: 0, SELL: 0 });
+    const queued = queuedSideCounts || { BUY: 0, SELL: 0 };
+    const oppositeSide: 'BUY' | 'SELL' = side === 'BUY' ? 'SELL' : 'BUY';
+    const projectedSideCount = openSideCounts[side] + queued[side] + 1;
+    const projectedOppositeCount = openSideCounts[oppositeSide] + queued[oppositeSide];
+    const exceptionalSignal = Number.isFinite(confidenceScore) && confidenceScore !== undefined
+      && confidenceScore >= Math.min(10, Math.max(0, effectiveLiveAutoEntryMinScore) + DIRECTIONAL_GATE_OVERRIDE_SCORE_BUFFER);
+
+    if (projectedSideCount > sideCap) {
+      if (exceptionalSignal && projectedSideCount <= (sideCap + 1)) {
+        return null;
+      }
+      return `side concentration cap (${side} ${projectedSideCount}/${sideCap})`;
+    }
+
+    if ((projectedSideCount - projectedOppositeCount) > imbalanceCap) {
+      if (exceptionalSignal && (projectedSideCount - projectedOppositeCount) <= (imbalanceCap + 1)) {
+        return null;
+      }
+      return `directional imbalance cap (${side} lead ${projectedSideCount - projectedOppositeCount} > ${imbalanceCap})`;
+    }
+
+    return null;
+  }, [effectiveLiveAutoEntryMinScore]);
+
   const getDesiredLiveEntryNotional = React.useCallback((confidenceScore: number | undefined, tradableCapital: number) => {
     const minLiveNotional = Math.max(1, liveMinOrderNotional);
     const availableCapital = Math.max(0, tradableCapital);
@@ -1663,15 +1726,19 @@ export default function App() {
 
   React.useEffect(() => {
     const savedAutoTrade = localStorage.getItem('te_auto_trade') === 'true';
-    const shouldResumeAutoTrade = savedAutoTrade;
+    const savedRealMode = localStorage.getItem('te_real_mode') === 'true';
 
-    if (shouldResumeAutoTrade && isRealMode) {
+    if (savedRealMode) {
+      setIsRealMode(true);
+    }
+
+    if (savedAutoTrade && savedRealMode) {
       claimLiveControl();
     }
 
-    autoTradeRef.current = shouldResumeAutoTrade;
-    setAutoTrade(shouldResumeAutoTrade);
-  }, [claimLiveControl, isRealMode]);
+    autoTradeRef.current = savedAutoTrade;
+    setAutoTrade(savedAutoTrade);
+  }, [claimLiveControl]);
 
   React.useEffect(() => {
     if (isRealMode || !autoTrade) return;
@@ -1855,7 +1922,13 @@ export default function App() {
     });
   }, [pushTradeEvent]);
 
-  const queueLiquidationReview = React.useCallback((symbols: string[], liquidatedAt: number) => {
+  const queueLiquidationReview = React.useCallback((entries: Array<{
+    symbol: string;
+    exitSide?: 'LONG' | 'SHORT';
+    exitPrice?: number;
+    exitReason?: string;
+    source?: 'liquidation' | 'manual' | 'rebalance';
+  }>, liquidatedAt: number) => {
     const reviewEligibleAt = liquidatedAt + (hardReentryCooldownMinutes * 60 * 1000);
     setLiquidationReviewQueue((prev) => {
       const next = new Map<string, LiquidationReviewEntry>();
@@ -1864,8 +1937,8 @@ export default function App() {
         next.set(normalizeLiveFuturesSymbol(entry.symbol), entry);
       });
 
-      symbols.forEach((rawSymbol) => {
-        const symbol = String(rawSymbol || '').toUpperCase();
+      entries.forEach((reviewEntry) => {
+        const symbol = String(reviewEntry.symbol || '').toUpperCase();
         const normalized = normalizeLiveFuturesSymbol(symbol);
         if (!normalized) return;
         next.set(normalized, {
@@ -1875,6 +1948,10 @@ export default function App() {
           lastReviewedAt: 0,
           matchedFoundAt: null,
           pick: null,
+          source: reviewEntry.source || 'liquidation',
+          exitReason: reviewEntry.exitReason || null,
+          exitSide: reviewEntry.exitSide || null,
+          exitPrice: Number.isFinite(Number(reviewEntry.exitPrice)) && Number(reviewEntry.exitPrice) > 0 ? Number(reviewEntry.exitPrice) : null,
         });
       });
 
@@ -2507,9 +2584,10 @@ export default function App() {
         (heldSide === 'LONG' && type === 'SELL') ||
         (heldSide === 'SHORT' && type === 'BUY')
       );
+      let openingExposure = !closingExisting;
 
       const retryLock = getEntryRetryLock(tradeSymbol);
-      if (retryLock && !allowManualOverride && !closingExisting) {
+      if (retryLock && !allowManualOverride && openingExposure) {
         const remainingSec = Math.max(1, Math.ceil((retryLock.until - Date.now()) / 1000));
         const retryMsg = `retry lock active for ${remainingSec}s (${retryLock.reason})`;
         addLog(`TRADE SKIPPED: ${tradeSymbol} ${retryMsg}.`, 'warning');
@@ -2518,7 +2596,7 @@ export default function App() {
         return;
       }
 
-      if ((type === 'BUY' || openingShort) && !closingExisting && serverStatus !== 'OK') {
+      if (openingExposure && serverStatus !== 'OK') {
         const message = 'CONNECTION FAIL-SAFE: new live entries are blocked until connection health returns.';
         if (!allowManualOverride) {
           addLog(message, 'warning');
@@ -2529,7 +2607,7 @@ export default function App() {
         addLog(`MANUAL OVERRIDE: ${tradeSymbol} bypassing connection fail-safe.`, 'warning');
       }
 
-      if ((type === 'BUY' || openingShort) && !closingExisting && !hasLiveExecutionControl()) {
+      if (openingExposure && !hasLiveExecutionControl()) {
         const message = 'LIVE CONTROL LOCK: another tab owns live execution. This tab remains read-only.';
         addLog(message, 'warning');
         setExecutionFeedback({ type: 'warning', message });
@@ -2538,7 +2616,7 @@ export default function App() {
       }
 
       const entryLockActive = entryLockUntilRef.current > Date.now();
-      if ((type === 'BUY' || openingShort) && !closingExisting && entryLockActive) {
+      if (openingExposure && entryLockActive) {
         const remainingSec = Math.max(1, Math.ceil((entryLockUntilRef.current - Date.now()) / 1000));
         const lockMsg = `ENTRY LOCK ACTIVE (${remainingSec}s): waiting for successful exits before new positions.`;
         if (!allowManualOverride) {
@@ -2551,7 +2629,7 @@ export default function App() {
         setExecutionFeedback({ type: 'warning', message: `Manual override for ${tradeSymbol}: ${lockMsg}` });
       }
 
-      if ((type === 'BUY' || openingShort) && !closingExisting) {
+      if (openingExposure) {
         const symbolRiskBlock = getSymbolRiskBlock(tradeSymbol);
         if (symbolRiskBlock) {
           if (!allowManualOverride) {
@@ -2563,6 +2641,24 @@ export default function App() {
           }
           addLog(`MANUAL OVERRIDE: ${tradeSymbol} bypassing symbol guard (${symbolRiskBlock.reason}).`, 'warning');
           setExecutionFeedback({ type: 'warning', message: `Manual override for ${tradeSymbol}: ${symbolRiskBlock.reason}.` });
+        }
+
+        const directionalExposureBlock = getLiveDirectionalExposureBlock({
+          side: type === 'SELL' ? 'SELL' : 'BUY',
+          confidenceScore,
+          openHoldings: latestHoldings,
+          maxSlots: Math.min(maxConcurrentTrades, PROFITABLE_LIVE_RUNTIME_GATES.maxConcurrentTrades),
+        });
+        if (directionalExposureBlock) {
+          if (!allowManualOverride) {
+            addLog(`TRADE SKIPPED: ${tradeSymbol} blocked by directional guard (${directionalExposureBlock}).`, 'warning');
+            setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${directionalExposureBlock}.` });
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${directionalExposureBlock}`, status: 'SKIPPED', cycleId: eventCycleId });
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * softCooldownMinutes) }));
+            return;
+          }
+          addLog(`MANUAL OVERRIDE: ${tradeSymbol} bypassing directional guard (${directionalExposureBlock}).`, 'warning');
+          setExecutionFeedback({ type: 'warning', message: `Manual override for ${tradeSymbol}: ${directionalExposureBlock}.` });
         }
 
         if (Number.isFinite(confidenceScore) && confidenceScore !== undefined && confidenceScore < effectiveLiveAutoEntryMinScore) {
@@ -2738,17 +2834,36 @@ export default function App() {
           (heldSide === 'LONG' && type === 'SELL') ||
           (heldSide === 'SHORT' && type === 'BUY')
         );
+        openingExposure = !closingExisting;
 
         if (closingExisting) {
           amount = Math.min(heldAmount, requestedAmount && requestedAmount > 0 ? requestedAmount : heldAmount);
-        } else if (type === 'BUY' || openingShort) {
-          const realFreeCapital = Math.max(0, availableFunds);
-          const tradableCapital = isRealMode
-            ? realFreeCapital
-            : Math.max(0, balance);
+        } else if (openingExposure) {
+          const deployableCapital = getBufferedLiveCapital(Math.max(0, availableFunds));
           const minLiveNotional = Math.max(1, liveMinOrderNotional);
-          const desiredNotional = getDesiredLiveEntryNotional(confidenceScore, tradableCapital);
-          const currentHoldingNotional = existingHolding && existingHolding.side === (openingShort ? 'SHORT' : 'LONG')
+          if (latestHoldings.length >= maxConcurrentTrades) {
+            const slotMsg = `slot cap reached (${latestHoldings.length}/${maxConcurrentTrades})`;
+            addLog(`TRADE ABORTED: ${tradeSymbol} ${slotMsg}.`, 'warning');
+            setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${slotMsg}.` });
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${slotMsg}`, status: 'SKIPPED', cycleId: eventCycleId });
+            setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * softCooldownMinutes) }));
+            return;
+          }
+
+          if (deployableCapital < minLiveNotional) {
+            const lowMarginUntil = Date.now() + (lowMarginLockMinutes * 60 * 1000);
+            entryLockUntilRef.current = Math.max(entryLockUntilRef.current, lowMarginUntil);
+            setEntryLockUntil(prev => Math.max(prev, lowMarginUntil));
+            setEntryLockReason('free margin below live minimum order threshold');
+            const marginMsg = `free margin too low ($${deployableCapital.toFixed(2)} < $${minLiveNotional.toFixed(2)})`;
+            addLog(`TRADE ABORTED: ${tradeSymbol} ${marginMsg}.`, 'warning');
+            setExecutionFeedback({ type: 'warning', message: `${type} blocked for ${tradeSymbol}: ${marginMsg}.` });
+            pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time, reason: `SKIP: ${marginMsg}`, status: 'SKIPPED', cycleId: eventCycleId });
+            return;
+          }
+
+          const desiredNotional = getDesiredLiveEntryNotional(confidenceScore, deployableCapital);
+          const currentHoldingNotional = existingHolding && existingHolding.side === (type === 'SELL' ? 'SHORT' : 'LONG')
             ? getHoldingActiveNotional(existingHolding, price)
             : 0;
           const allocation = Math.max(0, desiredNotional - currentHoldingNotional);
@@ -2846,7 +2961,7 @@ export default function App() {
                 const hasPosition = hasPositionForSymbol(positions, tradeSymbol);
                 if (closingExisting) {
                   verified = !hasPosition;
-                } else if (type === 'BUY' || openingShort) {
+                } else if (openingExposure) {
                   verified = hasPosition;
                 }
                 if (verified) {
@@ -3000,7 +3115,7 @@ export default function App() {
             const hasPosition = hasPositionForSymbol(positions, tradeSymbol);
             if (closingExisting) {
               verified = !hasPosition;
-            } else if (type === 'BUY' || openingShort) {
+            } else if (openingExposure) {
               verified = hasPosition;
             }
           }
@@ -3036,7 +3151,7 @@ export default function App() {
         if (!isMarginOrFundsFailure && !isAuthFailure) {
           const pendingMsg = `Order submission for ${tradeSymbol} needs delayed confirmation (${msg}).`;
           addLog(`REAL ${type} UNCONFIRMED: ${pendingMsg}`, 'warning');
-          if (!closingExisting && (type === 'BUY' || openingShort)) {
+          if (openingExposure) {
             const optimisticAmount = amount > 0 ? amount : heldAmount || 0;
             if (optimisticAmount > 0) {
               applyOptimisticLiveFill(type, tradeSymbol, optimisticAmount, price, time);
@@ -3381,7 +3496,13 @@ export default function App() {
     
     const currentPositions = [...holdings];
     const liquidationStartedAt = Date.now();
-    queueLiquidationReview(currentPositions.map((holding) => holding.symbol), liquidationStartedAt);
+    queueLiquidationReview(currentPositions.map((holding) => ({
+      symbol: holding.symbol,
+      exitSide: holding.side,
+      exitPrice: holdingPrices[holding.symbol] || (holding.symbol === symbol ? currentPrice : holding.entryPrice),
+      exitReason: 'EMERGENCY_LIQUIDATION',
+      source: 'liquidation',
+    })), liquidationStartedAt);
     let attempted = 0;
     for (const h of currentPositions) {
       const price = holdingPrices[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice);
@@ -3424,7 +3545,13 @@ export default function App() {
 
     const currentPositions = [...holdings];
     const liquidationStartedAt = Date.now();
-    queueLiquidationReview(currentPositions.map((holding) => holding.symbol), liquidationStartedAt);
+    queueLiquidationReview(currentPositions.map((holding) => ({
+      symbol: holding.symbol,
+      exitSide: holding.side,
+      exitPrice: holdingPrices[holding.symbol] || (holding.symbol === symbol ? currentPrice : holding.entryPrice),
+      exitReason: reason,
+      source: 'liquidation',
+    })), liquidationStartedAt);
 
     for (const h of currentPositions) {
       const price = holdingPrices[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice);
@@ -3453,8 +3580,15 @@ export default function App() {
       `Confirm close for ${holding.symbol} (${holding.side}) at about $${formatPrice(markPrice)}?`
     );
     if (!confirmed) return;
+    queueLiquidationReview([{
+      symbol: holding.symbol,
+      exitSide: holding.side,
+      exitPrice: markPrice,
+      exitReason: 'MANUAL_DOCK_CONTROL',
+      source: 'manual',
+    }], Date.now());
     executeTrade(closeSide, holding.symbol, markPrice, 'MANUAL_DOCK_CONTROL', holding.id);
-  }, [executeTrade]);
+  }, [executeTrade, queueLiquidationReview]);
 
   useEffect(() => {
     checkServer();
@@ -4842,6 +4976,7 @@ export default function App() {
             acc[holding.side === 'SHORT' ? 'SELL' : 'BUY'] += 1;
             return acc;
           }, { BUY: 0, SELL: 0 });
+          const selectedSideCounts: Record<'BUY' | 'SELL', number> = { BUY: 0, SELL: 0 };
           const realFreeCapital = Math.max(0, availableFunds);
           const realTradableCapital = realFreeCapital;
           if (isRealMode && realFreeCapital < liveMinOrderNotional) {
@@ -4873,6 +5008,23 @@ export default function App() {
               });
               return;
             }
+            const directionalExposureBlock = getLiveDirectionalExposureBlock({
+              side: entry.side,
+              confidenceScore: getDirectionalEntryScore(entry.side, entry.pick.signal.score),
+              openHoldings: currentHoldings,
+              queuedSideCounts: selectedSideCounts,
+              maxSlots: currentMaxTrades,
+            });
+            if (directionalExposureBlock) {
+              deferredTrades.push({
+                symbol: entry.pick.symbol,
+                side: entry.side,
+                score: entry.pick.signal.score,
+                priorityRank: entry.pick.priorityRank || 0,
+                reason: directionalExposureBlock,
+              });
+              return;
+            }
             const capacityBlock = getLiveEntryCapacityBlock({
               desiredNotional,
               currentHoldingNotional,
@@ -4891,6 +5043,7 @@ export default function App() {
             }
 
             selectedTrades.push(entry);
+            selectedSideCounts[entry.side] += 1;
             queuedNotional += incrementalNotional;
           });
 
@@ -5848,6 +6001,9 @@ export default function App() {
     const normalizedLiveExchange = String(serverConfig?.exchange || '').toLowerCase();
     const isLiveBinance = isRealMode && normalizedLiveExchange === 'binance';
     const scanNow = Date.now();
+    const effectiveLiveSlotCap = isRealMode
+      ? Math.min(maxConcurrentTrades, PROFITABLE_LIVE_RUNTIME_GATES.maxConcurrentTrades)
+      : maxConcurrentTrades;
     const hasAllowedQuote = (value: string) => {
       const up = String(value || '').toUpperCase();
       return liveQuoteAllowlist.some((quote: string) => up.endsWith(quote));
@@ -5898,6 +6054,16 @@ export default function App() {
             const edgeAfterFrictionPct = getExpectedEdgeAfterFrictionPct(directionalSide, pick.lastPrice, pick.signal.tradePlan, estimatedRoundTripFrictionBps);
             if (isRealMode && edgeAfterFrictionPct !== null && edgeAfterFrictionPct < relaxedMinEdgeAfterFrictionPct) {
               reason = `edge ${edgeAfterFrictionPct.toFixed(2)}% below ${relaxedMinEdgeAfterFrictionPct.toFixed(2)}%`;
+            } else if (isRealMode) {
+              const directionalExposureBlock = getLiveDirectionalExposureBlock({
+                side: directionalSide,
+                confidenceScore: directionalConfidence,
+                openHoldings: holdings,
+                maxSlots: effectiveLiveSlotCap,
+              });
+              if (directionalExposureBlock) {
+                reason = directionalExposureBlock;
+              }
             } else if (isLiveBinance && isNonTradableQuoteBaseSymbol(pick.symbol)) {
               reason = 'quote asset treated as cash';
             } else if (isLiveBinance && isUnsupportedLiveScanSymbol(pick.symbol)) {
@@ -5921,7 +6087,7 @@ export default function App() {
       detail: `${pick.signal.overall} passed base checks`,
       className: 'bg-emerald-100 text-emerald-700',
     };
-  }, [serverConfig?.exchange, isRealMode, liveQuoteAllowlist, fullUniverseMode, holdings, cooldowns, isUnsupportedLiveScanSymbol, autoEntryMinScore, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock]);
+  }, [serverConfig?.exchange, isRealMode, maxConcurrentTrades, liveQuoteAllowlist, fullUniverseMode, holdings, cooldowns, isUnsupportedLiveScanSymbol, autoEntryMinScore, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getLiveDirectionalExposureBlock]);
 
   const rankedSignalStatuses = React.useMemo(() => {
     const now = Date.now();
@@ -6056,6 +6222,7 @@ export default function App() {
 
     const selectedEntries = new Set<string>();
     const deferredByKey = new Map<string, string>();
+    const selectedSideCounts: Record<'BUY' | 'SELL', number> = { BUY: 0, SELL: 0 };
     let queuedNotional = 0;
 
     entries.forEach((entry) => {
@@ -6070,6 +6237,17 @@ export default function App() {
         deferredByKey.set(selectionKey, 'all live slots filled this cycle');
         return;
       }
+      const directionalExposureBlock = getLiveDirectionalExposureBlock({
+        side: entry.side,
+        confidenceScore: directionalScore,
+        openHoldings: currentHoldings,
+        queuedSideCounts: selectedSideCounts,
+        maxSlots: currentMaxTrades,
+      });
+      if (directionalExposureBlock) {
+        deferredByKey.set(selectionKey, directionalExposureBlock);
+        return;
+      }
       const capacityBlock = getLiveEntryCapacityBlock({
         desiredNotional,
         currentHoldingNotional,
@@ -6082,6 +6260,7 @@ export default function App() {
       }
 
       selectedEntries.add(selectionKey);
+      selectedSideCounts[entry.side] += 1;
       queuedNotional += incrementalNotional;
     });
 
@@ -6139,6 +6318,7 @@ export default function App() {
     liveMinOrderNotional,
     getBufferedLiveCapital,
     getDesiredLiveEntryNotional,
+    getLiveDirectionalExposureBlock,
     getHoldingActiveNotional,
     getLiveEntryCapacityBlock,
   ]);
@@ -6189,6 +6369,30 @@ export default function App() {
       })
       .slice(0, 8);
   }, [liquidationReviewQueue]);
+
+  const getLiquidationReviewDrift = React.useCallback((entry: LiquidationReviewEntry) => {
+    if (!entry.pick || !entry.exitSide || !entry.exitPrice || entry.exitPrice <= 0) return null;
+    const currentReviewPrice = Number(entry.pick.lastPrice || 0);
+    if (!Number.isFinite(currentReviewPrice) || currentReviewPrice <= 0) return null;
+
+    const holdDeltaPct = entry.exitSide === 'SHORT'
+      ? ((entry.exitPrice - currentReviewPrice) / entry.exitPrice) * 100
+      : ((currentReviewPrice - entry.exitPrice) / entry.exitPrice) * 100;
+
+    if (!Number.isFinite(holdDeltaPct)) return null;
+
+    const holdingWouldBeBetter = holdDeltaPct > 0;
+    const magnitudePct = Math.abs(holdDeltaPct);
+    return {
+      currentReviewPrice,
+      holdingWouldBeBetter,
+      magnitudePct,
+      className: holdingWouldBeBetter ? 'text-rose-700' : 'text-emerald-700',
+      label: holdingWouldBeBetter
+        ? `holding would be better by ${magnitudePct.toFixed(2)}%`
+        : `removal was better by ${magnitudePct.toFixed(2)}%`,
+    };
+  }, []);
   
   const requestRankedSignalTrade = React.useCallback((pick: MarketScanResult, eligibility: { label: string; detail: string; className: string }) => {
     const tradeType: 'BUY' | 'SELL' = pick.signal.overall === 'SELL' ? 'SELL' : 'BUY';
@@ -6960,21 +7164,22 @@ export default function App() {
           <section className="bg-white border-2 border-[#141414] p-4 shadow-[8px_8px_0px_0px_#141414]">
             <div className="space-y-4">
               <div className="flex items-center justify-between">
-                <h3 className="font-mono text-[12px] uppercase tracking-[0.2em] opacity-75">Post-Liquidation Review</h3>
+                <h3 className="font-mono text-[12px] uppercase tracking-[0.2em] opacity-75">Post-Exit Review</h3>
                 <span className="text-[10px] font-mono uppercase opacity-50">{visibleLiquidationReviewEntries.length} tracked</span>
               </div>
               <p className="text-[9px] font-mono uppercase tracking-wide opacity-45 px-2">
-                Symbols closed by emergency liquidation stay here until cooldown expires and a later scan shows whether they still earn a ranked re-entry.
+                Closed symbols stay here until cooldown expires and a later scan shows whether the exit saved pain or left money on the table.
               </p>
               {visibleLiquidationReviewEntries.length === 0 ? (
                 <p className="px-2 text-[10px] font-mono normal-case opacity-60">
-                  No emergency-liquidated symbols are waiting for review.
+                  No removed symbols are waiting for review.
                 </p>
               ) : (
                 <div className="space-y-2 max-h-[280px] overflow-y-auto custom-scrollbar pr-2">
                   {visibleLiquidationReviewEntries.map((entry) => {
                     const reviewReady = entry.reviewEligibleAt <= Date.now();
                     const minutesRemaining = Math.max(1, Math.ceil((entry.reviewEligibleAt - Date.now()) / 60000));
+                    const reviewDrift = getLiquidationReviewDrift(entry);
                     const eligibility = entry.pick
                       ? getPickEligibility(entry.pick)
                       : { label: 'WAITING', detail: 'awaiting post-cooldown scan', className: 'bg-gray-100 text-gray-600' };
@@ -6998,8 +7203,13 @@ export default function App() {
                               {entry.symbol}
                             </button>
                             <div className="mt-1 text-[8px] font-mono uppercase opacity-45">
-                              liquidated {formatSignalAge(entry.liquidatedAt).replace('found ', '')}
+                              {entry.source === 'manual' ? 'manually closed' : entry.source === 'rebalance' ? 'rebalanced out' : 'liquidated'} {formatSignalAge(entry.liquidatedAt).replace('found ', '')}
                             </div>
+                            {(entry.exitSide || entry.exitPrice || entry.exitReason) && (
+                              <div className="mt-1 text-[8px] font-mono uppercase opacity-55">
+                                {entry.exitSide || 'EXIT'} {entry.exitPrice ? `@ ${formatPrice(entry.exitPrice)}` : ''} {entry.exitReason ? `| ${entry.exitReason.replace(/_/g, ' ')}` : ''}
+                              </div>
+                            )}
                           </div>
                           <span className={`rounded-sm px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wide ${reviewReady ? 'bg-sky-100 text-sky-800' : 'bg-amber-100 text-amber-800'}`}>
                             {reviewReady ? 'Review Open' : `Cooldown ${minutesRemaining}m`}
@@ -7024,6 +7234,11 @@ export default function App() {
                               <div className="mt-1 text-[8px] font-mono uppercase opacity-45">
                                 {entry.matchedFoundAt ? formatSignalAge(entry.matchedFoundAt) : 'ready for review'}
                               </div>
+                              {reviewDrift && (
+                                <div className={`mt-1 text-[8px] font-mono uppercase ${reviewDrift.className}`}>
+                                  {reviewDrift.label} | now {formatPrice(reviewDrift.currentReviewPrice)}
+                                </div>
+                              )}
                               <div className="mt-1 text-[8px] font-mono normal-case text-slate-600">
                                 {eligibility.detail}
                               </div>

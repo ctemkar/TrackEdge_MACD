@@ -2099,7 +2099,10 @@ async function startServer() {
               : await fetchBinancePositionsFromAccountViaHttp(binanceKey, binanceSecret);
             const rows = [...primary.positions, ...(secondary.positions || [])];
             const matchingRows = rows.filter((row: any) => {
-              const rowSymbol = String(row?.symbol || row?.info?.symbol || '').toUpperCase().replace('/', '').replace(':', '');
+              const rowSymbol = String(row?.symbol || row?.info?.symbol || '')
+                .toUpperCase()
+                .split(':')[0]
+                .replace('/', '');
               return rowSymbol === raw;
             });
 
