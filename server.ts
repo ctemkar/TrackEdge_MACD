@@ -1135,6 +1135,20 @@ async function startServer() {
       let papiAccountEquity: number | null = null;
       let papiAvailableBalance: number | null = null;
       let papiBalanceUnrealizedPnl: number | null = null;
+      let rawPmAccountSummary: any | null = null;
+      const hasRawPmSummaryFields = (value: any) => {
+        if (!value || typeof value !== 'object') return false;
+        const candidates = [
+          value.actualEquity,
+          value.accountEquity,
+          value.totalAvailableBalance,
+          value.virtualMaxWithdrawAmount,
+          value.accountInitialMargin,
+          value.accountMaintMargin,
+          value.uniMMR,
+        ];
+        return candidates.some((candidate) => Number.isFinite(Number(candidate)));
+      };
       if (client.id === 'gemini') {
         try {
           // Fetch all possible sub-accounts for Gemini
@@ -1232,6 +1246,9 @@ async function startServer() {
           if (preferredBinance.key && preferredBinance.secret) {
             const pmAccount = await fetchBinancePortfolioMarginAccountViaHttp(preferredBinance.key, preferredBinance.secret);
             if (pmAccount.accountData) {
+              if (hasRawPmSummaryFields(pmAccount.accountData)) {
+                rawPmAccountSummary = pmAccount.accountData;
+              }
               const accountEquity = Number(
                 pmAccount.accountData.actualEquity ??
                 pmAccount.accountData.accountEquity ??
@@ -1267,6 +1284,9 @@ async function startServer() {
 
           const papiAccount = await (client as any).papiGetAccount?.();
           if (papiAccount) {
+            if (hasRawPmSummaryFields(papiAccount)) {
+              rawPmAccountSummary = papiAccount;
+            }
             const actual = Number(
               papiAccount.actualEquity ||
               papiAccount.accountEquity ||
@@ -1774,6 +1794,18 @@ async function startServer() {
         balance: { USDT: cashTotal }, 
         equity: portfolioMarginEquity,
         availableBalance: uiAvailableBalance,
+        pmSummary: client.id === 'binance' ? {
+          source: rawPmAccountSummary ? 'papi/v1/account' : null,
+          actualEquity: Number.isFinite(Number(rawPmAccountSummary?.actualEquity)) ? Number(rawPmAccountSummary.actualEquity) : null,
+          accountEquity: Number.isFinite(Number(rawPmAccountSummary?.accountEquity)) ? Number(rawPmAccountSummary.accountEquity) : null,
+          totalAvailableBalance: Number.isFinite(Number(rawPmAccountSummary?.totalAvailableBalance)) ? Number(rawPmAccountSummary.totalAvailableBalance) : null,
+          virtualMaxWithdrawAmount: Number.isFinite(Number(rawPmAccountSummary?.virtualMaxWithdrawAmount)) ? Number(rawPmAccountSummary.virtualMaxWithdrawAmount) : null,
+          accountInitialMargin: Number.isFinite(Number(rawPmAccountSummary?.accountInitialMargin)) ? Number(rawPmAccountSummary.accountInitialMargin) : null,
+          accountMaintMargin: Number.isFinite(Number(rawPmAccountSummary?.accountMaintMargin)) ? Number(rawPmAccountSummary.accountMaintMargin) : null,
+          totalMarginOpenLoss: Number.isFinite(Number(rawPmAccountSummary?.totalMarginOpenLoss)) ? Number(rawPmAccountSummary.totalMarginOpenLoss) : null,
+          uniMMR: Number.isFinite(Number(rawPmAccountSummary?.uniMMR)) ? Number(rawPmAccountSummary.uniMMR) : null,
+          updateTime: Number.isFinite(Number(rawPmAccountSummary?.updateTime)) ? Number(rawPmAccountSummary.updateTime) : 0,
+        } : undefined,
         authDegraded,
         authDegradedMessage,
         binanceRouteHealth,

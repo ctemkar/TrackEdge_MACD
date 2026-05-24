@@ -858,6 +858,29 @@ export default function App() {
     filteredSymbols: Record<string, string>;
   }
 
+  interface ExchangeAccountSnapshot {
+    updatedAt: number;
+    positionCount: number;
+    grossNotional: number;
+    initialMargin: number;
+    equity: number;
+    availableBalance: number;
+    unrealizedPnl: number;
+  }
+
+  interface ExchangePmSummary {
+    source: string | null;
+    actualEquity: number | null;
+    accountEquity: number | null;
+    totalAvailableBalance: number | null;
+    virtualMaxWithdrawAmount: number | null;
+    accountInitialMargin: number | null;
+    accountMaintMargin: number | null;
+    totalMarginOpenLoss: number | null;
+    uniMMR: number | null;
+    updateTime: number;
+  }
+
   interface ExecuteTradeOptions {
     allowManualOverride?: boolean;
     bypassDuplicateOrderLockout?: boolean;
@@ -1112,6 +1135,27 @@ export default function App() {
   });
   const [holdingPrices, setHoldingPrices] = useState<Record<string, number>>({});
   const [liveUnrealizedPnl, setLiveUnrealizedPnl] = useState(0);
+  const [exchangeAccountSnapshot, setExchangeAccountSnapshot] = useState<ExchangeAccountSnapshot>({
+    updatedAt: 0,
+    positionCount: 0,
+    grossNotional: 0,
+    initialMargin: 0,
+    equity: 0,
+    availableBalance: 0,
+    unrealizedPnl: 0,
+  });
+  const [exchangePmSummary, setExchangePmSummary] = useState<ExchangePmSummary>({
+    source: null,
+    actualEquity: null,
+    accountEquity: null,
+    totalAvailableBalance: null,
+    virtualMaxWithdrawAmount: null,
+    accountInitialMargin: null,
+    accountMaintMargin: null,
+    totalMarginOpenLoss: null,
+    uniMMR: null,
+    updateTime: 0,
+  });
   const [cooldowns, setCooldowns] = useState<Record<string, number>>({});
   const [isSyncing, setIsSyncing] = useState(false);
   const [serverStatus, setServerStatus] = useState<'IDLE' | 'OK' | 'ERROR'>('IDLE');
@@ -2292,6 +2336,18 @@ export default function App() {
         const syncedPositionCount = data?.positions && typeof data.positions === 'object'
           ? Object.keys(data.positions).length
           : 0;
+        const nextPmSummary: ExchangePmSummary = {
+          source: typeof data?.pmSummary?.source === 'string' ? data.pmSummary.source : null,
+          actualEquity: Number.isFinite(Number(data?.pmSummary?.actualEquity)) ? Number(data.pmSummary.actualEquity) : null,
+          accountEquity: Number.isFinite(Number(data?.pmSummary?.accountEquity)) ? Number(data.pmSummary.accountEquity) : null,
+          totalAvailableBalance: Number.isFinite(Number(data?.pmSummary?.totalAvailableBalance)) ? Number(data.pmSummary.totalAvailableBalance) : null,
+          virtualMaxWithdrawAmount: Number.isFinite(Number(data?.pmSummary?.virtualMaxWithdrawAmount)) ? Number(data.pmSummary.virtualMaxWithdrawAmount) : null,
+          accountInitialMargin: Number.isFinite(Number(data?.pmSummary?.accountInitialMargin)) ? Number(data.pmSummary.accountInitialMargin) : null,
+          accountMaintMargin: Number.isFinite(Number(data?.pmSummary?.accountMaintMargin)) ? Number(data.pmSummary.accountMaintMargin) : null,
+          totalMarginOpenLoss: Number.isFinite(Number(data?.pmSummary?.totalMarginOpenLoss)) ? Number(data.pmSummary.totalMarginOpenLoss) : null,
+          uniMMR: Number.isFinite(Number(data?.pmSummary?.uniMMR)) ? Number(data.pmSummary.uniMMR) : null,
+          updateTime: Number.isFinite(Number(data?.pmSummary?.updateTime)) ? Number(data.pmSummary.updateTime) : 0,
+        };
         const nextFilteredSyncSymbols = Array.isArray(data?.filteredSymbols)
           ? data.filteredSymbols
               .map((entry: any) => ({
@@ -2303,6 +2359,7 @@ export default function App() {
         setBalance(syncedBalance);
         setAvailableFunds(syncedAvailable);
         setLiveUnrealizedPnl(Number.isFinite(syncedUnrealized) ? syncedUnrealized : 0);
+        setExchangePmSummary(nextPmSummary);
         if (!isRealMode && autoTradeRef.current && (Boolean(liveControllerTabId) || syncedPositionCount > 0 || syncedBalance > 0)) {
           setIsRealMode(true);
         }
@@ -2426,6 +2483,20 @@ export default function App() {
         }
 
         const syncUpdatedAt = Date.now();
+        const syncedGrossNotional = freshHoldings.reduce((sum, holding) => sum + getHoldingActiveNotional(holding), 0);
+        const syncedInitialMargin = freshHoldings.reduce((sum, holding) => {
+          const value = Number(holding.initialMargin || 0);
+          return sum + (Number.isFinite(value) && value > 0 ? value : 0);
+        }, 0);
+        setExchangeAccountSnapshot({
+          updatedAt: syncUpdatedAt,
+          positionCount: freshHoldings.length,
+          grossNotional: syncedGrossNotional,
+          initialMargin: syncedInitialMargin,
+          equity: syncedBalance,
+          availableBalance: syncedAvailable,
+          unrealizedPnl: Number.isFinite(syncedUnrealized) ? syncedUnrealized : 0,
+        });
         const openPositions = Object.fromEntries(
           freshHoldings.map((holding) => [
             normalizeLiveFuturesSymbol(holding.symbol),
@@ -5613,9 +5684,8 @@ export default function App() {
   const computedUnrealizedPnl = holdings.reduce((sum, h) => {
     return sum + resolveHoldingPnl(h).pnl;
   }, 0);
-  const hasOpenPositions = holdings.length > 0;
   const displayedUnrealizedRisk = useExchangeAccountMetrics
-    ? (hasOpenPositions ? computedUnrealizedPnl : liveUnrealizedPnl)
+    ? liveUnrealizedPnl
     : computedUnrealizedPnl;
   const scanDisplayTotal = scanProgress.total > 0 ? scanProgress.total : availableSymbols.length;
   const scanProgressPct = scanProgress.total > 0
@@ -5796,19 +5866,53 @@ export default function App() {
       .sort((a, b) => b.time - a.time)
       .slice(0, 30);
   }, [liveAccountAudit]);
-  const remainingLiveSlots = Math.max(0, maxConcurrentTrades - holdings.length);
+  const exchangeSnapshotPositionCount = useExchangeAccountMetrics && exchangeAccountSnapshot.updatedAt > 0
+    ? exchangeAccountSnapshot.positionCount
+    : holdings.length;
+  const exchangeSnapshotGrossNotional = useExchangeAccountMetrics && exchangeAccountSnapshot.updatedAt > 0
+    ? exchangeAccountSnapshot.grossNotional
+    : holdings.reduce((sum, holding) => sum + getHoldingActiveNotional(holding), 0);
+  const exchangeSnapshotInitialMargin = useExchangeAccountMetrics && exchangeAccountSnapshot.updatedAt > 0
+    ? exchangeAccountSnapshot.initialMargin
+    : holdings.reduce((sum, holding) => {
+        const value = Number(holding.initialMargin || 0);
+        return sum + (Number.isFinite(value) && value > 0 ? value : 0);
+      }, 0);
+  const displayedLivePortfolioValue = useExchangeAccountMetrics && exchangePmSummary.actualEquity !== null
+    ? exchangePmSummary.actualEquity
+    : equity;
+  const displayedLiveAvailableMargin = useExchangeAccountMetrics && exchangePmSummary.totalAvailableBalance !== null
+    ? exchangePmSummary.totalAvailableBalance
+    : exchangeFreeMargin;
+  const displayedLiveWithdrawableMargin = useExchangeAccountMetrics && exchangePmSummary.virtualMaxWithdrawAmount !== null
+    ? exchangePmSummary.virtualMaxWithdrawAmount
+    : exchangeFreeMargin;
+  const displayedLiveInitialMargin = useExchangeAccountMetrics && exchangePmSummary.accountInitialMargin !== null
+    ? exchangePmSummary.accountInitialMargin
+    : exchangeSnapshotInitialMargin;
+  const displayedLiveMaintMargin = useExchangeAccountMetrics && exchangePmSummary.accountMaintMargin !== null
+    ? exchangePmSummary.accountMaintMargin
+    : null;
+  const displayedLiveUniMmr = useExchangeAccountMetrics && exchangePmSummary.uniMMR !== null
+    ? exchangePmSummary.uniMMR
+    : null;
+  const remainingLiveSlots = Math.max(0, maxConcurrentTrades - exchangeSnapshotPositionCount);
   const liveBufferedFreeMargin = getBufferedLiveCapital(exchangeFreeMargin);
   const deployableLiveMargin = useExchangeAccountMetrics
     ? Math.max(0, Math.min(liveBufferedFreeMargin, remainingLiveSlots * Math.max(1, maxLiveOrderNotional)))
     : balance;
   const displayedAvailableFunds = exchangeFreeMargin;
-  const grossInvestedCapital = holdings.reduce((total, holding) => total + getHoldingCommittedCapital(holding), 0);
-  const usedCapital = Math.max(0, equity - exchangeFreeMargin);
-  const investedPct = equity > 0
-    ? Math.max(0, (grossInvestedCapital / equity) * 100)
+  const grossInvestedCapital = useExchangeAccountMetrics
+    ? exchangeSnapshotGrossNotional
+    : holdings.reduce((total, holding) => total + getHoldingCommittedCapital(holding), 0);
+  const usedCapital = useExchangeAccountMetrics
+    ? displayedLiveInitialMargin
+    : Math.max(0, equity - exchangeFreeMargin);
+  const investedPct = (useExchangeAccountMetrics ? displayedLivePortfolioValue : equity) > 0
+    ? Math.max(0, (grossInvestedCapital / (useExchangeAccountMetrics ? displayedLivePortfolioValue : equity)) * 100)
     : 0;
-  const usedMarginPct = equity > 0
-    ? Math.min(100, Math.max(0, (usedCapital / equity) * 100))
+  const usedMarginPct = (useExchangeAccountMetrics ? displayedLivePortfolioValue : equity) > 0
+    ? Math.min(100, Math.max(0, (usedCapital / (useExchangeAccountMetrics ? displayedLivePortfolioValue : equity)) * 100))
     : 0;
   const entryLockActive = entryLockUntil > Date.now();
   const entryLockRemainingSec = entryLockActive ? Math.max(1, Math.ceil((entryLockUntil - Date.now()) / 1000)) : 0;
@@ -8368,7 +8472,7 @@ export default function App() {
             <MetricBox 
               icon={<Wallet className={useExchangeAccountMetrics ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Portfolio Value"
-              value={`$${equity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+              value={`$${(useExchangeAccountMetrics ? displayedLivePortfolioValue : equity).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
               trend={pnl >= 0 ? 'up' : 'down'}
               action={
                 <button 
@@ -8380,7 +8484,7 @@ export default function App() {
               }
               subValue={
                 useExchangeAccountMetrics
-                  ? `Exchange Free $${exchangeFreeMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | Safe To Deploy $${deployableLiveMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                  ? `Binance actualEquity $${displayedLivePortfolioValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | Safe To Deploy $${deployableLiveMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
                   : `Available $${displayedAvailableFunds.toLocaleString(undefined, { minimumFractionDigits: 2 })}`
               }
             />
@@ -8406,21 +8510,25 @@ export default function App() {
               value={isSyncing ? "SYNCING..." : (useExchangeAccountMetrics ? (isRealMode ? "LIVE" : "SYNCED") : "PAPER")}
               subValue={serverConfig?.exchange
                 ? `${serverConfig.exchange.toUpperCase()} | ${holdings.length}/${maxConcurrentTrades} slots${entryLockActive ? ' | lock' : ''} | ${scanDataSource}`
-                : "SIMULATION"}
+                : useExchangeAccountMetrics
+                  ? `BINANCE | ${holdings.length}/${maxConcurrentTrades} slots${entryLockActive ? ' | lock' : ''} | ${scanDataSource}`
+                  : "SIMULATION"}
             />
             <MetricBox 
               icon={<DollarSign className={useExchangeAccountMetrics ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label={useExchangeAccountMetrics ? "Available Margin" : "Available Margin"}
-              value={`$${(useExchangeAccountMetrics ? displayedAvailableFunds : displayedAvailableFunds).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+              value={`$${(useExchangeAccountMetrics ? displayedLiveAvailableMargin : displayedAvailableFunds).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
               subValue={useExchangeAccountMetrics
-                ? `Exchange Free $${exchangeFreeMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | ${remainingLiveSlots} slots @ $${maxLiveOrderNotional.toFixed(0)}`
+                ? `Binance totalAvailableBalance $${displayedLiveAvailableMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | Withdrawable $${displayedLiveWithdrawableMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
                 : "Simulated Capital"}
             />
             <MetricBox 
               icon={<Activity className={useExchangeAccountMetrics ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
               label="Budget Efficiency"
               value={`${investedPct.toFixed(1)}%`}
-              subValue={`Entry capital $${grossInvestedCapital.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | Margin used ${usedMarginPct.toFixed(1)}%`}
+              subValue={useExchangeAccountMetrics
+                ? `Binance accountInitialMargin $${displayedLiveInitialMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${displayedLiveMaintMargin !== null ? ` | Maint $${displayedLiveMaintMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : ''}${displayedLiveUniMmr !== null ? ` | UniMMR ${displayedLiveUniMmr.toFixed(2)}` : ''}`
+                : `Entry capital $${grossInvestedCapital.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | Margin used ${usedMarginPct.toFixed(1)}%`}
             />
           </div>
 
