@@ -186,7 +186,7 @@ const PARAMETER_DEFAULTS = {
 const PROFITABLE_LIVE_RUNTIME_GATES = {
   autoEntryMinScore: 7.2,
   minEdgeAfterFrictionPct: 0.35,
-  maxConcurrentTrades: 10,
+  maxConcurrentTrades: 8,
   liveEntriesPerCycle: 2,
 } as const;
 
@@ -1503,7 +1503,7 @@ export default function App() {
     const alignedBearShort = regimeState === 'BEAR' && side === 'SELL';
     const normalizedRegimeConfidence = Math.max(0, Math.min(1, Number(regimeConfidence) || 0));
     const regimeCapBoost = alignedRegime
-      ? Math.max(1, Math.round((alignedBearShort ? 2 : 1) + (normalizedRegimeConfidence * (alignedBearShort ? 2 : 1))))
+      ? Math.max(1, Math.round((alignedBearShort ? 1.5 : 1) + normalizedRegimeConfidence))
       : 0;
 
     return {
@@ -1577,7 +1577,7 @@ export default function App() {
       ? Math.max(0, Math.min(1, (confidenceScore - confidenceFloor) / Math.max(0.5, 10 - confidenceFloor)))
       : 0;
     const normalizedPriority = Number.isFinite(priorityRank)
-      ? Math.max(0, Math.min(1, Number(priorityRank) / 35))
+      ? Math.max(0, Math.min(1, Number(priorityRank) / 45))
       : 0;
     const proportionalCapitalShare = strongSignalSizing
       ? (0.2 + (normalizedConfidence * 0.2))
@@ -1601,7 +1601,7 @@ export default function App() {
     }
 
     if (normalizedPriority > 0 && sizingTargetNotional > minLiveNotional) {
-      const priorityLift = 0.3 * normalizedPriority;
+      const priorityLift = 0.18 * normalizedPriority;
       allocation = allocation + ((sizingTargetNotional - allocation) * priorityLift);
     }
 
@@ -3688,7 +3688,7 @@ export default function App() {
     queueLiquidationReview(currentPositions.map((holding) => ({
       symbol: holding.symbol,
       exitSide: holding.side,
-      exitPrice: holdingPrices[holding.symbol] || (holding.symbol === symbol ? currentPrice : holding.entryPrice),
+      exitPrice: holdingPrices[holding.symbol] || (holding.symbol === symbol ? currentPrice : holding.entryPrice) || undefined,
       exitReason: 'EMERGENCY_LIQUIDATION',
       source: 'liquidation',
     })), liquidationStartedAt);
@@ -3737,7 +3737,7 @@ export default function App() {
     queueLiquidationReview(currentPositions.map((holding) => ({
       symbol: holding.symbol,
       exitSide: holding.side,
-      exitPrice: holdingPrices[holding.symbol] || (holding.symbol === symbol ? currentPrice : holding.entryPrice),
+      exitPrice: holdingPrices[holding.symbol] || (holding.symbol === symbol ? currentPrice : holding.entryPrice) || undefined,
       exitReason: reason,
       source: 'liquidation',
     })), liquidationStartedAt);
@@ -5204,8 +5204,8 @@ export default function App() {
           const desiredNotional = getDesiredLiveEntryNotional(directionalConfidence, getBufferedLiveCapital(availableFunds), pick.priorityRank);
           if (side === 'SELL' && isShortFacingLocalUpwardMomentum(pick)) {
             const alignedBearRegime = markovRegimeSummary.state === 'BEAR';
-            const strongerShortThreshold = Math.min(10, relaxedAutoEntryMinScore + (alignedBearRegime ? 0.15 : 0.4));
-            const shortMacdFloor = alignedBearRegime ? 6.2 : 7;
+            const strongerShortThreshold = Math.min(10, relaxedAutoEntryMinScore + (alignedBearRegime ? 0.2 : 0.4));
+            const shortMacdFloor = alignedBearRegime ? 6.6 : 7;
             if (directionalConfidence < strongerShortThreshold || pick.signal.macdScore < shortMacdFloor) {
               return `short faces local upward momentum; need score ${strongerShortThreshold.toFixed(1)}+ and MACD ${shortMacdFloor.toFixed(1)}+`;
             }
@@ -5433,7 +5433,8 @@ export default function App() {
             .join(' | ');
           const deferredReasonSummary = Object.entries(
             deferredTrades.reduce<Record<string, number>>((acc, entry) => {
-              acc[entry.reason] = (acc[entry.reason] || 0) + 1;
+              const reason = entry.reason || 'unknown defer reason';
+              acc[reason] = (acc[reason] || 0) + 1;
               return acc;
             }, {})
           )
