@@ -226,6 +226,13 @@ const normalizeLiveFuturesSymbol = (raw: string) => {
   return normalized.endsWith('USD') && !normalized.endsWith('USDT') ? `${normalized}T` : normalized;
 };
 
+const matchesLiveSymbolIdentity = (left: string, right: string) => {
+  const leftRiskKey = getSymbolRiskIdentity(left).key;
+  const rightRiskKey = getSymbolRiskIdentity(right).key;
+  if (leftRiskKey && rightRiskKey) return leftRiskKey === rightRiskKey;
+  return normalizeLiveFuturesSymbol(left) === normalizeLiveFuturesSymbol(right);
+};
+
 const countNormalizedLiveSymbols = (symbols: Array<{ value: string }>) => {
   return new Set(symbols.map((symbol) => normalizeLiveFuturesSymbol(symbol.value))).size;
 };
@@ -1547,12 +1554,12 @@ export default function App() {
       acc[holding.side === 'SHORT' ? 'SELL' : 'BUY'] += 1;
       return acc;
     }, { BUY: 0, SELL: 0 });
+    if (side === 'SELL') {
+      return null;
+    }
     const queued = queuedSideCounts || { BUY: 0, SELL: 0 };
-    const alignedBearShort = regimeState === 'BEAR' && side === 'SELL';
     const currentBookSize = openSideCounts.BUY + openSideCounts.SELL + queued.BUY + queued.SELL;
-    const exposureAwareMaxSlots = alignedBearShort
-      ? Math.max(maxSlots || maxConcurrentTradesRef.current || 1, currentBookSize + 1)
-      : maxSlots;
+    const exposureAwareMaxSlots = maxSlots;
     const { totalSlots, sideCap, imbalanceCap, alignedRegime } = getRegimeAdjustedDirectionalCaps({
       side,
       maxSlots: exposureAwareMaxSlots,
@@ -1565,18 +1572,9 @@ export default function App() {
     const strongDirectionalSignal = Number.isFinite(confidenceScore) && confidenceScore !== undefined
       && isStrongLiveSignal(confidenceScore, effectiveLiveAutoEntryMinScore);
     const strongPrioritySignal = Number.isFinite(priorityRank) && Number(priorityRank) >= 22;
-    const premiumBearShortBypass = alignedBearShort && strongDirectionalSignal && strongPrioritySignal;
-    const strongSignalDirectionalAllowance = alignedBearShort
-      ? Math.min(4, STRONG_LIVE_SIGNAL_EXTRA_SLOTS)
-      : Math.min(2, STRONG_LIVE_SIGNAL_EXTRA_SLOTS);
-    const premiumSellImbalanceAllowance = alignedBearShort && strongPrioritySignal
-      ? Math.min(5, STRONG_LIVE_SIGNAL_EXTRA_SLOTS + 2)
-      : strongSignalDirectionalAllowance;
+    const strongSignalDirectionalAllowance = Math.min(2, STRONG_LIVE_SIGNAL_EXTRA_SLOTS);
 
     if (projectedSideCount > sideCap) {
-      if (premiumBearShortBypass && projectedSideCount <= totalSlots) {
-        return null;
-      }
       if (strongDirectionalSignal && projectedSideCount <= (sideCap + strongSignalDirectionalAllowance)) {
         return null;
       }
@@ -1584,10 +1582,7 @@ export default function App() {
     }
 
     if ((projectedSideCount - projectedOppositeCount) > imbalanceCap) {
-      if (premiumBearShortBypass && projectedSideCount <= totalSlots) {
-        return null;
-      }
-      if (strongDirectionalSignal && strongPrioritySignal && (projectedSideCount - projectedOppositeCount) <= (imbalanceCap + premiumSellImbalanceAllowance)) {
+      if (strongDirectionalSignal && strongPrioritySignal && (projectedSideCount - projectedOppositeCount) <= (imbalanceCap + strongSignalDirectionalAllowance)) {
         return null;
       }
       return `directional imbalance cap (${side} lead ${projectedSideCount - projectedOppositeCount} > ${imbalanceCap}${alignedRegime ? ', regime-adjusted' : ''})`;
@@ -2725,7 +2720,7 @@ export default function App() {
 
     const isHeld = targetId 
       ? holdings.some(h => h.id === targetId)
-      : holdings.some(h => h.symbol === tradeSymbol);
+      : holdings.some(h => matchesLiveSymbolIdentity(h.symbol, tradeSymbol));
     const isShortEntry = type === 'SELL' && !targetId && !isHeld;
     const requiresLiveFuturesValidation = isRealMode;
     if (type === 'SELL' && !isHeld && !isShortEntry) {
@@ -2802,7 +2797,7 @@ export default function App() {
 
     if (isRealMode) {
       const latestHoldings = holdingsRef.current;
-      let existingHolding = latestHoldings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
+      let existingHolding = latestHoldings.find(h => targetId ? h.id === targetId : matchesLiveSymbolIdentity(h.symbol, tradeSymbol));
       let heldAmount = existingHolding?.amount || 0;
       let heldSide = existingHolding?.side;
       let openingShort = type === 'SELL' && (!existingHolding || heldAmount <= 0);
@@ -2971,10 +2966,10 @@ export default function App() {
                 }];
               });
             }
-            return current.filter(h => h.symbol !== normalizedSymbol);
+            return current.filter(h => !matchesLiveSymbolIdentity(h.symbol, normalizedSymbol));
           }
 
-          const existingIdx = current.findIndex(h => h.symbol === normalizedSymbol && h.side === openSide);
+          const existingIdx = current.findIndex(h => matchesLiveSymbolIdentity(h.symbol, normalizedSymbol) && h.side === openSide);
           if (existingIdx >= 0) {
             const existing = current[existingIdx];
             const nextAmount = Math.max(0, Number(existing.amount || 0) + Number(fillAmount || 0));
@@ -3442,7 +3437,7 @@ export default function App() {
         return;
       }
     } else {
-      const existingHolding = holdings.find(h => targetId ? h.id === targetId : h.symbol === tradeSymbol);
+      const existingHolding = holdings.find(h => targetId ? h.id === targetId : matchesLiveSymbolIdentity(h.symbol, tradeSymbol));
       const heldSide = existingHolding?.side;
       const closingExisting = Boolean(existingHolding) && (
         (heldSide === 'LONG' && type === 'SELL') ||
@@ -3501,7 +3496,7 @@ export default function App() {
         // If targetId is provided, close ONLY that one. Otherwise close ALL for this symbol.
         const holdingsToClose = targetId 
           ? holdings.filter(h => h.id === targetId)
-          : holdings.filter(h => h.symbol === tradeSymbol);
+          : holdings.filter(h => matchesLiveSymbolIdentity(h.symbol, tradeSymbol));
 
         if (holdingsToClose.length > 0) {
           const partialRequested = Boolean(targetId && requestedAmount && requestedAmount > 0 && holdingsToClose.length === 1);
@@ -5292,7 +5287,7 @@ export default function App() {
           if (matchingHolding) {
             const currentNotional = getHoldingActiveNotional(matchingHolding, pick.lastPrice);
             if ((desiredNotional - currentNotional) < liveMinOrderNotional) {
-              const sameSymbol = matchingHolding.symbol === pick.symbol;
+              const sameSymbol = matchesLiveSymbolIdentity(matchingHolding.symbol, pick.symbol);
               return sameSymbol ? 'already sized' : `already sized via ${matchingHolding.symbol}`;
             }
           }
@@ -6587,7 +6582,7 @@ export default function App() {
       reason = `outside focused quotes`;
     } else if (isLiveBinance && !isLiveTradableFuturesSymbol(pick.symbol)) {
       reason = 'not in Binance futures set';
-    } else if (holdings.some((holding) => holding.symbol === pick.symbol)) {
+    } else if (holdings.some((holding) => matchesLiveSymbolIdentity(holding.symbol, pick.symbol))) {
       reason = 'already held';
     } else {
       if (COOLDOWNS_ENABLED) {
@@ -7007,7 +7002,7 @@ export default function App() {
   }, [executeTrade, holdings]);
 
   const requestRankedSignalBuy = React.useCallback((pick: MarketScanResult, eligibility: { label: string; detail: string; className: string }) => {
-    const currentHolding = holdings.find((holding) => holding.symbol === pick.symbol);
+    const currentHolding = holdings.find((holding) => matchesLiveSymbolIdentity(holding.symbol, pick.symbol));
     const confidenceScore = getDirectionalEntryScore('BUY', pick.signal.score);
     const strategyReason = `MANUAL_TOP_RANKED_BUY_${pick.signal.overall}_${pick.signal.score}`;
     const buyBlockedReason = pick.signal.overall !== 'BUY'
