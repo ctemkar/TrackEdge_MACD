@@ -926,7 +926,17 @@ async function startServer() {
       console.warn('Network layer failed to resolve outbound IP');
     }
 
-    const currentExchange = exchangeInstance ? exchangeInstance.id : 'none';
+    const hasBinanceKeys = Boolean(
+      (process.env.BINANCE_LIVE_API_KEY && process.env.BINANCE_LIVE_API_SECRET) ||
+      (process.env.BINANCE_API_KEY && process.env.BINANCE_API_SECRET) ||
+      (process.env.BINANCE_KEY && process.env.BINANCE_SECRET)
+    );
+    const hasGeminiKeys = Boolean(
+      (process.env.GEMINI_LIVE_API_KEY && process.env.GEMINI_LIVE_API_SECRET) ||
+      (process.env.GEMINI_API_KEY && process.env.GEMINI_API_SECRET) ||
+      (process.env.GEMINI_KEY && process.env.GEMINI_SECRET)
+    );
+    const currentExchange = exchangeInstance?.id || (hasBinanceKeys ? 'binance' : hasGeminiKeys ? 'gemini' : 'none');
 
     res.json({ 
       status: 'ok', 
@@ -940,14 +950,7 @@ async function startServer() {
       privateBlockedUntil: privateBlockedUntil > now ? privateBlockedUntil : 0,
       config: {
         realTradingEnabled: process.env.ENABLE_REAL_TRADING === 'true',
-        hasKeys: !!(
-          (process.env.BINANCE_LIVE_API_KEY && process.env.BINANCE_LIVE_API_SECRET) ||
-          (process.env.BINANCE_API_KEY && process.env.BINANCE_API_SECRET) ||
-          (process.env.BINANCE_KEY && process.env.BINANCE_SECRET) ||
-          (process.env.GEMINI_LIVE_API_KEY && process.env.GEMINI_LIVE_API_SECRET) ||
-          (process.env.GEMINI_API_KEY && process.env.GEMINI_API_SECRET) ||
-          (process.env.GEMINI_KEY && process.env.GEMINI_SECRET)
-        )
+        hasKeys: !!(hasBinanceKeys || hasGeminiKeys)
       }
     });
   });

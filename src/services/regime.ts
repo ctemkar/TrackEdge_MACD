@@ -129,10 +129,11 @@ export const getRegimeTradeAdjustments = (summary: MarkovRegimeSummary, side: 'B
   }
 
   const aligned = (summary.state === 'BULL' && side === 'BUY') || (summary.state === 'BEAR' && side === 'SELL');
+  const alignedBearShort = summary.state === 'BEAR' && side === 'SELL';
   return aligned
     ? {
-        minScoreDelta: Number((-(0.15 + (0.15 * summary.confidence))).toFixed(2)),
-        minEdgeDelta: Number((-(0.03 + (0.02 * summary.confidence))).toFixed(2)),
+        minScoreDelta: Number((-(alignedBearShort ? (0.3 + (0.2 * summary.confidence)) : (0.15 + (0.15 * summary.confidence)))).toFixed(2)),
+        minEdgeDelta: Number((-(alignedBearShort ? (0.05 + (0.03 * summary.confidence)) : (0.03 + (0.02 * summary.confidence)))).toFixed(2)),
         label: `Markov ${summary.state.toLowerCase()} regime: aligned ${side === 'BUY' ? 'long' : 'short'}`,
       }
     : {

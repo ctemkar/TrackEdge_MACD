@@ -186,8 +186,8 @@ const PARAMETER_DEFAULTS = {
 const PROFITABLE_LIVE_RUNTIME_GATES = {
   autoEntryMinScore: 7.2,
   minEdgeAfterFrictionPct: 0.35,
-  maxConcurrentTrades: 6,
-  liveEntriesPerCycle: 1,
+  maxConcurrentTrades: 8,
+  liveEntriesPerCycle: 2,
 } as const;
 
 const NON_TRADABLE_QUOTE_BASES = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
@@ -884,6 +884,7 @@ export default function App() {
   interface ExecuteTradeOptions {
     allowManualOverride?: boolean;
     bypassDuplicateOrderLockout?: boolean;
+    priorityRank?: number;
   }
   
   interface PendingManualOverrideTrade {
@@ -891,6 +892,7 @@ export default function App() {
     symbol: string;
     price: number;
     confidenceScore?: number;
+    priorityRank?: number;
     reason: string;
     strategyReason: string;
     buttonLabel: string;
@@ -1498,9 +1500,10 @@ export default function App() {
     const baseSideCap = Math.max(1, Math.ceil(totalSlots * LIVE_DIRECTIONAL_SIDE_CAP_RATIO));
     const baseImbalanceCap = Math.max(1, Math.floor(totalSlots / 3));
     const alignedRegime = (regimeState === 'BEAR' && side === 'SELL') || (regimeState === 'BULL' && side === 'BUY');
+    const alignedBearShort = regimeState === 'BEAR' && side === 'SELL';
     const normalizedRegimeConfidence = Math.max(0, Math.min(1, Number(regimeConfidence) || 0));
     const regimeCapBoost = alignedRegime
-      ? Math.max(1, Math.round(1 + normalizedRegimeConfidence))
+      ? Math.max(1, Math.round((alignedBearShort ? 2 : 1) + (normalizedRegimeConfidence * (alignedBearShort ? 2 : 1))))
       : 0;
 
     return {
@@ -1565,13 +1568,16 @@ export default function App() {
     return null;
   }, [effectiveLiveAutoEntryMinScore, getRegimeAdjustedDirectionalCaps]);
 
-  const getDesiredLiveEntryNotional = React.useCallback((confidenceScore: number | undefined, tradableCapital: number) => {
+  const getDesiredLiveEntryNotional = React.useCallback((confidenceScore: number | undefined, tradableCapital: number, priorityRank?: number) => {
     const minLiveNotional = Math.max(1, liveMinOrderNotional);
     const availableCapital = Math.max(0, tradableCapital);
     const strongSignalSizing = Number.isFinite(confidenceScore) && confidenceScore !== undefined && isStrongLiveSignal(confidenceScore, effectiveLiveAutoEntryMinScore);
     const confidenceFloor = Math.min(9.5, Math.max(0, effectiveLiveAutoEntryMinScore));
     const normalizedConfidence = Number.isFinite(confidenceScore) && confidenceScore !== undefined
       ? Math.max(0, Math.min(1, (confidenceScore - confidenceFloor) / Math.max(0.5, 10 - confidenceFloor)))
+      : 0;
+    const normalizedPriority = Number.isFinite(priorityRank)
+      ? Math.max(0, Math.min(1, Number(priorityRank) / 35))
       : 0;
     const proportionalCapitalShare = strongSignalSizing
       ? (0.2 + (normalizedConfidence * 0.2))
@@ -1592,6 +1598,11 @@ export default function App() {
       const confidenceFloorAllocation = strongSignalSizing ? 0.7 : 0.55;
       const scaledConfidence = confidenceFloorAllocation + ((1 - confidenceFloorAllocation) * normalizedConfidence);
       allocation = minLiveNotional + ((sizingTargetNotional - minLiveNotional) * scaledConfidence);
+    }
+
+    if (normalizedPriority > 0 && sizingTargetNotional > minLiveNotional) {
+      const priorityLift = 0.3 * normalizedPriority;
+      allocation = allocation + ((sizingTargetNotional - allocation) * priorityLift);
     }
 
     allocation = Math.min(Math.max(minLiveNotional, allocation), cappedMaxLiveNotional);
@@ -3040,7 +3051,7 @@ export default function App() {
             return;
           }
 
-          const desiredNotional = getDesiredLiveEntryNotional(confidenceScore, deployableCapital);
+          const desiredNotional = getDesiredLiveEntryNotional(confidenceScore, deployableCapital, options?.priorityRank);
           const currentHoldingNotional = existingHolding && existingHolding.side === (type === 'SELL' ? 'SHORT' : 'LONG')
             ? getHoldingActiveNotional(existingHolding, price)
             : 0;
@@ -3801,6 +3812,20 @@ export default function App() {
   }, [addLog, holdings.length, isRealMode, reportSyncError, serverStatus]);
 
   useEffect(() => {
+    if (serverStatus !== 'OK') return;
+
+    if (syncError && /(CONNECTION FAIL-SAFE|Failed to fetch|NetworkError|Load failed)/i.test(syncError)) {
+      reportSyncError(null);
+    }
+
+    setExecutionFeedback((prev) => {
+      if (!prev) return prev;
+      if (prev.type !== 'warning') return prev;
+      return /CONNECTION FAIL-SAFE/i.test(prev.message) ? null : prev;
+    });
+  }, [reportSyncError, serverStatus, syncError]);
+
+  useEffect(() => {
     if (!isRealMode || String(serverConfig?.exchange || '').toLowerCase() !== 'binance') return;
     if (serverStatus !== 'OK' || holdings.length === 0) return;
     const now = Date.now();
@@ -4003,17 +4028,25 @@ export default function App() {
 
   useEffect(() => {
     if (!shouldMaintainLiveAccountSync) return;
-    if (serverStatus !== 'OK') return;
     if (rateLimitedUntilRef.current > Date.now()) return;
 
-    // Keep private account sync off during public scan-only sessions.
-    syncRealBalanceRef.current();
-    const timer = setInterval(() => {
+    if (serverStatus === 'OK') {
+      // Keep private account sync off during public scan-only sessions.
       syncRealBalanceRef.current();
+    } else {
+      void checkServer();
+    }
+
+    const timer = setInterval(() => {
+      if (serverStatus === 'OK') {
+        syncRealBalanceRef.current();
+        return;
+      }
+      void checkServer();
     }, 15000);
 
     return () => clearInterval(timer);
-  }, [shouldMaintainLiveAccountSync, serverStatus]);
+  }, [checkServer, shouldMaintainLiveAccountSync, serverStatus]);
 
   const currentHolding = holdings.find(h => h.symbol === symbol);
   const currentHoldingContracts = Number(currentHolding?.contracts || currentHolding?.amount || 0);
@@ -5168,11 +5201,13 @@ export default function App() {
           if (directionalConfidence < relaxedAutoEntryMinScore) {
             return `confidence ${directionalConfidence.toFixed(1)} below ${relaxedAutoEntryMinScore.toFixed(1)} (${regimeAdjustedRequirements.label})`;
           }
-          const desiredNotional = getDesiredLiveEntryNotional(directionalConfidence, getBufferedLiveCapital(availableFunds));
+          const desiredNotional = getDesiredLiveEntryNotional(directionalConfidence, getBufferedLiveCapital(availableFunds), pick.priorityRank);
           if (side === 'SELL' && isShortFacingLocalUpwardMomentum(pick)) {
-            const strongerShortThreshold = Math.min(10, relaxedAutoEntryMinScore + 0.4);
-            if (directionalConfidence < strongerShortThreshold || pick.signal.macdScore < 7) {
-              return `short faces local upward momentum; need score ${strongerShortThreshold.toFixed(1)}+ and MACD 7.0+`;
+            const alignedBearRegime = markovRegimeSummary.state === 'BEAR';
+            const strongerShortThreshold = Math.min(10, relaxedAutoEntryMinScore + (alignedBearRegime ? 0.15 : 0.4));
+            const shortMacdFloor = alignedBearRegime ? 6.2 : 7;
+            if (directionalConfidence < strongerShortThreshold || pick.signal.macdScore < shortMacdFloor) {
+              return `short faces local upward momentum; need score ${strongerShortThreshold.toFixed(1)}+ and MACD ${shortMacdFloor.toFixed(1)}+`;
             }
           }
           if (matchingHolding) {
@@ -5327,7 +5362,7 @@ export default function App() {
           entries.forEach((entry) => {
             const directionalScore = getDirectionalEntryScore(entry.side, entry.pick.signal.score);
             const matchingHolding = currentHoldings.find((h) => getSymbolRiskIdentity(h.symbol).key === getSymbolRiskIdentity(entry.pick.symbol).key && h.side === (entry.side === 'SELL' ? 'SHORT' : 'LONG'));
-            const desiredNotional = getDesiredLiveEntryNotional(directionalScore, realTradableCapital);
+            const desiredNotional = getDesiredLiveEntryNotional(directionalScore, realTradableCapital, entry.pick.priorityRank);
             const currentHoldingNotional = matchingHolding ? getHoldingActiveNotional(matchingHolding, entry.pick.lastPrice) : 0;
             const incrementalNotional = Math.max(0, desiredNotional - currentHoldingNotional);
 
@@ -5428,7 +5463,10 @@ export default function App() {
                   pick.signal.tradePlan,
                   undefined,
                   getDirectionalEntryScore(side, pick.signal.score),
-                  { bypassDuplicateOrderLockout: true },
+                  {
+                    bypassDuplicateOrderLockout: true,
+                    priorityRank: pick.priorityRank,
+                  },
                 );
                 if (!autoTradeRef.current || entryLockUntilRef.current > Date.now()) break;
                 if (isRealMode) {
@@ -6646,7 +6684,7 @@ export default function App() {
     entries.forEach((entry) => {
       const directionalScore = getDirectionalEntryScore(entry.side, entry.pick.signal.score);
       const matchingHolding = currentHoldings.find((holding) => getSymbolRiskIdentity(holding.symbol).key === getSymbolRiskIdentity(entry.pick.symbol).key && holding.side === (entry.side === 'SELL' ? 'SHORT' : 'LONG'));
-      const desiredNotional = getDesiredLiveEntryNotional(directionalScore, realTradableCapital);
+      const desiredNotional = getDesiredLiveEntryNotional(directionalScore, realTradableCapital, entry.pick.priorityRank);
       const currentHoldingNotional = matchingHolding ? getHoldingActiveNotional(matchingHolding, entry.pick.lastPrice) : 0;
       const incrementalNotional = Math.max(0, desiredNotional - currentHoldingNotional);
       const selectionKey = `${entry.side}:${normalizeLiveFuturesSymbol(entry.pick.symbol)}`;
@@ -6831,6 +6869,7 @@ export default function App() {
         symbol: pick.symbol,
         price: pick.lastPrice,
         confidenceScore,
+        priorityRank: pick.priorityRank,
         reason: eligibility.detail,
         strategyReason,
         buttonLabel,
@@ -6848,6 +6887,7 @@ export default function App() {
       undefined,
       undefined,
       confidenceScore,
+      { priorityRank: pick.priorityRank },
     );
   }, [executeTrade, holdings]);
 
@@ -6867,6 +6907,7 @@ export default function App() {
         symbol: pick.symbol,
         price: pick.lastPrice,
         confidenceScore,
+        priorityRank: pick.priorityRank,
         reason: currentHolding?.side === 'SHORT'
           ? `${buyBlockedReason}. Existing short will be closed before a new long can be established.`
           : buyBlockedReason,
@@ -6886,6 +6927,7 @@ export default function App() {
       pick.signal.tradePlan,
       undefined,
       confidenceScore,
+      { priorityRank: pick.priorityRank },
     );
   }, [executeTrade, holdings]);
   
@@ -6903,7 +6945,10 @@ export default function App() {
       undefined,
       undefined,
       pendingTrade.confidenceScore,
-      { allowManualOverride: true },
+      {
+        allowManualOverride: true,
+        priorityRank: pendingTrade.priorityRank,
+      },
     );
   }, [executeTrade, pendingManualOverrideTrade]);
 
