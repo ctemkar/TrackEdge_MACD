@@ -1483,6 +1483,37 @@ export default function App() {
     return null;
   }, [balance, getLivePortfolioExposureCap, getPortfolioGrossNotional]);
 
+  const getRegimeAdjustedDirectionalCaps = React.useCallback(({
+    side,
+    maxSlots,
+    regimeState,
+    regimeConfidence,
+  }: {
+    side: 'BUY' | 'SELL';
+    maxSlots?: number;
+    regimeState?: 'BULL' | 'BEAR' | 'NEUTRAL';
+    regimeConfidence?: number;
+  }) => {
+    const totalSlots = Math.max(1, maxSlots || maxConcurrentTradesRef.current || 1);
+    const baseSideCap = Math.max(1, Math.ceil(totalSlots * LIVE_DIRECTIONAL_SIDE_CAP_RATIO));
+    const baseImbalanceCap = Math.max(1, Math.floor(totalSlots / 3));
+    const alignedRegime = (regimeState === 'BEAR' && side === 'SELL') || (regimeState === 'BULL' && side === 'BUY');
+    const normalizedRegimeConfidence = Math.max(0, Math.min(1, Number(regimeConfidence) || 0));
+    const regimeCapBoost = alignedRegime
+      ? Math.max(1, Math.round(1 + normalizedRegimeConfidence))
+      : 0;
+
+    return {
+      totalSlots,
+      baseSideCap,
+      baseImbalanceCap,
+      sideCap: Math.min(totalSlots, baseSideCap + regimeCapBoost),
+      imbalanceCap: Math.min(totalSlots, baseImbalanceCap + regimeCapBoost),
+      alignedRegime,
+      regimeCapBoost,
+    };
+  }, []);
+
   const getLiveDirectionalExposureBlock = React.useCallback(({
     side,
     confidenceScore,
@@ -1500,9 +1531,12 @@ export default function App() {
     regimeState?: 'BULL' | 'BEAR' | 'NEUTRAL';
     regimeConfidence?: number;
   }) => {
-    const totalSlots = Math.max(1, maxSlots || maxConcurrentTradesRef.current || 1);
-    const baseSideCap = Math.max(1, Math.ceil(totalSlots * LIVE_DIRECTIONAL_SIDE_CAP_RATIO));
-    const baseImbalanceCap = Math.max(1, Math.floor(totalSlots / 3));
+    const { sideCap, imbalanceCap, alignedRegime } = getRegimeAdjustedDirectionalCaps({
+      side,
+      maxSlots,
+      regimeState,
+      regimeConfidence,
+    });
     const openSideCounts = openHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
       acc[holding.side === 'SHORT' ? 'SELL' : 'BUY'] += 1;
       return acc;
@@ -1511,13 +1545,6 @@ export default function App() {
     const oppositeSide: 'BUY' | 'SELL' = side === 'BUY' ? 'SELL' : 'BUY';
     const projectedSideCount = openSideCounts[side] + queued[side] + 1;
     const projectedOppositeCount = openSideCounts[oppositeSide] + queued[oppositeSide];
-    const alignedRegime = (regimeState === 'BEAR' && side === 'SELL') || (regimeState === 'BULL' && side === 'BUY');
-    const normalizedRegimeConfidence = Math.max(0, Math.min(1, Number(regimeConfidence) || 0));
-    const regimeCapBoost = alignedRegime
-      ? Math.max(1, Math.round(1 + normalizedRegimeConfidence))
-      : 0;
-    const sideCap = Math.min(totalSlots, baseSideCap + regimeCapBoost);
-    const imbalanceCap = Math.min(totalSlots, baseImbalanceCap + regimeCapBoost);
     const strongDirectionalSignal = Number.isFinite(confidenceScore) && confidenceScore !== undefined
       && isStrongLiveSignal(confidenceScore, effectiveLiveAutoEntryMinScore);
 
@@ -1536,7 +1563,7 @@ export default function App() {
     }
 
     return null;
-  }, [effectiveLiveAutoEntryMinScore]);
+  }, [effectiveLiveAutoEntryMinScore, getRegimeAdjustedDirectionalCaps]);
 
   const getDesiredLiveEntryNotional = React.useCallback((confidenceScore: number | undefined, tradableCapital: number) => {
     const minLiveNotional = Math.max(1, liveMinOrderNotional);
