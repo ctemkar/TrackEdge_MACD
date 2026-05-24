@@ -4,6 +4,8 @@ import { TrendingUp, Activity, ShieldAlert, ShieldCheck, Info, Wallet, DollarSig
 import { motion, AnimatePresence } from 'motion/react';
 import { fetchBinanceData, fetchLatestPrice, subscribeToTicker, fetchAllSymbols, fetchTopSymbolsByVolume, fetchTicker24hStats, getPublicDataSourceSnapshot, fetchLiveAccountAudit, LiveAccountAuditSnapshot } from './services/binance';
 import { calculateIndicators, evaluateStrategy, Candle, DEFAULT_STRATEGY_CONFIG, IndicatorResult, StrategyConfig, StrategySignal } from './services/indicators';
+import { buildAcceptedOrderVisibilityMessage, scheduleFollowUpSyncs, verifyLiveOrderOnExchange } from './services/liveOrderLifecycle';
+import { decideExchangeSyncTrust, decideLiquidationRetry } from './services/liveExecutionPolicy';
 import { computeMarkovRegime, getRegimeTradeAdjustments, getRegimeWeightAdjustments } from './services/regime';
 import { pickReplacementOpportunity } from './services/rebalance';
 import { scanMarket, MarketScanResult, getLowHistorySnapshot } from './services/scanner';
@@ -148,7 +150,7 @@ const CRITERIA_HELP: Record<string, string> = {
 };
 
 const PARAMETER_DEFAULTS = {
-  maxConcurrentTrades: 10,
+  maxConcurrentTrades: 20,
   takeProfitPercent: MIN_ENFORCED_TAKE_PROFIT_PCT,
   stopLossPercent: MIN_ENFORCED_STOP_LOSS_PCT,
   maxDrawdownPercent: 10,
@@ -186,7 +188,7 @@ const PARAMETER_DEFAULTS = {
 const PROFITABLE_LIVE_RUNTIME_GATES = {
   autoEntryMinScore: 7.2,
   minEdgeAfterFrictionPct: 0.35,
-  maxConcurrentTrades: 12,
+  maxConcurrentTrades: 20,
   liveEntriesPerCycle: 6,
 } as const;
 
@@ -1119,8 +1121,11 @@ export default function App() {
   const [showSyncError, setShowSyncError] = useState(true);
   const [maxConcurrentTrades, setMaxConcurrentTrades] = useState(() => {
     const saved = localStorage.getItem('te_max_concurrent_trades');
-    return saved ? (parseInt(saved, 10) || 15) : 15;
+    return saved ? (parseInt(saved, 10) || 20) : 20;
   });
+  const [pnlTimelineScale, setPnlTimelineScale] = useState<'7D' | '30D' | '90D' | 'ALL'>('30D');
+  const [pnlTimelineZoom, setPnlTimelineZoom] = useState(1);
+  const [pnlTimelineHoveredTimestamp, setPnlTimelineHoveredTimestamp] = useState<number | null>(null);
   const effectiveLiveAutoEntryMinScore = isRealMode
     ? Math.max(autoEntryMinScore, PROFITABLE_LIVE_RUNTIME_GATES.autoEntryMinScore)
     : autoEntryMinScore;
@@ -1241,6 +1246,7 @@ export default function App() {
   const loadingRef = React.useRef(loading);
   const holdingPricesRef = React.useRef<Record<string, number>>({});
   const syncRealBalanceRef = React.useRef<() => Promise<boolean>>(async () => false);
+  const lastTrustedExchangeSyncRef = React.useRef(true);
   const pendingCloseSyncRef = React.useRef<Record<string, PendingCloseSyncConfirmation>>({});
   const scanningRef = React.useRef(false);
   const skipNextImmediateAutoScanRef = React.useRef(false);
@@ -2404,6 +2410,7 @@ export default function App() {
       
       const data = await resp.json();
       if (data.status === 'success' || data.status === 'cached') {
+        let syncTrusted = true;
         setPrivateSyncBlockedUntil(0);
         entryLockUntilRef.current = 0;
         setEntryLockUntil(0);
@@ -2455,6 +2462,9 @@ export default function App() {
         setAuthDegradedMessage(isAuthDegraded
           ? (degradedMsg || 'Binance futures auth is degraded (-2015): API key, IP whitelist, or permissions are incomplete.')
           : null);
+        if (isAuthDegraded) {
+          syncTrusted = false;
+        }
 
         // Keep autonomous mode running here; narrower scan/entry checks already block undersized live orders.
         const bufferedAvailable = getBufferedLiveCapital(syncedAvailable);
@@ -2541,19 +2551,25 @@ export default function App() {
           }).filter((h): h is Holding => h !== null);
 
           const existingHoldings = holdingsRef.current;
-            const maxTransientEmptySyncs = 8;
-          const shouldPreserveExistingHoldings = isRealMode
-            && existingHoldings.length > 0
-            && freshHoldings.length === 0
-            && nextFilteredSyncSymbols.length === 0
-              && consecutiveEmptyPositionSyncsRef.current < maxTransientEmptySyncs;
+          const syncTrustDecision = decideExchangeSyncTrust({
+            isRealMode,
+            isAuthDegraded,
+            existingHoldingCount: existingHoldings.length,
+            freshHoldingCount: freshHoldings.length,
+            filteredSymbolCount: nextFilteredSyncSymbols.length,
+            consecutiveEmptySyncs: consecutiveEmptyPositionSyncsRef.current,
+          });
 
-          if (shouldPreserveExistingHoldings) {
-            consecutiveEmptyPositionSyncsRef.current += 1;
+          if (syncTrustDecision.preserveExistingHoldings) {
+            consecutiveEmptyPositionSyncsRef.current = syncTrustDecision.nextConsecutiveEmptySyncs;
             freshHoldings = existingHoldings;
-              addLog(`SYNC WARNING: Binance returned an empty position snapshot while ${existingHoldings.length} live holding${existingHoldings.length === 1 ? '' : 's'} were already tracked. Preserving current positions until the exchange confirms the flat state (${consecutiveEmptyPositionSyncsRef.current}/${maxTransientEmptySyncs}).`, 'warning');
+            syncTrusted = syncTrustDecision.isTrusted;
+            if (syncTrustDecision.warningMessage) {
+              addLog(syncTrustDecision.warningMessage, 'warning');
+            }
           } else {
-            consecutiveEmptyPositionSyncsRef.current = freshHoldings.length === 0 ? consecutiveEmptyPositionSyncsRef.current : 0;
+            consecutiveEmptyPositionSyncsRef.current = syncTrustDecision.nextConsecutiveEmptySyncs;
+            syncTrusted = syncTrustDecision.isTrusted;
             setHoldings(freshHoldings);
             console.log(`[TradeEdge SYNC] Frontend holdings updated: ${freshHoldings.length} positions ready for Active Positions Engine`);
             if (freshHoldings.length > 0) {
@@ -2565,6 +2581,8 @@ export default function App() {
         if (freshHoldings.length > 0) {
           consecutiveEmptyPositionSyncsRef.current = 0;
         }
+
+        lastTrustedExchangeSyncRef.current = syncTrusted;
 
         const syncUpdatedAt = Date.now();
         const syncedGrossNotional = freshHoldings.reduce((sum, holding) => sum + getHoldingActiveNotional(holding), 0);
@@ -2656,6 +2674,7 @@ export default function App() {
         setServerStatus('OK');
         return true;
       } else {
+        lastTrustedExchangeSyncRef.current = false;
         setAuthDegradedMessage(null);
         const message = data.message || 'Unknown balance sync error';
         reportSyncError(message);
@@ -2665,6 +2684,7 @@ export default function App() {
       }
     } catch (e: any) {
       console.error('Sync Error:', e);
+      lastTrustedExchangeSyncRef.current = false;
       setAuthDegradedMessage(null);
       addLog(`SYNC ERROR: ${e.message}`, 'warning');
       reportSyncError(e.message);
@@ -3170,31 +3190,24 @@ export default function App() {
           let verifyAttempts = 0;
           let authDegradedDuringVerify = false;
           try {
-            while (verifyAttempts < 4 && !verified) {
-              await new Promise(r => setTimeout(r, 600 + verifyAttempts * 400));
-              const verifyResp = await fetch('/api/binance/balance?fresh=1');
-              if (verifyResp.ok) {
-                const verify = await verifyResp.json();
-                // If position-risk endpoint is degraded (-2015), skip verification and mark as filled immediately.
-                if (verify?.authDegraded === true) {
-                  authDegradedDuringVerify = true;
-                  verified = true;
-                  console.log(`[TradeEdge] AUTH DEGRADED during verification - auto-confirming order ${result?.order?.id}`);
-                  break;
-                }
-                const positions = verify?.positions || {};
-                const hasPosition = hasPositionForSymbol(positions, tradeSymbol);
-                if (closingExisting) {
-                  verified = !hasPosition;
-                } else if (openingExposure) {
-                  verified = hasPosition;
-                }
-                if (verified) {
-                  console.log(`[TradeEdge] VERIFIED: ${type} ${tradeSymbol} - Position confirmed after attempt ${verifyAttempts + 1}`);
-                  break;
-                }
-              }
-              verifyAttempts++;
+            const verification = await verifyLiveOrderOnExchange({
+              fetchFreshBalance: async () => {
+                const verifyResp = await fetch('/api/binance/balance?fresh=1');
+                if (!verifyResp.ok) return null;
+                return await verifyResp.json();
+              },
+              hasPositionForSymbol,
+              tradeSymbol,
+              closingExisting,
+              openingExposure,
+            });
+            verified = verification.verified;
+            verifyAttempts = verification.attempts;
+            authDegradedDuringVerify = verification.authDegradedDuringVerify;
+            if (authDegradedDuringVerify) {
+              console.log(`[TradeEdge] AUTH DEGRADED during verification - auto-confirming order ${result?.order?.id}`);
+            } else if (verified) {
+              console.log(`[TradeEdge] VERIFIED: ${type} ${tradeSymbol} - Position confirmed after attempt ${verifyAttempts}`);
             }
           } catch (e) {
             console.warn(`[TradeEdge] Verification fetch failed: ${e}`);
@@ -3202,15 +3215,14 @@ export default function App() {
 
           if (!verified) {
             const orderId = result?.order?.id || result?.order?.clientOrderId || result?.order?.info?.orderId;
-            const msg = `Order accepted by exchange but live position not yet visible${orderId ? ` (order ${orderId})` : ''}.`;
+            const msg = buildAcceptedOrderVisibilityMessage(orderId);
             addLog(`REAL ${type} UNCONFIRMED: ${tradeSymbol} - ${msg}`, 'warning');
             if (!closingExisting) {
               applyOptimisticLiveFill(type, tradeSymbol, amount, price, time);
               setExecutionFeedback({ type: 'info', message: `${type} submitted for ${tradeSymbol}. Awaiting exchange confirmation.` });
               pushTradeEvent({ type, symbol: tradeSymbol, price, amount, time, reason: `SUBMITTED: ${msg}`, status: 'SUBMITTED', cycleId: eventCycleId });
               setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * Math.max(successCooldownMinutes, hardReentryCooldownMinutes)) }));
-              setTimeout(syncRealBalance, 1500);
-              setTimeout(syncRealBalance, 4500);
+              scheduleFollowUpSyncs(syncRealBalance);
               return;
             }
 
@@ -3229,8 +3241,7 @@ export default function App() {
               lockEntries(closeFailureLockMinutes * 60 * 1000, `Close verification failed for ${tradeSymbol}. New entries paused for ${closeFailureLockMinutes}m.`);
             }
             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * Math.max(softCooldownMinutes, hardReentryCooldownMinutes)) }));
-            setTimeout(syncRealBalance, 1500);
-            setTimeout(syncRealBalance, 4500);
+            scheduleFollowUpSyncs(syncRealBalance);
             return;
           }
 
@@ -3265,11 +3276,9 @@ export default function App() {
           const closingLong = heldSide === 'LONG' && type === 'SELL';
           const closingShort = heldSide === 'SHORT' && type === 'BUY';
           if (closingLong || closingShort) {
-            const realized = closingLong
-              ? (price - (existingHolding?.entryPrice || price)) * amount
-              : ((existingHolding?.entryPrice || price) - price) * amount;
-            const basis = (existingHolding?.entryPrice || price) * Math.max(amount, 1e-12);
-            const realizedPct = basis > 0 ? (realized / basis) * 100 : 0;
+            const closeOutcome = existingHolding
+              ? estimateHoldingCloseOutcome(existingHolding, price, amount)
+              : { netPnl: 0, netPnlPct: 0, estimatedFriction: 0 };
             applyOptimisticLiveFill(type, tradeSymbol, amount, price, time);
             void clearExchangeProtection(tradeSymbol, heldSide === 'SHORT' ? 'SHORT' : 'LONG');
             pushTradeEvent({
@@ -3280,13 +3289,18 @@ export default function App() {
               amount,
               time,
               reason,
-              pnl: realized,
-              pnlPct: realizedPct,
+              pnl: closeOutcome.netPnl,
+              pnlPct: closeOutcome.netPnlPct,
               status: 'FILLED',
               cycleId: eventCycleId,
             });
-            const exitCooldownMinutes = getExitCooldownMinutes(reason, realized);
+            const exitCooldownMinutes = getExitCooldownMinutes(reason, closeOutcome.netPnl);
             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * exitCooldownMinutes) }));
+            addLog(`REAL ${type} SUCCESS: ${tradeSymbol} | Net P&L ${closeOutcome.netPnl >= 0 ? '+' : '-'}$${Math.abs(closeOutcome.netPnl).toFixed(2)} (${closeOutcome.netPnlPct >= 0 ? '+' : ''}${closeOutcome.netPnlPct.toFixed(2)}%) after est. costs $${closeOutcome.estimatedFriction.toFixed(2)}`, closeOutcome.netPnl >= 0 ? 'success' : 'warning');
+            setExecutionFeedback({
+              type: closeOutcome.netPnl >= 0 ? 'success' : 'warning',
+              message: `${type} confirmed on exchange for ${tradeSymbol}. Net P&L ${closeOutcome.netPnl >= 0 ? '+' : '-'}$${Math.abs(closeOutcome.netPnl).toFixed(2)} after est. costs.`,
+            });
           } else {
             applyOptimisticLiveFill(type, tradeSymbol, amount, price, time);
             pauseNewLiveEntriesAfterOpen(`post-fill live cooldown after ${tradeSymbol} open`);
@@ -3300,10 +3314,9 @@ export default function App() {
               status: 'FILLED',
               cycleId: eventCycleId,
             });
+            addLog(`REAL ${type} SUCCESS: ${tradeSymbol}`, 'success');
+            setExecutionFeedback({ type: 'success', message: `${type} confirmed on exchange for ${tradeSymbol}.` });
           }
-
-          addLog(`REAL ${type} SUCCESS: ${tradeSymbol}`, 'success');
-          setExecutionFeedback({ type: 'success', message: `${type} confirmed on exchange for ${tradeSymbol}.` });
           if (!(closingLong || closingShort)) {
             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * Math.max(successCooldownMinutes, hardReentryCooldownMinutes)) }));
           }
@@ -3384,8 +3397,7 @@ export default function App() {
             setExecutionFeedback({ type: 'info', message: `${type} submitted for ${tradeSymbol}. Waiting for exchange confirmation.` });
             pushTradeEvent({ type, symbol: tradeSymbol, price, amount: optimisticAmount, time, reason: `SUBMITTED: ${msg}`, status: 'SUBMITTED', cycleId: eventCycleId });
             setCooldowns(prev => ({ ...prev, [tradeSymbol]: Date.now() + (1000 * 60 * Math.max(successCooldownMinutes, hardReentryCooldownMinutes)) }));
-            setTimeout(syncRealBalance, 1500);
-            setTimeout(syncRealBalance, 4500);
+            scheduleFollowUpSyncs(syncRealBalance);
             return;
           }
 
@@ -3402,8 +3414,7 @@ export default function App() {
           }
           setExecutionFeedback({ type: 'warning', message: `${type} unconfirmed for ${tradeSymbol}. Waiting for exchange confirmation.` });
           pushTradeEvent({ type, symbol: tradeSymbol, price, amount: heldAmount || 0, time, reason: `CLOSE UNCONFIRMED: waiting for exchange sync. ${msg}`, status: 'UNCONFIRMED', cycleId: eventCycleId });
-          setTimeout(syncRealBalance, 1500);
-          setTimeout(syncRealBalance, 4500);
+          scheduleFollowUpSyncs(syncRealBalance);
           return;
         }
 
@@ -3739,6 +3750,16 @@ export default function App() {
     await syncRealBalance();
 
     const remainingPositions = [...holdingsRef.current];
+    const liquidationRetryDecision = decideLiquidationRetry({
+      remainingPositionCount: remainingPositions.length,
+      syncTrusted: lastTrustedExchangeSyncRef.current,
+    });
+    if (liquidationRetryDecision.warningMessage) {
+      addLog(liquidationRetryDecision.warningMessage, 'warning');
+    }
+    if (!liquidationRetryDecision.shouldRetry) {
+      return;
+    }
     if (remainingPositions.length > 0) {
       addLog(`LIQUIDATION RETRY: ${remainingPositions.length} positions still reported open after first pass. Retrying close orders...`, 'warning');
       for (const h of remainingPositions) {
@@ -3787,6 +3808,17 @@ export default function App() {
     await syncRealBalance();
 
     const remainingPositions = [...holdingsRef.current];
+    const forcedLiquidationRetryDecision = decideLiquidationRetry({
+      remainingPositionCount: remainingPositions.length,
+      syncTrusted: lastTrustedExchangeSyncRef.current,
+      forcedReason: reason,
+    });
+    if (forcedLiquidationRetryDecision.warningMessage) {
+      addLog(forcedLiquidationRetryDecision.warningMessage, 'warning');
+    }
+    if (!forcedLiquidationRetryDecision.shouldRetry) {
+      return;
+    }
     for (const h of remainingPositions) {
       const price = holdingPricesRef.current[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice);
       if (!price) continue;
@@ -3811,8 +3843,10 @@ export default function App() {
 
   const confirmAndClosePosition = React.useCallback((holding: Holding, markPrice: number) => {
     const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
+    const { netPnl, netPnlPct, estimatedFriction } = estimateHoldingCloseOutcome(holding, markPrice);
+    const signedNetPnl = `${netPnl >= 0 ? '+' : '-'}$${Math.abs(netPnl).toFixed(2)}`;
     const confirmed = window.confirm(
-      `Confirm close for ${holding.symbol} (${holding.side}) at about $${formatMarkPrice(markPrice)}?`
+      `Confirm close for ${holding.symbol} (${holding.side}) at about $${formatMarkPrice(markPrice)}?\nEstimated net P&L after costs: ${signedNetPnl} (${netPnlPct >= 0 ? '+' : ''}${netPnlPct.toFixed(2)}%).\nEstimated costs: $${estimatedFriction.toFixed(2)}.`
     );
     if (!confirmed) return;
     queueLiquidationReview([{
@@ -3823,7 +3857,7 @@ export default function App() {
       source: 'manual',
     }], Date.now());
     executeTrade(closeSide, holding.symbol, markPrice, 'MANUAL_DOCK_CONTROL', holding.id);
-  }, [executeTrade, queueLiquidationReview]);
+  }, [estimateHoldingCloseOutcome, executeTrade, queueLiquidationReview]);
 
   useEffect(() => {
     checkServer();
@@ -5886,6 +5920,21 @@ export default function App() {
   };
   
   const equity = calculateEquity();
+  function estimateHoldingCloseOutcome(holding: Holding, exitPrice: number, closingAmount?: number) {
+    const amount = Math.max(0, Number(closingAmount ?? holding.contracts ?? holding.amount ?? 0));
+    const entryPrice = Number(holding.entryPrice || exitPrice || 0);
+    const basis = entryPrice * amount;
+    const grossPnl = holding.side === 'SHORT'
+      ? (entryPrice - exitPrice) * amount
+      : (exitPrice - entryPrice) * amount;
+    const estimatedFriction = basis > 0
+      ? basis * (Math.max(0, estimatedRoundTripFrictionBps) / 10000)
+      : 0;
+    const netPnl = grossPnl - estimatedFriction;
+    const netPnlPct = basis > 0 ? (netPnl / basis) * 100 : 0;
+    return { amount, basis, grossPnl, estimatedFriction, netPnl, netPnlPct };
+  }
+
   const resolveHoldingPnl = (h: Holding) => {
     const mark = h.markPrice || holdingPrices[h.symbol] || (h.symbol === symbol ? currentPrice : h.entryPrice) || h.entryPrice;
     const contracts = Number(h.contracts || h.amount || 0);
@@ -6046,6 +6095,110 @@ export default function App() {
   }, [tradeHistory]);
   const totalPnl = useExchangeAccountMetrics ? (trackedRealizedPnl + openPnl) : basisDelta;
   const realizedPnl = useExchangeAccountMetrics ? trackedRealizedPnl : (totalPnl - openPnl);
+  const pnlTimelinePoints = React.useMemo(() => {
+    const closedTrades = [...tradeHistory]
+      .filter((trade) => {
+        const status = trade.status || 'FILLED';
+        return (status === 'FILLED' || status === 'SYNC_REMOVED') && typeof trade.pnl === 'number';
+      })
+      .map((trade) => ({
+        timestamp: Date.parse(trade.time),
+        pnl: Number(trade.pnl || 0),
+      }))
+      .filter((trade) => Number.isFinite(trade.timestamp))
+      .sort((a, b) => a.timestamp - b.timestamp);
+
+    const dailyPnl = new Map<number, number>();
+    closedTrades.forEach((trade) => {
+      const tradeDate = new Date(trade.timestamp);
+      tradeDate.setHours(0, 0, 0, 0);
+      const dayStart = tradeDate.getTime();
+      dailyPnl.set(dayStart, (dailyPnl.get(dayStart) || 0) + trade.pnl);
+    });
+
+    let cumulativePnl = 0;
+    const points = Array.from(dailyPnl.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([timestamp, pnl]) => {
+        cumulativePnl += pnl;
+        return {
+          timestamp,
+          value: cumulativePnl,
+        };
+      });
+
+    const now = Date.now();
+    if (points.length === 0) {
+      if (Math.abs(totalPnl) < 1e-8) return [];
+      const today = new Date(now);
+      today.setHours(0, 0, 0, 0);
+      return [{ timestamp: today.getTime(), value: totalPnl }];
+    }
+
+    const lastPoint = points[points.length - 1];
+    const today = new Date(now);
+    today.setHours(0, 0, 0, 0);
+    const todayStart = today.getTime();
+    if (lastPoint.timestamp === todayStart) {
+      lastPoint.value = totalPnl;
+    } else {
+      points.push({ timestamp: todayStart, value: totalPnl });
+    }
+
+    return points;
+  }, [totalPnl, tradeHistory]);
+  const visiblePnlTimelinePoints = React.useMemo(() => {
+    const scaleDays = pnlTimelineScale === '7D' ? 7 : pnlTimelineScale === '30D' ? 30 : pnlTimelineScale === '90D' ? 90 : 30;
+    if (pnlTimelineScale === 'ALL' && pnlTimelinePoints.length > 0) return pnlTimelinePoints;
+    const cutoff = new Date();
+    cutoff.setHours(0, 0, 0, 0);
+    cutoff.setDate(cutoff.getDate() - (scaleDays - 1));
+    const filteredPoints = pnlTimelinePoints.filter((point) => point.timestamp >= cutoff.getTime());
+    if (filteredPoints.length > 0) return filteredPoints;
+
+    const fallbackStart = cutoff.getTime();
+    return Array.from({ length: scaleDays }, (_, index) => ({
+      timestamp: fallbackStart + (index * 24 * 60 * 60 * 1000),
+      value: totalPnl,
+    }));
+  }, [pnlTimelinePoints, pnlTimelineScale]);
+  const pnlTimelineChart = React.useMemo(() => {
+    if (visiblePnlTimelinePoints.length === 0) return null;
+
+    const width = Math.max(180, visiblePnlTimelinePoints.length * (18 + (24 * pnlTimelineZoom)));
+    const height = 100;
+    const values = visiblePnlTimelinePoints.map((point) => point.value);
+    const minValue = Math.min(...values);
+    const maxValue = Math.max(...values);
+    const valueRange = Math.max(1, maxValue - minValue);
+    const baselineValue = Math.max(minValue, Math.min(maxValue, 0));
+    const baselineY = height - (((baselineValue - minValue) / valueRange) * height);
+    const coords = visiblePnlTimelinePoints.map((point, index) => {
+      const x = visiblePnlTimelinePoints.length === 1 ? width / 2 : (index / (visiblePnlTimelinePoints.length - 1)) * width;
+      const y = height - (((point.value - minValue) / valueRange) * height);
+      return { x, y, value: point.value, timestamp: point.timestamp };
+    });
+    const linePath = coords.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(' ');
+    const areaPath = `${linePath} L ${coords[coords.length - 1].x.toFixed(2)} ${baselineY.toFixed(2)} L ${coords[0].x.toFixed(2)} ${baselineY.toFixed(2)} Z`;
+
+    return {
+      minValue,
+      maxValue,
+      baselineY,
+      width,
+      coords,
+      linePath,
+      areaPath,
+      startLabel: new Date(coords[0].timestamp).toLocaleDateString([], { month: 'short', day: 'numeric' }),
+      endLabel: coords.length > 1 ? new Date(coords[coords.length - 1].timestamp).toLocaleDateString([], { month: 'short', day: 'numeric' }) : 'Today',
+    };
+  }, [pnlTimelineZoom, visiblePnlTimelinePoints]);
+  const pnlTimelineHoveredPoint = React.useMemo(() => {
+    if (!pnlTimelineChart) return null;
+    const timestamp = pnlTimelineHoveredTimestamp ?? pnlTimelineChart.coords[pnlTimelineChart.coords.length - 1]?.timestamp;
+    if (!timestamp) return null;
+    return pnlTimelineChart.coords.find((point) => point.timestamp === timestamp) || null;
+  }, [pnlTimelineChart, pnlTimelineHoveredTimestamp]);
   const exchangeFreeMargin = useExchangeAccountMetrics ? availableFunds : balance;
   const liveAuditSummary = liveAccountAudit?.summary;
   const liveAuditReconciledDelta = isRealMode ? ((liveAuditSummary?.netIncome || 0) + openPnl) : 0;
@@ -8752,6 +8905,87 @@ export default function App() {
               </div>
             </section>
           )}
+          <section className="bg-white border-2 border-[#141414] shadow-[8px_8px_0px_0px_#141414] overflow-hidden">
+            <div className="bg-gray-50 border-b border-[#141414]/10 p-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex items-center gap-2">
+                <TrendingUp size={14} className="opacity-50" />
+                <h3 className="font-mono text-[10px] uppercase tracking-widest font-bold">P&amp;L Timeline</h3>
+                <span className="text-[9px] font-mono uppercase opacity-50">{visiblePnlTimelinePoints.length > 0 ? `${visiblePnlTimelinePoints.length} days` : 'Awaiting history'}</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="flex items-center gap-1 rounded-sm border border-[#141414]/10 bg-white p-1">
+                  {(['7D', '30D', '90D', 'ALL'] as const).map((scale) => (
+                    <button
+                      key={scale}
+                      onClick={() => setPnlTimelineScale(scale)}
+                      className={`px-2 py-1 text-[9px] font-mono font-black uppercase tracking-wide transition-colors ${pnlTimelineScale === scale ? 'bg-[#141414] text-white' : 'text-[#141414]/55 hover:bg-[#141414]/5'}`}
+                    >
+                      {scale}
+                    </button>
+                  ))}
+                </div>
+                <label className="flex items-center gap-2 text-[9px] font-mono uppercase tracking-wide text-[#141414]/55">
+                  Zoom
+                  <input
+                    type="range"
+                    min="0.5"
+                    max="2.5"
+                    step="0.25"
+                    value={pnlTimelineZoom}
+                    onChange={(e) => setPnlTimelineZoom(parseFloat(e.target.value))}
+                    className="w-24 accent-[#F27D26]"
+                  />
+                  <span className="min-w-[32px] text-right font-black text-[#141414]">{pnlTimelineZoom.toFixed(2)}x</span>
+                </label>
+              </div>
+            </div>
+            <div className="p-4">
+              {pnlTimelineChart ? (
+                <>
+                  <div className="overflow-x-auto rounded-sm border border-[#141414]/10 bg-[linear-gradient(180deg,rgba(242,125,38,0.08),rgba(20,20,20,0.01))] px-3 py-3">
+                    <div style={{ width: `${pnlTimelineChart.width}px`, minWidth: '100%' }} className="relative h-48">
+                      {pnlTimelineHoveredPoint && (
+                        <div
+                          className="pointer-events-none absolute top-1 z-10 -translate-x-1/2 rounded-sm border border-[#141414] bg-white px-2 py-1 text-[10px] font-mono shadow-[4px_4px_0px_0px_#141414]"
+                          style={{ left: `${pnlTimelineHoveredPoint.x}px` }}
+                        >
+                          <div className="font-black uppercase tracking-wide text-[#141414]">{new Date(pnlTimelineHoveredPoint.timestamp).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}</div>
+                          <div className={pnlTimelineHoveredPoint.value >= 0 ? 'text-emerald-600' : 'text-rose-600'}>
+                            {pnlTimelineHoveredPoint.value >= 0 ? '+' : '-'}${Math.abs(pnlTimelineHoveredPoint.value).toFixed(2)}
+                          </div>
+                        </div>
+                      )}
+                      <svg viewBox={`0 0 ${pnlTimelineChart.width} 100`} preserveAspectRatio="none" className="h-full w-full">
+                        <line x1="0" y1={pnlTimelineChart.baselineY} x2={pnlTimelineChart.width} y2={pnlTimelineChart.baselineY} className="stroke-[#141414]/15" strokeWidth="0.75" strokeDasharray="4 4" />
+                        <path d={pnlTimelineChart.areaPath} className={totalPnl >= 0 ? 'fill-emerald-500/12' : 'fill-rose-500/12'} />
+                        <path d={pnlTimelineChart.linePath} className={totalPnl >= 0 ? 'stroke-emerald-600' : 'stroke-rose-600'} strokeWidth="2.25" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                        {pnlTimelineChart.coords.map((point) => (
+                          <g
+                            key={`${point.timestamp}-${point.x}`}
+                            onMouseEnter={() => setPnlTimelineHoveredTimestamp(point.timestamp)}
+                            onMouseLeave={() => setPnlTimelineHoveredTimestamp(null)}
+                          >
+                            <circle cx={point.x} cy={point.y} r="2.1" className={point.value >= 0 ? 'fill-emerald-600' : 'fill-rose-600'} />
+                          </g>
+                        ))}
+                      </svg>
+                    </div>
+                  </div>
+                  <div className="mt-3 flex items-center justify-between font-mono text-[10px] opacity-60">
+                    <span>{pnlTimelineChart.startLabel}</span>
+                    <span>Scroll horizontally to inspect older days</span>
+                    <span>{pnlTimelineChart.endLabel}</span>
+                  </div>
+                  <div className="mt-2 flex items-center justify-between font-mono text-[10px] font-bold">
+                    <span className={pnlTimelineChart.minValue < 0 ? 'text-rose-600' : 'text-[#141414]/60'}>{pnlTimelineChart.minValue >= 0 ? '+' : '-'}${Math.abs(pnlTimelineChart.minValue).toFixed(2)}</span>
+                    <span className={totalPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}>{totalPnl >= 0 ? '+' : '-'}${Math.abs(totalPnl).toFixed(2)} now</span>
+                    <span className={pnlTimelineChart.maxValue >= 0 ? 'text-emerald-600' : 'text-[#141414]/60'}>{pnlTimelineChart.maxValue >= 0 ? '+' : '-'}${Math.abs(pnlTimelineChart.maxValue).toFixed(2)}</span>
+                  </div>
+                </>
+              ) : null}
+            </div>
+          </section>
+
           <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2 xl:grid-cols-3">
             <MetricBox 
               icon={<Wallet className={useExchangeAccountMetrics ? 'text-rose-500' : 'text-[#F27D26]'} size={18} />}
@@ -8959,6 +9193,11 @@ export default function App() {
                     })
                   )}
                 </tbody>
+                <tfoot>
+                  <tr aria-hidden="true">
+                    <td colSpan={12} className="h-5 border-0 p-0"></td>
+                  </tr>
+                </tfoot>
               </table>
             </div>
           </section>
