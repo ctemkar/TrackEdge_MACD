@@ -1553,7 +1553,7 @@ export default function App() {
     const exposureAwareMaxSlots = alignedBearShort
       ? Math.max(maxSlots || maxConcurrentTradesRef.current || 1, currentBookSize + 1)
       : maxSlots;
-    const { sideCap, imbalanceCap, alignedRegime } = getRegimeAdjustedDirectionalCaps({
+    const { totalSlots, sideCap, imbalanceCap, alignedRegime } = getRegimeAdjustedDirectionalCaps({
       side,
       maxSlots: exposureAwareMaxSlots,
       regimeState,
@@ -1565,6 +1565,7 @@ export default function App() {
     const strongDirectionalSignal = Number.isFinite(confidenceScore) && confidenceScore !== undefined
       && isStrongLiveSignal(confidenceScore, effectiveLiveAutoEntryMinScore);
     const strongPrioritySignal = Number.isFinite(priorityRank) && Number(priorityRank) >= 22;
+    const premiumBearShortBypass = alignedBearShort && strongDirectionalSignal && strongPrioritySignal;
     const strongSignalDirectionalAllowance = alignedBearShort
       ? Math.min(4, STRONG_LIVE_SIGNAL_EXTRA_SLOTS)
       : Math.min(2, STRONG_LIVE_SIGNAL_EXTRA_SLOTS);
@@ -1573,6 +1574,9 @@ export default function App() {
       : strongSignalDirectionalAllowance;
 
     if (projectedSideCount > sideCap) {
+      if (premiumBearShortBypass && projectedSideCount <= totalSlots) {
+        return null;
+      }
       if (strongDirectionalSignal && projectedSideCount <= (sideCap + strongSignalDirectionalAllowance)) {
         return null;
       }
@@ -1580,6 +1584,9 @@ export default function App() {
     }
 
     if ((projectedSideCount - projectedOppositeCount) > imbalanceCap) {
+      if (premiumBearShortBypass && projectedSideCount <= totalSlots) {
+        return null;
+      }
       if (strongDirectionalSignal && strongPrioritySignal && (projectedSideCount - projectedOppositeCount) <= (imbalanceCap + premiumSellImbalanceAllowance)) {
         return null;
       }
