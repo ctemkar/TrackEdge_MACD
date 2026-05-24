@@ -1489,16 +1489,20 @@ export default function App() {
     openHoldings,
     queuedSideCounts,
     maxSlots,
+    regimeState,
+    regimeConfidence,
   }: {
     side: 'BUY' | 'SELL';
     confidenceScore?: number;
     openHoldings: Holding[];
     queuedSideCounts?: Record<'BUY' | 'SELL', number>;
     maxSlots?: number;
+    regimeState?: 'BULL' | 'BEAR' | 'NEUTRAL';
+    regimeConfidence?: number;
   }) => {
     const totalSlots = Math.max(1, maxSlots || maxConcurrentTradesRef.current || 1);
-    const sideCap = Math.max(1, Math.ceil(totalSlots * LIVE_DIRECTIONAL_SIDE_CAP_RATIO));
-    const imbalanceCap = Math.max(1, Math.floor(totalSlots / 3));
+    const baseSideCap = Math.max(1, Math.ceil(totalSlots * LIVE_DIRECTIONAL_SIDE_CAP_RATIO));
+    const baseImbalanceCap = Math.max(1, Math.floor(totalSlots / 3));
     const openSideCounts = openHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
       acc[holding.side === 'SHORT' ? 'SELL' : 'BUY'] += 1;
       return acc;
@@ -1507,6 +1511,13 @@ export default function App() {
     const oppositeSide: 'BUY' | 'SELL' = side === 'BUY' ? 'SELL' : 'BUY';
     const projectedSideCount = openSideCounts[side] + queued[side] + 1;
     const projectedOppositeCount = openSideCounts[oppositeSide] + queued[oppositeSide];
+    const alignedRegime = (regimeState === 'BEAR' && side === 'SELL') || (regimeState === 'BULL' && side === 'BUY');
+    const normalizedRegimeConfidence = Math.max(0, Math.min(1, Number(regimeConfidence) || 0));
+    const regimeCapBoost = alignedRegime
+      ? Math.max(1, Math.round(1 + normalizedRegimeConfidence))
+      : 0;
+    const sideCap = Math.min(totalSlots, baseSideCap + regimeCapBoost);
+    const imbalanceCap = Math.min(totalSlots, baseImbalanceCap + regimeCapBoost);
     const strongDirectionalSignal = Number.isFinite(confidenceScore) && confidenceScore !== undefined
       && isStrongLiveSignal(confidenceScore, effectiveLiveAutoEntryMinScore);
 
@@ -1514,14 +1525,14 @@ export default function App() {
       if (strongDirectionalSignal && projectedSideCount <= (sideCap + 1)) {
         return null;
       }
-      return `side concentration cap (${side} ${projectedSideCount}/${sideCap})`;
+      return `side concentration cap (${side} ${projectedSideCount}/${sideCap}${alignedRegime ? ', regime-adjusted' : ''})`;
     }
 
     if ((projectedSideCount - projectedOppositeCount) > imbalanceCap) {
       if (strongDirectionalSignal && (projectedSideCount - projectedOppositeCount) <= (imbalanceCap + 1)) {
         return null;
       }
-      return `directional imbalance cap (${side} lead ${projectedSideCount - projectedOppositeCount} > ${imbalanceCap})`;
+      return `directional imbalance cap (${side} lead ${projectedSideCount - projectedOppositeCount} > ${imbalanceCap}${alignedRegime ? ', regime-adjusted' : ''})`;
     }
 
     return null;
@@ -2785,6 +2796,8 @@ export default function App() {
           confidenceScore,
           openHoldings: latestHoldings,
           maxSlots: Math.min(maxConcurrentTrades, PROFITABLE_LIVE_RUNTIME_GATES.maxConcurrentTrades),
+          regimeState: markovRegimeSummary.state,
+          regimeConfidence: markovRegimeSummary.confidence,
         });
         if (directionalExposureBlock) {
           if (!allowManualOverride) {
@@ -5259,6 +5272,8 @@ export default function App() {
               openHoldings: currentHoldings,
               queuedSideCounts: selectedSideCounts,
               maxSlots: currentMaxTrades,
+              regimeState: markovRegimeSummary.state,
+              regimeConfidence: markovRegimeSummary.confidence,
             });
             if (directionalExposureBlock) {
               deferredTrades.push({
@@ -6382,6 +6397,8 @@ export default function App() {
                 confidenceScore: directionalConfidence,
                 openHoldings: holdings,
                 maxSlots: effectiveLiveSlotCap,
+                regimeState: markovRegimeSummary.state,
+                regimeConfidence: markovRegimeSummary.confidence,
               });
               if (directionalExposureBlock) {
                 reason = directionalExposureBlock;
@@ -6569,6 +6586,8 @@ export default function App() {
         openHoldings: currentHoldings,
         queuedSideCounts: selectedSideCounts,
         maxSlots: currentMaxTrades,
+        regimeState: markovRegimeSummary.state,
+        regimeConfidence: markovRegimeSummary.confidence,
       });
       if (directionalExposureBlock) {
         deferredByKey.set(selectionKey, directionalExposureBlock);
