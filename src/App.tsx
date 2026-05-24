@@ -4157,6 +4157,28 @@ export default function App() {
       ? 'border-rose-200 bg-rose-50/70 text-rose-800'
       : 'border-slate-200 bg-slate-50/80 text-slate-700';
   const markovRegimeDecisionLabel = `regime=${markovRegimeSummary.state} obs=${markovRegimeSummary.currentObservation} conf=${(markovRegimeSummary.confidence * 100).toFixed(0)}% bull=${(markovRegimeSummary.bullProbability * 100).toFixed(0)} bear=${(markovRegimeSummary.bearProbability * 100).toFixed(0)} neutral=${(markovRegimeSummary.neutralProbability * 100).toFixed(0)}`;
+  const openDirectionalCounts = React.useMemo(() => {
+    return holdings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
+      acc[holding.side === 'SHORT' ? 'SELL' : 'BUY'] += 1;
+      return acc;
+    }, { BUY: 0, SELL: 0 });
+  }, [holdings]);
+  const regimeLongCaps = React.useMemo(() => {
+    return getRegimeAdjustedDirectionalCaps({
+      side: 'BUY',
+      maxSlots: maxConcurrentTrades,
+      regimeState: markovRegimeSummary.state,
+      regimeConfidence: markovRegimeSummary.confidence,
+    });
+  }, [getRegimeAdjustedDirectionalCaps, markovRegimeSummary.confidence, markovRegimeSummary.state, maxConcurrentTrades]);
+  const regimeShortCaps = React.useMemo(() => {
+    return getRegimeAdjustedDirectionalCaps({
+      side: 'SELL',
+      maxSlots: maxConcurrentTrades,
+      regimeState: markovRegimeSummary.state,
+      regimeConfidence: markovRegimeSummary.confidence,
+    });
+  }, [getRegimeAdjustedDirectionalCaps, markovRegimeSummary.confidence, markovRegimeSummary.state, maxConcurrentTrades]);
 
   const getRegimeAdjustedTradeRequirements = React.useCallback((side: 'BUY' | 'SELL') => {
     const adjustment = getRegimeTradeAdjustments(markovRegimeSummary, side);
@@ -7344,6 +7366,24 @@ export default function App() {
                 <div className="border border-current/10 bg-white/50 px-2 py-1">
                   <span className="opacity-50">Neutral</span>
                   <p className="font-black text-[13px]">{(markovRegimeSummary.neutralProbability * 100).toFixed(0)}%</p>
+                </div>
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-4">
+                <div className="border border-current/10 bg-white/50 px-2 py-1">
+                  <span className="opacity-50">Long Cap</span>
+                  <p className="font-black text-[13px]">{openDirectionalCounts.BUY}/{regimeLongCaps.sideCap}</p>
+                </div>
+                <div className="border border-current/10 bg-white/50 px-2 py-1">
+                  <span className="opacity-50">Short Cap</span>
+                  <p className="font-black text-[13px]">{openDirectionalCounts.SELL}/{regimeShortCaps.sideCap}</p>
+                </div>
+                <div className="border border-current/10 bg-white/50 px-2 py-1">
+                  <span className="opacity-50">Long Lead Cap</span>
+                  <p className="font-black text-[13px]">{regimeLongCaps.imbalanceCap}</p>
+                </div>
+                <div className="border border-current/10 bg-white/50 px-2 py-1">
+                  <span className="opacity-50">Short Lead Cap</span>
+                  <p className="font-black text-[13px]">{regimeShortCaps.imbalanceCap}</p>
                 </div>
               </div>
               <p className="mt-2 opacity-70">Trade thresholds and adaptive weights now follow this regime instead of a raw buy-vs-sell snapshot.</p>
