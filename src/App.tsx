@@ -186,7 +186,7 @@ const PARAMETER_DEFAULTS = {
 const PROFITABLE_LIVE_RUNTIME_GATES = {
   autoEntryMinScore: 7.2,
   minEdgeAfterFrictionPct: 0.35,
-  maxConcurrentTrades: 8,
+  maxConcurrentTrades: 10,
   liveEntriesPerCycle: 2,
 } as const;
 
@@ -5421,8 +5421,28 @@ export default function App() {
           const deferredCount = deferredTrades.length;
           const coverageSummary = `coverage=${results.length}/${shortlistLimit}/${symbolsToScan.length}`;
           const exposureSummary = `openSides=BUY:${openSideCounts.BUY}|SELL:${openSideCounts.SELL}`;
+          const blockedReasonSummary = Object.entries(
+            blockedSignals.reduce<Record<string, number>>((acc, entry) => {
+              acc[entry.reason] = (acc[entry.reason] || 0) + 1;
+              return acc;
+            }, {})
+          )
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 3)
+            .map(([reason, count]) => `${count} ${reason}`)
+            .join(' | ');
+          const deferredReasonSummary = Object.entries(
+            deferredTrades.reduce<Record<string, number>>((acc, entry) => {
+              acc[entry.reason] = (acc[entry.reason] || 0) + 1;
+              return acc;
+            }, {})
+          )
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 3)
+            .map(([reason, count]) => `${count} ${reason}`)
+            .join(' | ');
           addLog(
-            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`,
+            `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}${blockedReasonSummary ? ` blockedTop=${blockedReasonSummary}` : ''}${deferredReasonSummary ? ` deferredTop=${deferredReasonSummary}` : ''}`,
             selectedCount > 0 ? 'success' : 'info',
           );
           updateLatestScanArchiveDecision(`SCAN DECISION: ${markovRegimeDecisionLabel} | found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`);
