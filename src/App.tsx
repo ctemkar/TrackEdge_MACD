@@ -4179,6 +4179,32 @@ export default function App() {
       regimeConfidence: markovRegimeSummary.confidence,
     });
   }, [getRegimeAdjustedDirectionalCaps, markovRegimeSummary.confidence, markovRegimeSummary.state, maxConcurrentTrades]);
+  const regimeBlockedReasonCounts = React.useMemo(() => {
+    return Object.entries(scanBlockedSummary.reasonCounts).reduce((acc, [reason, count]) => {
+      const normalizedReason = reason.toLowerCase();
+      const safeCount = Number(count) || 0;
+      if (normalizedReason.includes('side concentration cap')) {
+        acc.sideCap += safeCount;
+        if (normalizedReason.includes('(sell')) acc.shortSideCap += safeCount;
+        if (normalizedReason.includes('(buy')) acc.longSideCap += safeCount;
+      } else if (normalizedReason.includes('directional imbalance cap')) {
+        acc.imbalanceCap += safeCount;
+        if (normalizedReason.includes('(sell')) acc.shortImbalanceCap += safeCount;
+        if (normalizedReason.includes('(buy')) acc.longImbalanceCap += safeCount;
+      } else {
+        acc.other += safeCount;
+      }
+      return acc;
+    }, {
+      sideCap: 0,
+      shortSideCap: 0,
+      longSideCap: 0,
+      imbalanceCap: 0,
+      shortImbalanceCap: 0,
+      longImbalanceCap: 0,
+      other: 0,
+    });
+  }, [scanBlockedSummary.reasonCounts]);
 
   const getRegimeAdjustedTradeRequirements = React.useCallback((side: 'BUY' | 'SELL') => {
     const adjustment = getRegimeTradeAdjustments(markovRegimeSummary, side);
@@ -7384,6 +7410,23 @@ export default function App() {
                 <div className="border border-current/10 bg-white/50 px-2 py-1">
                   <span className="opacity-50">Short Lead Cap</span>
                   <p className="font-black text-[13px]">{regimeShortCaps.imbalanceCap}</p>
+                </div>
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-3">
+                <div className="border border-current/10 bg-white/50 px-2 py-1">
+                  <span className="opacity-50">Side Cap Blocks</span>
+                  <p className="font-black text-[13px]">{regimeBlockedReasonCounts.sideCap}</p>
+                  <p className="text-[9px] opacity-60">Short {regimeBlockedReasonCounts.shortSideCap} | Long {regimeBlockedReasonCounts.longSideCap}</p>
+                </div>
+                <div className="border border-current/10 bg-white/50 px-2 py-1">
+                  <span className="opacity-50">Imbalance Blocks</span>
+                  <p className="font-black text-[13px]">{regimeBlockedReasonCounts.imbalanceCap}</p>
+                  <p className="text-[9px] opacity-60">Short {regimeBlockedReasonCounts.shortImbalanceCap} | Long {regimeBlockedReasonCounts.longImbalanceCap}</p>
+                </div>
+                <div className="border border-current/10 bg-white/50 px-2 py-1">
+                  <span className="opacity-50">Other Blocks</span>
+                  <p className="font-black text-[13px]">{regimeBlockedReasonCounts.other}</p>
+                  <p className="text-[9px] opacity-60">All other rejection reasons</p>
                 </div>
               </div>
               <p className="mt-2 opacity-70">Trade thresholds and adaptive weights now follow this regime instead of a raw buy-vs-sell snapshot.</p>
