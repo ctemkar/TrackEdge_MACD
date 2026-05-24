@@ -186,8 +186,8 @@ const PARAMETER_DEFAULTS = {
 const PROFITABLE_LIVE_RUNTIME_GATES = {
   autoEntryMinScore: 7.2,
   minEdgeAfterFrictionPct: 0.35,
-  maxConcurrentTrades: 10,
-  liveEntriesPerCycle: 4,
+  maxConcurrentTrades: 12,
+  liveEntriesPerCycle: 6,
 } as const;
 
 const NON_TRADABLE_QUOTE_BASES = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
@@ -1507,10 +1507,10 @@ export default function App() {
     const alignedBearShort = regimeState === 'BEAR' && side === 'SELL';
     const normalizedRegimeConfidence = Math.max(0, Math.min(1, Number(regimeConfidence) || 0));
     const sideCapBoost = alignedRegime
-      ? Math.max(1, Math.round((alignedBearShort ? 1.5 : 1) + normalizedRegimeConfidence))
+      ? Math.max(1, Math.round((alignedBearShort ? 2.5 : 1) + normalizedRegimeConfidence))
       : 0;
     const imbalanceCapBoost = alignedRegime
-      ? Math.max(1, Math.round((alignedBearShort ? 4 : 1) + normalizedRegimeConfidence))
+      ? Math.max(1, Math.round((alignedBearShort ? 5 : 1) + normalizedRegimeConfidence))
       : 0;
 
     return {
@@ -1566,10 +1566,10 @@ export default function App() {
       && isStrongLiveSignal(confidenceScore, effectiveLiveAutoEntryMinScore);
     const strongPrioritySignal = Number.isFinite(priorityRank) && Number(priorityRank) >= 22;
     const strongSignalDirectionalAllowance = alignedBearShort
-      ? Math.min(3, STRONG_LIVE_SIGNAL_EXTRA_SLOTS)
+      ? Math.min(4, STRONG_LIVE_SIGNAL_EXTRA_SLOTS)
       : Math.min(2, STRONG_LIVE_SIGNAL_EXTRA_SLOTS);
     const premiumSellImbalanceAllowance = alignedBearShort && strongPrioritySignal
-      ? Math.min(4, STRONG_LIVE_SIGNAL_EXTRA_SLOTS + 1)
+      ? Math.min(5, STRONG_LIVE_SIGNAL_EXTRA_SLOTS + 2)
       : strongSignalDirectionalAllowance;
 
     if (projectedSideCount > sideCap) {
