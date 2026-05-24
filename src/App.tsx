@@ -160,7 +160,7 @@ const PARAMETER_DEFAULTS = {
   hardReentryCooldownMinutes: 120,
   minEdgeAfterFrictionPct: 0.15,
   estimatedRoundTripFrictionBps: 18,
-  symbolDailyLossLimit: 20,
+  symbolDailyLossLimit: 10,
   symbolDailyFlipLimit: 12,
   accountDailyLossLimit: 25,
   marginStopLossPct: DEFAULT_MARGIN_STOP_LOSS_PCT,
@@ -1352,11 +1352,6 @@ export default function App() {
     const summary = key ? symbolRiskSummary.get(key) : null;
     if (!summary) return null;
     if (summary.dailyStopUntil > at && summary.dailyStopReason) {
-      const softenedDailyLossLimit = Math.abs(symbolDailyLossLimit) * 1.5;
-      const hardDailyLossBreach = summary.realizedPnl <= -softenedDailyLossLimit;
-      if (!hardDailyLossBreach) {
-        return null;
-      }
       const hoursRemaining = Math.max(1, Math.ceil((summary.dailyStopUntil - at) / (60 * 60 * 1000)));
       return {
         reason: `${summary.dailyStopReason} (${hoursRemaining}h remaining)`,
