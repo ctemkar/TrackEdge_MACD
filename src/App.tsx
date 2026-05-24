@@ -186,7 +186,7 @@ const PARAMETER_DEFAULTS = {
 const PROFITABLE_LIVE_RUNTIME_GATES = {
   autoEntryMinScore: 7.2,
   minEdgeAfterFrictionPct: 0.35,
-  maxConcurrentTrades: 8,
+  maxConcurrentTrades: 10,
   liveEntriesPerCycle: 2,
 } as const;
 
