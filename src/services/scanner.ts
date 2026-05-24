@@ -77,6 +77,7 @@ function computeProfitabilityRank(result: MarketScanResult): number {
   if (!signalActive) return -Infinity;
 
   const macdComponent = Math.min(20, Math.log10(1 + Math.max(0, result.macdSpread || 0) * 100000));
+  const isSell = result.signal.overall === 'SELL';
   const histogramAligned =
     (result.signal.overall === 'BUY' && (result.macdHistogram || 0) > 0 && (result.macdHistogramDelta || 0) >= 0) ||
     (result.signal.overall === 'SELL' && (result.macdHistogram || 0) < 0 && (result.macdHistogramDelta || 0) <= 0);
@@ -88,11 +89,23 @@ function computeProfitabilityRank(result: MarketScanResult): number {
     (result.signal.overall === 'BUY' && result.trend === 'UP') ||
     (result.signal.overall === 'SELL' && result.trend === 'DOWN');
   const trendComponent = trendAligned ? 4 : 0;
-  const moveMagnitude = Math.abs(result.change24h || 0);
-  const momentumComponent = Math.min(5, moveMagnitude / 3);
+  const directionalMove = Number(result.change24h || 0);
+  const favorableMove = isSell ? Math.max(0, -directionalMove) : Math.max(0, directionalMove);
+  const moveMagnitude = Math.abs(directionalMove);
+  const momentumComponent = Math.min(5, favorableMove / 3);
   const spikePenalty = moveMagnitude > 18 ? Math.min(6, (moveMagnitude - 18) / 2) : 0;
+  const rsiValue = Number.isFinite(Number(result.rsi)) ? Number(result.rsi) : 50;
+  const exhaustionPenalty = isSell
+    ? Math.max(
+        favorableMove > 6 ? Math.min(4, (favorableMove - 6) / 1.5) : 0,
+        rsiValue < 38 ? Math.min(3, (38 - rsiValue) / 4) : 0,
+      )
+    : Math.max(
+        favorableMove > 6 ? Math.min(4, (favorableMove - 6) / 1.5) : 0,
+        rsiValue > 62 ? Math.min(3, (rsiValue - 62) / 4) : 0,
+      );
 
-  return macdComponent + histogramComponent + volumeComponent + trendComponent + momentumComponent - spikePenalty;
+  return macdComponent + histogramComponent + volumeComponent + trendComponent + momentumComponent - spikePenalty - exhaustionPenalty;
 }
 
 async function fetchScanCandlesWithRetry(symbol: string): Promise<Candle[]> {

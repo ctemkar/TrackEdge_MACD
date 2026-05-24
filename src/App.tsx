@@ -1229,6 +1229,7 @@ export default function App() {
   const syncRealBalanceRef = React.useRef<() => Promise<boolean>>(async () => false);
   const pendingCloseSyncRef = React.useRef<Record<string, PendingCloseSyncConfirmation>>({});
   const scanningRef = React.useRef(false);
+  const skipNextImmediateAutoScanRef = React.useRef(false);
   const rateLimitedUntilRef = React.useRef(0);
   const liveProtectionInflightRef = React.useRef<Record<string, number>>({});
   const liveProtectionFailureNotifiedAtRef = React.useRef(0);
@@ -1376,6 +1377,7 @@ export default function App() {
   const lastScanSkipLogRef = React.useRef<Record<string, number>>({});
   const [pendingCloseSyncSymbols, setPendingCloseSyncSymbols] = useState<Record<string, PendingCloseSyncConfirmation>>({});
   const [recentSyncRemovedClosures, setRecentSyncRemovedClosures] = useState<Record<string, { updatedAt: number; reason: string }>>({});
+  const [pendingAutonomyRearmAfterLiquidation, setPendingAutonomyRearmAfterLiquidation] = useState(false);
   const [lastExchangeSyncSnapshot, setLastExchangeSyncSnapshot] = useState<ExchangeSyncSnapshot>({
     updatedAt: 0,
     openPositions: {},
@@ -1560,12 +1562,12 @@ export default function App() {
     const projectedOppositeCount = openSideCounts[oppositeSide] + queued[oppositeSide];
     const strongDirectionalSignal = Number.isFinite(confidenceScore) && confidenceScore !== undefined
       && isStrongLiveSignal(confidenceScore, effectiveLiveAutoEntryMinScore);
-    const strongPrioritySignal = Number.isFinite(priorityRank) && Number(priorityRank) >= 16;
+    const strongPrioritySignal = Number.isFinite(priorityRank) && Number(priorityRank) >= 22;
     const strongSignalDirectionalAllowance = alignedBearShort
       ? Math.min(3, STRONG_LIVE_SIGNAL_EXTRA_SLOTS)
       : Math.min(2, STRONG_LIVE_SIGNAL_EXTRA_SLOTS);
     const premiumSellImbalanceAllowance = alignedBearShort && strongPrioritySignal
-      ? Math.min(6, STRONG_LIVE_SIGNAL_EXTRA_SLOTS + 3)
+      ? Math.min(4, STRONG_LIVE_SIGNAL_EXTRA_SLOTS + 1)
       : strongSignalDirectionalAllowance;
 
     if (projectedSideCount > sideCap) {
@@ -1576,7 +1578,7 @@ export default function App() {
     }
 
     if ((projectedSideCount - projectedOppositeCount) > imbalanceCap) {
-      if ((strongDirectionalSignal || strongPrioritySignal) && (projectedSideCount - projectedOppositeCount) <= (imbalanceCap + premiumSellImbalanceAllowance)) {
+      if (strongDirectionalSignal && strongPrioritySignal && (projectedSideCount - projectedOppositeCount) <= (imbalanceCap + premiumSellImbalanceAllowance)) {
         return null;
       }
       return `directional imbalance cap (${side} lead ${projectedSideCount - projectedOppositeCount} > ${imbalanceCap}${alignedRegime ? ', regime-adjusted' : ''})`;
@@ -1839,6 +1841,18 @@ export default function App() {
     releaseLiveControl();
     addLog(reason, 'warning');
   }, [addLog, releaseLiveControl]);
+
+  const resumeAutonomousTrading = React.useCallback((reason: string, options?: { waitForNextFullScanCycle?: boolean }) => {
+    if (isRealMode) {
+      claimLiveControl();
+    }
+    skipNextImmediateAutoScanRef.current = options?.waitForNextFullScanCycle === true;
+    autoTradeRef.current = true;
+    setAutoTrade(true);
+    setExecutionFeedback({ type: 'success', message: reason });
+    localStorage.setItem('te_auto_trade', 'true');
+    addLog(reason, 'success');
+  }, [addLog, claimLiveControl, isRealMode]);
 
   const applyBenchmarkCapital = React.useCallback((nextValue: number, nextTimestamp: number = Date.now()) => {
     setBenchmarkCapital(nextValue);
@@ -3699,6 +3713,7 @@ export default function App() {
     const confirmed = window.confirm(`LIQUIDATION PROTOCOL: Close all ${holdings.length} active positions at market price?`);
     if (!confirmed) return;
     
+    setPendingAutonomyRearmAfterLiquidation(true);
     suspendAutonomousTrading(`LIQUIDATION START: Autonomous trading suspended. Closing ${holdings.length} vectors...`);
     
     const currentPositions = [...holdings];
@@ -3743,11 +3758,12 @@ export default function App() {
     } else {
       addLog(`LIQUIDATION COMPLETE. All positions closed.`, 'success');
     }
-  }, [holdings, holdingPrices, symbol, currentPrice, executeTrade, addLog, queueLiquidationReview]);
+  }, [holdings, holdingPrices, symbol, currentPrice, executeTrade, addLog, queueLiquidationReview, suspendAutonomousTrading]);
 
   const forceLiquidateAll = React.useCallback(async (reason: string) => {
     if (holdings.length === 0) return;
 
+    setPendingAutonomyRearmAfterLiquidation(false);
     suspendAutonomousTrading(`FORCED LIQUIDATION: ${reason}. Autonomous trading suspended. Closing ${holdings.length} active positions...`);
 
     const currentPositions = [...holdings];
@@ -3780,6 +3796,18 @@ export default function App() {
     }
     await syncRealBalance();
   }, [holdings, holdingPrices, symbol, currentPrice, executeTrade, queueLiquidationReview, suspendAutonomousTrading, syncRealBalance]);
+
+  useEffect(() => {
+    if (!pendingAutonomyRearmAfterLiquidation) return;
+    if (holdings.length > 0) return;
+    if (Object.keys(pendingCloseSyncSymbols).length > 0) return;
+    if (isRealMode && lastExchangeSyncSnapshot.updatedAt <= 0) return;
+
+    setPendingAutonomyRearmAfterLiquidation(false);
+    resumeAutonomousTrading('LIQUIDATION COMPLETE: autonomous trading re-armed after the exchange confirmed a flat book. Waiting for the next full scan cycle before new entries.', {
+      waitForNextFullScanCycle: true,
+    });
+  }, [holdings.length, isRealMode, lastExchangeSyncSnapshot.updatedAt, pendingAutonomyRearmAfterLiquidation, pendingCloseSyncSymbols, resumeAutonomousTrading]);
 
   const confirmAndClosePosition = React.useCallback((holding: Holding, markPrice: number) => {
     const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
@@ -4265,6 +4293,29 @@ export default function App() {
       label: adjustment.label,
     };
   }, [effectiveLiveAutoEntryMinScore, effectiveLiveMinEdgeAfterFrictionPct, markovRegimeSummary]);
+
+  const getPickAwareTradeRequirements = React.useCallback((side: 'BUY' | 'SELL', pick: MarketScanResult) => {
+    const baseRequirements = getRegimeAdjustedTradeRequirements(side);
+    if (side !== 'BUY' || markovRegimeSummary.state !== 'BEAR') {
+      return baseRequirements;
+    }
+
+    const rsiValue = Number.isFinite(Number(pick.rsi)) ? Number(pick.rsi) : 50;
+    const improvingHistogram = (pick.macdHistogramDelta || 0) >= 0;
+    const reboundHistogram = pick.signal.confluence.macdHistogram === 'BEARISH_FADE'
+      || pick.signal.confluence.macdHistogram === 'BULLISH_FADE'
+      || pick.signal.confluence.macdHistogram === 'BULLISH_ACCELERATION';
+
+    if (!(rsiValue <= 38 && improvingHistogram && reboundHistogram)) {
+      return baseRequirements;
+    }
+
+    return {
+      minScore: Number(Math.max(0, baseRequirements.minScore - 0.4).toFixed(1)),
+      minEdgeAfterFrictionPct: Number(Math.max(0, baseRequirements.minEdgeAfterFrictionPct - 0.06).toFixed(2)),
+      label: `${baseRequirements.label} | oversold bounce long`,
+    };
+  }, [getRegimeAdjustedTradeRequirements, markovRegimeSummary.state]);
 
   const adaptiveStrategyConfig = React.useMemo(() => {
     const recentClosedTrades = tradeHistory
@@ -5166,7 +5217,7 @@ export default function App() {
       };
 
       const getEntryBlockReason = ({ side, pick }: { side: 'BUY' | 'SELL'; pick: MarketScanResult }) => {
-        const regimeAdjustedRequirements = getRegimeAdjustedTradeRequirements(side);
+        const regimeAdjustedRequirements = getPickAwareTradeRequirements(side, pick);
         const relaxedAutoEntryMinScore = regimeAdjustedRequirements.minScore;
         const relaxedMinEdgeAfterFrictionPct = regimeAdjustedRequirements.minEdgeAfterFrictionPct;
         const pickRiskKey = getSymbolRiskIdentity(pick.symbol).key;
@@ -5687,7 +5738,11 @@ export default function App() {
 
     loadData();
     if (autoTradeRef.current) {
-      void performScanRef.current();
+      if (skipNextImmediateAutoScanRef.current) {
+        skipNextImmediateAutoScanRef.current = false;
+      } else {
+        void performScanRef.current();
+      }
       setNextScanSec(scanIntervalSec);
     } else {
       setNextScanSec(0);
@@ -6539,7 +6594,7 @@ export default function App() {
         } else {
           const directionalSide = pick.signal.overall === 'SELL' ? 'SELL' : 'BUY';
           const directionalConfidence = getDirectionalEntryScore(directionalSide, pick.signal.score);
-          const regimeAdjustedRequirements = getRegimeAdjustedTradeRequirements(directionalSide);
+          const regimeAdjustedRequirements = getPickAwareTradeRequirements(directionalSide, pick);
           const relaxedAutoEntryMinScore = isRealMode ? Math.max(0, regimeAdjustedRequirements.minScore - 0.8) : autoEntryMinScore;
           const relaxedMinEdgeAfterFrictionPct = isRealMode ? Math.max(0, regimeAdjustedRequirements.minEdgeAfterFrictionPct - 0.2) : minEdgeAfterFrictionPct;
           if (isRealMode && directionalConfidence < relaxedAutoEntryMinScore) {
@@ -6552,6 +6607,7 @@ export default function App() {
               const directionalExposureBlock = getLiveDirectionalExposureBlock({
                 side: directionalSide,
                 confidenceScore: directionalConfidence,
+                priorityRank: pick.priorityRank,
                 openHoldings: holdings,
                 maxSlots: effectiveLiveSlotCap,
                 regimeState: markovRegimeSummary.state,
@@ -6583,7 +6639,7 @@ export default function App() {
       detail: `${pick.signal.overall} passed base checks`,
       className: 'bg-emerald-100 text-emerald-700',
     };
-  }, [serverConfig?.exchange, isRealMode, maxConcurrentTrades, liveQuoteAllowlist, fullUniverseMode, holdings, cooldowns, isUnsupportedLiveScanSymbol, autoEntryMinScore, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getLiveDirectionalExposureBlock, getRegimeAdjustedTradeRequirements]);
+  }, [serverConfig?.exchange, isRealMode, maxConcurrentTrades, liveQuoteAllowlist, fullUniverseMode, holdings, cooldowns, isUnsupportedLiveScanSymbol, autoEntryMinScore, estimatedRoundTripFrictionBps, minEdgeAfterFrictionPct, getSymbolRiskBlock, getLiveDirectionalExposureBlock, getPickAwareTradeRequirements]);
 
   const rankedSignalStatuses = React.useMemo(() => {
     const now = Date.now();
