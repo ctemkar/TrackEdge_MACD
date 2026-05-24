@@ -187,7 +187,7 @@ const PROFITABLE_LIVE_RUNTIME_GATES = {
   autoEntryMinScore: 7.2,
   minEdgeAfterFrictionPct: 0.35,
   maxConcurrentTrades: 10,
-  liveEntriesPerCycle: 2,
+  liveEntriesPerCycle: 4,
 } as const;
 
 const NON_TRADABLE_QUOTE_BASES = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
@@ -3637,10 +3637,6 @@ export default function App() {
       return didChange ? next : prev;
     });
 
-    if (isRealMode) {
-      return;
-    }
-
     const technicalInvalidation = holding.side === 'LONG' ? price <= stopPrice : price >= stopPrice;
     const priceProfitTargetHit = holding.side === 'LONG' ? price >= tp2Price : price <= tp2Price;
     const hitTp1 = holding.side === 'LONG' ? price >= tp1Price : price <= tp1Price;
@@ -3814,7 +3810,7 @@ export default function App() {
   const confirmAndClosePosition = React.useCallback((holding: Holding, markPrice: number) => {
     const closeSide: 'BUY' | 'SELL' = holding.side === 'SHORT' ? 'BUY' : 'SELL';
     const confirmed = window.confirm(
-      `Confirm close for ${holding.symbol} (${holding.side}) at about $${formatPrice(markPrice)}?`
+      `Confirm close for ${holding.symbol} (${holding.side}) at about $${formatMarkPrice(markPrice)}?`
     );
     if (!confirmed) return;
     queueLiquidationReview([{
@@ -4194,6 +4190,11 @@ export default function App() {
     if (price < 0.0001) return price.toFixed(8);
     if (price < 1) return price.toFixed(6);
     return price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 });
+  };
+
+  const formatMarkPrice = (price: number) => {
+    if (!Number.isFinite(price) || price === 0) return '0.00000';
+    return price.toFixed(5);
   };
 
   const formatScanSourceLabel = React.useCallback(() => {
@@ -8917,7 +8918,7 @@ export default function App() {
                              ${formatPrice(h.entryPrice)}
                           </td>
                           <td className={`px-1 py-1.5 font-mono text-[10px] font-bold ${pnlVal > 0 ? 'text-emerald-600' : pnlVal < 0 ? 'text-rose-600' : 'text-[#141414]'}`}>
-                          ${formatPrice(mark)}
+                          ${formatMarkPrice(mark)}
                           </td>
                           <td className="px-1 py-1.5 font-mono text-[10px] font-bold text-[#141414]">
                           ${formatPrice(stopPrice)}
