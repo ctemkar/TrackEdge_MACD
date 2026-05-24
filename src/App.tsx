@@ -1502,24 +1502,28 @@ export default function App() {
     const alignedRegime = (regimeState === 'BEAR' && side === 'SELL') || (regimeState === 'BULL' && side === 'BUY');
     const alignedBearShort = regimeState === 'BEAR' && side === 'SELL';
     const normalizedRegimeConfidence = Math.max(0, Math.min(1, Number(regimeConfidence) || 0));
-    const regimeCapBoost = alignedRegime
+    const sideCapBoost = alignedRegime
       ? Math.max(1, Math.round((alignedBearShort ? 1.5 : 1) + normalizedRegimeConfidence))
+      : 0;
+    const imbalanceCapBoost = alignedRegime
+      ? Math.max(1, Math.round((alignedBearShort ? 4 : 1) + normalizedRegimeConfidence))
       : 0;
 
     return {
       totalSlots,
       baseSideCap,
       baseImbalanceCap,
-      sideCap: Math.min(totalSlots, baseSideCap + regimeCapBoost),
-      imbalanceCap: Math.min(totalSlots, baseImbalanceCap + regimeCapBoost),
+      sideCap: Math.min(totalSlots, baseSideCap + sideCapBoost),
+      imbalanceCap: Math.min(totalSlots, baseImbalanceCap + imbalanceCapBoost),
       alignedRegime,
-      regimeCapBoost,
+      regimeCapBoost: Math.max(sideCapBoost, imbalanceCapBoost),
     };
   }, []);
 
   const getLiveDirectionalExposureBlock = React.useCallback(({
     side,
     confidenceScore,
+    priorityRank,
     openHoldings,
     queuedSideCounts,
     maxSlots,
@@ -1528,38 +1532,51 @@ export default function App() {
   }: {
     side: 'BUY' | 'SELL';
     confidenceScore?: number;
+    priorityRank?: number;
     openHoldings: Holding[];
     queuedSideCounts?: Record<'BUY' | 'SELL', number>;
     maxSlots?: number;
     regimeState?: 'BULL' | 'BEAR' | 'NEUTRAL';
     regimeConfidence?: number;
   }) => {
-    const { sideCap, imbalanceCap, alignedRegime } = getRegimeAdjustedDirectionalCaps({
-      side,
-      maxSlots,
-      regimeState,
-      regimeConfidence,
-    });
     const openSideCounts = openHoldings.reduce<Record<'BUY' | 'SELL', number>>((acc, holding) => {
       acc[holding.side === 'SHORT' ? 'SELL' : 'BUY'] += 1;
       return acc;
     }, { BUY: 0, SELL: 0 });
     const queued = queuedSideCounts || { BUY: 0, SELL: 0 };
+    const alignedBearShort = regimeState === 'BEAR' && side === 'SELL';
+    const currentBookSize = openSideCounts.BUY + openSideCounts.SELL + queued.BUY + queued.SELL;
+    const exposureAwareMaxSlots = alignedBearShort
+      ? Math.max(maxSlots || maxConcurrentTradesRef.current || 1, currentBookSize + 1)
+      : maxSlots;
+    const { sideCap, imbalanceCap, alignedRegime } = getRegimeAdjustedDirectionalCaps({
+      side,
+      maxSlots: exposureAwareMaxSlots,
+      regimeState,
+      regimeConfidence,
+    });
     const oppositeSide: 'BUY' | 'SELL' = side === 'BUY' ? 'SELL' : 'BUY';
     const projectedSideCount = openSideCounts[side] + queued[side] + 1;
     const projectedOppositeCount = openSideCounts[oppositeSide] + queued[oppositeSide];
     const strongDirectionalSignal = Number.isFinite(confidenceScore) && confidenceScore !== undefined
       && isStrongLiveSignal(confidenceScore, effectiveLiveAutoEntryMinScore);
+    const strongPrioritySignal = Number.isFinite(priorityRank) && Number(priorityRank) >= 16;
+    const strongSignalDirectionalAllowance = alignedBearShort
+      ? Math.min(3, STRONG_LIVE_SIGNAL_EXTRA_SLOTS)
+      : Math.min(2, STRONG_LIVE_SIGNAL_EXTRA_SLOTS);
+    const premiumSellImbalanceAllowance = alignedBearShort && strongPrioritySignal
+      ? Math.min(6, STRONG_LIVE_SIGNAL_EXTRA_SLOTS + 3)
+      : strongSignalDirectionalAllowance;
 
     if (projectedSideCount > sideCap) {
-      if (strongDirectionalSignal && projectedSideCount <= (sideCap + 1)) {
+      if (strongDirectionalSignal && projectedSideCount <= (sideCap + strongSignalDirectionalAllowance)) {
         return null;
       }
       return `side concentration cap (${side} ${projectedSideCount}/${sideCap}${alignedRegime ? ', regime-adjusted' : ''})`;
     }
 
     if ((projectedSideCount - projectedOppositeCount) > imbalanceCap) {
-      if (strongDirectionalSignal && (projectedSideCount - projectedOppositeCount) <= (imbalanceCap + 1)) {
+      if ((strongDirectionalSignal || strongPrioritySignal) && (projectedSideCount - projectedOppositeCount) <= (imbalanceCap + premiumSellImbalanceAllowance)) {
         return null;
       }
       return `directional imbalance cap (${side} lead ${projectedSideCount - projectedOppositeCount} > ${imbalanceCap}${alignedRegime ? ', regime-adjusted' : ''})`;
@@ -2832,6 +2849,7 @@ export default function App() {
         const directionalExposureBlock = getLiveDirectionalExposureBlock({
           side: type === 'SELL' ? 'SELL' : 'BUY',
           confidenceScore,
+          priorityRank: options?.priorityRank,
           openHoldings: latestHoldings,
           maxSlots: Math.min(maxConcurrentTrades, PROFITABLE_LIVE_RUNTIME_GATES.maxConcurrentTrades),
           regimeState: markovRegimeSummary.state,
@@ -5358,15 +5376,18 @@ export default function App() {
           const selectedTrades: typeof entries = [];
           const deferredTrades: ScanDeferredSignal[] = [];
           let queuedNotional = 0;
+          const strongSignalCycleAllowance = Math.min(2, STRONG_LIVE_SIGNAL_EXTRA_SLOTS);
 
           entries.forEach((entry) => {
             const directionalScore = getDirectionalEntryScore(entry.side, entry.pick.signal.score);
+            const strongDirectionalSignal = isStrongLiveSignal(directionalScore, effectiveLiveAutoEntryMinScore);
             const matchingHolding = currentHoldings.find((h) => getSymbolRiskIdentity(h.symbol).key === getSymbolRiskIdentity(entry.pick.symbol).key && h.side === (entry.side === 'SELL' ? 'SHORT' : 'LONG'));
             const desiredNotional = getDesiredLiveEntryNotional(directionalScore, realTradableCapital, entry.pick.priorityRank);
             const currentHoldingNotional = matchingHolding ? getHoldingActiveNotional(matchingHolding, entry.pick.lastPrice) : 0;
             const incrementalNotional = Math.max(0, desiredNotional - currentHoldingNotional);
 
             if (selectedTrades.length >= effectiveBaseAvailableSlots) {
+              if (!strongDirectionalSignal || selectedTrades.length >= (effectiveBaseAvailableSlots + strongSignalCycleAllowance)) {
               deferredTrades.push({
                 symbol: entry.pick.symbol,
                 side: entry.side,
@@ -5375,10 +5396,12 @@ export default function App() {
                 reason: 'all live slots filled this cycle',
               });
               return;
+              }
             }
             const directionalExposureBlock = getLiveDirectionalExposureBlock({
               side: entry.side,
-              confidenceScore: getDirectionalEntryScore(entry.side, entry.pick.signal.score),
+              confidenceScore: directionalScore,
+              priorityRank: entry.pick.priorityRank,
               openHoldings: currentHoldings,
               queuedSideCounts: selectedSideCounts,
               maxSlots: currentMaxTrades,
@@ -6701,9 +6724,11 @@ export default function App() {
     const deferredByKey = new Map<string, string>();
     const selectedSideCounts: Record<'BUY' | 'SELL', number> = { BUY: 0, SELL: 0 };
     let queuedNotional = 0;
+    const strongSignalCycleAllowance = Math.min(2, STRONG_LIVE_SIGNAL_EXTRA_SLOTS);
 
     entries.forEach((entry) => {
       const directionalScore = getDirectionalEntryScore(entry.side, entry.pick.signal.score);
+      const strongDirectionalSignal = isStrongLiveSignal(directionalScore, effectiveLiveAutoEntryMinScore);
       const matchingHolding = currentHoldings.find((holding) => getSymbolRiskIdentity(holding.symbol).key === getSymbolRiskIdentity(entry.pick.symbol).key && holding.side === (entry.side === 'SELL' ? 'SHORT' : 'LONG'));
       const desiredNotional = getDesiredLiveEntryNotional(directionalScore, realTradableCapital, entry.pick.priorityRank);
       const currentHoldingNotional = matchingHolding ? getHoldingActiveNotional(matchingHolding, entry.pick.lastPrice) : 0;
@@ -6711,12 +6736,15 @@ export default function App() {
       const selectionKey = `${entry.side}:${normalizeLiveFuturesSymbol(entry.pick.symbol)}`;
 
       if (selectedEntries.size >= effectiveBaseAvailableSlots) {
+        if (!strongDirectionalSignal || selectedEntries.size >= (effectiveBaseAvailableSlots + strongSignalCycleAllowance)) {
         deferredByKey.set(selectionKey, 'all live slots filled this cycle');
         return;
+        }
       }
       const directionalExposureBlock = getLiveDirectionalExposureBlock({
         side: entry.side,
         confidenceScore: directionalScore,
+        priorityRank: entry.pick.priorityRank,
         openHoldings: currentHoldings,
         queuedSideCounts: selectedSideCounts,
         maxSlots: currentMaxTrades,
