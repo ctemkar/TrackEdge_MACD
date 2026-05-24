@@ -601,6 +601,13 @@ export default function App() {
     const saved = localStorage.getItem('te_fast_adverse_move_exit_pct');
     return saved ? Math.max(0.1, parseFloat(saved) || PARAMETER_DEFAULTS.fastAdverseMoveExitPct) : PARAMETER_DEFAULTS.fastAdverseMoveExitPct;
   });
+
+  useEffect(() => {
+    if (symbolDailyLossLimit > PARAMETER_DEFAULTS.symbolDailyLossLimit) {
+      setSymbolDailyLossLimit(PARAMETER_DEFAULTS.symbolDailyLossLimit);
+    }
+  }, [symbolDailyLossLimit]);
+
   const [dailyEquityAnchorDate, setDailyEquityAnchorDate] = useState(() => localStorage.getItem('te_daily_equity_anchor_date') || '');
   const [dailyEquityAnchor, setDailyEquityAnchor] = useState(() => {
     const saved = localStorage.getItem('te_daily_equity_anchor');
