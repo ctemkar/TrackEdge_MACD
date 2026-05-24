@@ -627,6 +627,7 @@ async function startServer() {
   }> => {
     try {
       const response = await fetchBinanceSignedJson(apiKey, apiSecret, [
+        { label: 'papi-um-account', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/um/account' },
         { label: 'papi-account', baseUrl: 'https://papi.binance.com', endpoint: '/papi/v1/account' },
       ], {});
       return {
@@ -1232,13 +1233,15 @@ async function startServer() {
             const pmAccount = await fetchBinancePortfolioMarginAccountViaHttp(preferredBinance.key, preferredBinance.secret);
             if (pmAccount.accountData) {
               const accountEquity = Number(
-                pmAccount.accountData.accountEquity ??
                 pmAccount.accountData.actualEquity ??
+                pmAccount.accountData.accountEquity ??
                 pmAccount.accountData.totalMarginBalance ??
                 0,
               );
               const availableBalance = Number(
+                pmAccount.accountData.availableBalance ??
                 pmAccount.accountData.totalAvailableBalance ??
+                pmAccount.accountData.maxWithdrawAmount ??
                 pmAccount.accountData.virtualMaxWithdrawAmount ??
                 0,
               );
@@ -1264,8 +1267,17 @@ async function startServer() {
 
           const papiAccount = await (client as any).papiGetAccount?.();
           if (papiAccount) {
-            const actual = Number(papiAccount.accountEquity || papiAccount.actualEquity);
-            const available = Number(papiAccount.totalAvailableBalance || papiAccount.virtualMaxWithdrawAmount);
+            const actual = Number(
+              papiAccount.actualEquity ||
+              papiAccount.accountEquity ||
+              papiAccount.totalMarginBalance
+            );
+            const available = Number(
+              papiAccount.availableBalance ||
+              papiAccount.totalAvailableBalance ||
+              papiAccount.maxWithdrawAmount ||
+              papiAccount.virtualMaxWithdrawAmount
+            );
             if (!Number.isFinite(papiAccountEquity) && Number.isFinite(actual) && actual > 0) papiAccountEquity = actual;
             if (Number.isFinite(available) && available >= 0) papiAvailableBalance = available;
           }

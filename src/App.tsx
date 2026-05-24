@@ -4045,6 +4045,7 @@ export default function App() {
     : markovRegimeSummary.state === 'BEAR'
       ? 'border-rose-200 bg-rose-50/70 text-rose-800'
       : 'border-slate-200 bg-slate-50/80 text-slate-700';
+  const markovRegimeDecisionLabel = `regime=${markovRegimeSummary.state} obs=${markovRegimeSummary.currentObservation} conf=${(markovRegimeSummary.confidence * 100).toFixed(0)}% bull=${(markovRegimeSummary.bullProbability * 100).toFixed(0)} bear=${(markovRegimeSummary.bearProbability * 100).toFixed(0)} neutral=${(markovRegimeSummary.neutralProbability * 100).toFixed(0)}`;
 
   const getRegimeAdjustedTradeRequirements = React.useCallback((side: 'BUY' | 'SELL') => {
     const adjustment = getRegimeTradeAdjustments(markovRegimeSummary, side);
@@ -5228,7 +5229,7 @@ export default function App() {
             `SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`,
             selectedCount > 0 ? 'success' : 'info',
           );
-          updateLatestScanArchiveDecision(`SCAN DECISION: found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`);
+          updateLatestScanArchiveDecision(`SCAN DECISION: ${markovRegimeDecisionLabel} | found=${signalCandidates.length} eligible=${entries.length} blocked=${blockedSignals.length} deferred=${deferredCount} selected=${selectedCount} slots=${effectiveBaseAvailableSlots} cohortCap=${MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE > 0 ? MAX_LIVE_ENTRIES_PER_COHORT_PER_CYCLE : 'off'} ${exposureSummary} ${coverageSummary}`);
           
           if (selectedTrades.length > 0 || deferredTrades.length > 0) {
             // Live mode safety: execute entries sequentially to avoid burst margin failures.
