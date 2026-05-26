@@ -6179,6 +6179,16 @@ export default function App() {
       value: totalPnl,
     }));
   }, [pnlTimelinePoints, pnlTimelineScale]);
+  const yesterdayDelta = React.useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayPoint = pnlTimelinePoints.find((point) => point.timestamp === yesterday.getTime());
+    const todayPoint = pnlTimelinePoints.find((point) => point.timestamp === today.getTime());
+    if (!yesterdayPoint || !todayPoint) return null;
+    return todayPoint.value - yesterdayPoint.value;
+  }, [pnlTimelinePoints]);
   const pnlTimelineChart = React.useMemo(() => {
     if (visiblePnlTimelinePoints.length === 0) return null;
 
@@ -8992,6 +9002,11 @@ export default function App() {
                     <span>{pnlTimelineChart.startLabel}</span>
                     <span>Scroll horizontally to inspect older days</span>
                     <span>{pnlTimelineChart.endLabel}</span>
+                  </div>
+                  <div className="mt-1 text-[9px] text-[#141414]/70">
+                    {yesterdayDelta !== null
+                      ? `Yesterday delta: ${yesterdayDelta >= 0 ? '+' : '-'}$${Math.abs(yesterdayDelta).toFixed(2)}`
+                      : 'No yesterday PnL data available'}
                   </div>
                   <div className="mt-2 flex items-center justify-between font-mono text-[10px] font-bold">
                     <span className={pnlTimelineChart.minValue < 0 ? 'text-rose-600' : 'text-[#141414]/60'}>{pnlTimelineChart.minValue >= 0 ? '+' : '-'}${Math.abs(pnlTimelineChart.minValue).toFixed(2)}</span>
