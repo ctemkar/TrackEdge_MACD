@@ -1872,19 +1872,27 @@ export default function App() {
   React.useEffect(() => {
     const savedAutoTrade = localStorage.getItem('te_auto_trade') === 'true';
     const savedRealMode = localStorage.getItem('te_real_mode') === 'true';
+    const currentController = localStorage.getItem(LIVE_CONTROL_TAB_KEY) || '';
 
     if (savedRealMode) {
       setIsRealMode(true);
     }
 
-    if (savedAutoTrade && savedRealMode) {
+    if (savedAutoTrade && savedRealMode && (!currentController || currentController === appTabIdRef.current)) {
       claimLiveControl();
+      autoTradeRef.current = true;
+      setAutoTrade(true);
+    } else {
+      autoTradeRef.current = false;
+      setAutoTrade(false);
+      if (savedAutoTrade && savedRealMode && currentController && currentController !== appTabIdRef.current) {
+        setExecutionFeedback({ type: 'warning', message: 'Another tab already owns live execution control. This tab is read-only until control is transferred.' });
+        addLog('LIVE CONTROL: detected another controller tab on startup; this tab remains read-only.', 'warning');
+      }
     }
 
-    autoTradeRef.current = savedAutoTrade;
-    setAutoTrade(savedAutoTrade);
     setModePersistenceReady(true);
-  }, [claimLiveControl]);
+  }, [addLog, claimLiveControl]);
 
   React.useEffect(() => {
     // Paper mode should not automatically reactivate live mode simply because
@@ -4335,15 +4343,22 @@ export default function App() {
     const reboundHistogram = pick.signal.confluence.macdHistogram === 'BEARISH_FADE'
       || pick.signal.confluence.macdHistogram === 'BULLISH_FADE'
       || pick.signal.confluence.macdHistogram === 'BULLISH_ACCELERATION';
+    const strongMomentum = pick.signal.macdScore != null && pick.signal.macdScore >= 7;
+    const strongSignal = Number.isFinite(pick.signal.score) && pick.signal.score >= Math.max(0, baseRequirements.minScore + 0.8);
+    const strongBearBounce = rsiValue <= 34 && improvingHistogram && reboundHistogram && strongMomentum && strongSignal;
 
-    if (!(rsiValue <= 38 && improvingHistogram && reboundHistogram)) {
-      return baseRequirements;
+    if (!strongBearBounce) {
+      return {
+        minScore: 11,
+        minEdgeAfterFrictionPct: 999,
+        label: `${baseRequirements.label} | bear market long blocked`,
+      };
     }
 
     return {
       minScore: Number(Math.max(0, baseRequirements.minScore - 0.4).toFixed(1)),
       minEdgeAfterFrictionPct: Number(Math.max(0, baseRequirements.minEdgeAfterFrictionPct - 0.06).toFixed(2)),
-      label: `${baseRequirements.label} | oversold bounce long`,
+      label: `${baseRequirements.label} | strong bear bounce long`,
     };
   }, [getRegimeAdjustedTradeRequirements, markovRegimeSummary.state]);
 
@@ -6399,15 +6414,16 @@ export default function App() {
         : 0;
       const closeSide: 'BUY' | 'SELL' = h.side === 'SHORT' ? 'BUY' : 'SELL';
       const displaySymbol = h.displaySymbol || (h.symbol.endsWith('USDT')
-        ? `${h.symbol.slice(0, -4)}/USDT:USDT`
+        ? `${h.symbol.slice(0, -4)}/USDT`
         : h.symbol.endsWith('USDC')
-          ? `${h.symbol.slice(0, -4)}/USDC:USDC`
+          ? `${h.symbol.slice(0, -4)}/USDC`
           : h.symbol);
 
       return {
         holding: h,
         index,
         displaySymbol,
+        rawSymbol: h.symbol,
         exchange: h.exchange || 'Binance',
         side: h.side,
         contracts,
@@ -6910,6 +6926,20 @@ export default function App() {
             label: 'BLOCKED',
             detail: 'Binance tradable metadata unavailable',
             className: 'bg-rose-100 text-rose-700',
+          };
+        }
+      });
+      return statuses;
+    }
+
+    if (isRealMode && !hasLiveExecutionControl()) {
+      visibleSignalTablePicks.forEach((pick) => {
+        const currentStatus = statuses[pick.symbol];
+        if (currentStatus?.label === 'READY' || currentStatus?.label === 'SELECTED') {
+          statuses[pick.symbol] = {
+            label: 'LOCKED',
+            detail: 'another tab owns live execution control',
+            className: 'bg-amber-100 text-amber-700',
           };
         }
       });
@@ -8149,18 +8179,18 @@ export default function App() {
                       <div className="flex items-center justify-between gap-2">
                         <div className="flex items-center gap-2">
                           <span className="font-black text-[11px] text-indigo-950">{entry.symbol}</span>
-                          <span className={`rounded-sm px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wide ${entry.lifecycle.className}`}>
+                          <span className={`rounded-sm px-2 py-1 text-[10px] sm:text-[11px] font-black uppercase tracking-wide ${entry.lifecycle.className}`}>
                             {entry.lifecycle.label}
                           </span>
-                          <span className={`rounded-sm px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wide ${entry.eligibility.className}`}>
+                          <span className={`rounded-sm px-2 py-1 text-[10px] sm:text-[11px] font-black uppercase tracking-wide ${entry.eligibility.className}`}>
                             {entry.eligibility.label}
                           </span>
                         </div>
-                        <span className="text-[9px] text-indigo-900/70">
+                        <span className="text-[10px] sm:text-[11px] text-indigo-900/70">
                           {entry.signal} | {formatSignalAge(entry.foundAt)}
                         </span>
                       </div>
-                      <div className="mt-1 text-[9px] normal-case tracking-normal text-indigo-950/80">
+                      <div className="mt-1 text-[11px] sm:text-[12px] normal-case tracking-normal text-indigo-950/85 font-semibold">
                         {entry.reason}
                       </div>
                     </div>
@@ -8280,10 +8310,10 @@ export default function App() {
 
                     <div className="flex justify-center px-2">
                       <div className="flex max-w-[150px] flex-col items-center gap-1 text-center leading-tight">
-                        <span className={`rounded-sm px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wide ${eligibility.className}`}>
+                        <span className={`rounded-sm px-2 py-1 text-[10px] sm:text-[11px] font-black uppercase tracking-wide ${eligibility.className}`}>
                           {eligibility.label}
                         </span>
-                        <span className="text-[8px] font-mono normal-case opacity-60">
+                        <span className="text-[10px] sm:text-[11px] font-mono normal-case opacity-75 break-words max-w-[160px]">
                           {eligibility.detail}
                         </span>
                       </div>
@@ -9208,14 +9238,15 @@ export default function App() {
                   ) : (
                     sortedActivePositionRows.map((row) => {
                       const h = row.holding;
-                      const { mark, contracts, stopPrice, margin, notional, unrealizedPnl: pnlVal, pnlPct: pnlPctVal, closeSide, displaySymbol, riskGuardText, recentAdverseMovePct } = row;
+                      const { mark, contracts, stopPrice, margin, notional, unrealizedPnl: pnlVal, pnlPct: pnlPctVal, closeSide, displaySymbol, rawSymbol, riskGuardText, recentAdverseMovePct } = row;
                       return (
                         <tr key={h.id} className="hover:bg-gray-50/50 transition-colors group cursor-pointer" onClick={() => setSymbol(h.symbol)}>
                           <td className="px-1 py-1.5">
                               <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-sm ${h.side === 'SHORT' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{h.side === 'SHORT' ? '↓' : '↑'}</span>
                           </td>
                         <td className="px-1 py-1.5 font-mono text-[10px] font-black uppercase tracking-tight">
-                          {displaySymbol}
+                          <div>{displaySymbol}</div>
+                          <div className="text-[8px] font-normal uppercase opacity-60">{rawSymbol}</div>
                         </td>
                           <td className="px-1 py-1.5 font-mono text-[10px] opacity-60">
                           {contracts < 1 ? contracts.toFixed(8) : contracts.toFixed(4)}
