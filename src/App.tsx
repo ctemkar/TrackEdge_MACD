@@ -2811,7 +2811,8 @@ export default function App() {
       return;
     }
 
-    const lockKey = `${type}_${tradeSymbol}_${targetId || 'all'}`;
+    const normalizedLockSymbol = normalizeLiveFuturesSymbol(tradeSymbol) || normalizedTradeSymbol;
+    const lockKey = `${type}_${normalizedLockSymbol}_${targetId || 'all'}`;
     if (tradeLockout.current.has(lockKey) && !bypassDuplicateOrderLockout) {
       setExecutionFeedback({ type: 'warning', message: `${type} skipped for ${tradeSymbol}: duplicate order lockout.` });
       pushTradeEvent({ type, symbol: tradeSymbol, price, amount: 0, time: new Date().toISOString(), reason: 'SKIP: Duplicate order lockout', status: 'SKIPPED', cycleId: eventCycleId });
