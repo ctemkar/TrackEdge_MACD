@@ -1887,9 +1887,9 @@ export default function App() {
   }, [claimLiveControl]);
 
   React.useEffect(() => {
-    if (isRealMode || !autoTrade) return;
-    if (!liveControllerTabId) return;
-    setIsRealMode(true);
+    // Paper mode should not automatically reactivate live mode simply because
+    // an auto-trade flag or stale controller tab state exists in storage.
+    // Live mode must always be entered explicitly by the user.
   }, [autoTrade, isRealMode, liveControllerTabId]);
 
   React.useEffect(() => {
