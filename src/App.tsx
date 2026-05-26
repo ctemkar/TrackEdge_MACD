@@ -7023,7 +7023,7 @@ export default function App() {
 
       statuses[pick.symbol] = {
         label: 'DEFERRED',
-        detail: 'eligible but not selected this cycle',
+        detail: 'lost the live entry slot to higher-priority eligible signals',
         className: 'bg-amber-100 text-amber-700',
       };
     });
