@@ -7018,7 +7018,14 @@ export default function App() {
           detail: deferredReason,
           className: 'bg-amber-100 text-amber-700',
         };
+        return;
       }
+
+      statuses[pick.symbol] = {
+        label: 'DEFERRED',
+        detail: 'eligible but not selected this cycle',
+        className: 'bg-amber-100 text-amber-700',
+      };
     });
 
     return statuses;
