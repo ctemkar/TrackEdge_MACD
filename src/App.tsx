@@ -272,11 +272,11 @@ const compareTopSignalDisplayPriority = (
   a: Pick<MarketScanResult, 'priorityRank' | 'signal'>,
   b: Pick<MarketScanResult, 'priorityRank' | 'signal'>,
 ) => {
-  const bucketDelta = getTopSignalDisplayBucket(a.signal.overall) - getTopSignalDisplayBucket(b.signal.overall);
-  if (bucketDelta !== 0) return bucketDelta;
-
   const priorityRankDelta = (b.priorityRank || 0) - (a.priorityRank || 0);
   if (priorityRankDelta !== 0) return priorityRankDelta;
+
+  const bucketDelta = getTopSignalDisplayBucket(a.signal.overall) - getTopSignalDisplayBucket(b.signal.overall);
+  if (bucketDelta !== 0) return bucketDelta;
 
   const aDirectionalScore = a.signal.overall === 'SELL'
     ? 10 - (a.signal.score || 0)
@@ -1873,24 +1873,32 @@ export default function App() {
   React.useEffect(() => {
     const savedAutoTrade = localStorage.getItem('te_auto_trade') === 'true';
     const savedRealMode = localStorage.getItem('te_real_mode') === 'true';
+    const currentController = localStorage.getItem(LIVE_CONTROL_TAB_KEY) || '';
 
     if (savedRealMode) {
       setIsRealMode(true);
     }
 
-    if (savedAutoTrade && savedRealMode) {
+    if (savedAutoTrade && savedRealMode && (!currentController || currentController === appTabIdRef.current)) {
       claimLiveControl();
+      autoTradeRef.current = true;
+      setAutoTrade(true);
+    } else {
+      autoTradeRef.current = false;
+      setAutoTrade(false);
+      if (savedAutoTrade && savedRealMode && currentController && currentController !== appTabIdRef.current) {
+        setExecutionFeedback({ type: 'warning', message: 'Another tab already owns live execution control. This tab is read-only until control is transferred.' });
+        addLog('LIVE CONTROL: detected another controller tab on startup; this tab remains read-only.', 'warning');
+      }
     }
 
-    autoTradeRef.current = savedAutoTrade;
-    setAutoTrade(savedAutoTrade);
     setModePersistenceReady(true);
-  }, [claimLiveControl]);
+  }, [addLog, claimLiveControl]);
 
   React.useEffect(() => {
-    if (isRealMode || !autoTrade) return;
-    if (!liveControllerTabId) return;
-    setIsRealMode(true);
+    // Paper mode should not automatically reactivate live mode simply because
+    // an auto-trade flag or stale controller tab state exists in storage.
+    // Live mode must always be entered explicitly by the user.
   }, [autoTrade, isRealMode, liveControllerTabId]);
 
   React.useEffect(() => {
@@ -4095,17 +4103,7 @@ export default function App() {
     return () => clearInterval(timer);
   }, [isRealMode, loadLiveAccountAudit]);
 
-  const shouldMaintainLiveAccountSync = isRealMode || (
-    lastExchangeSyncSnapshot.updatedAt > 0
-    && holdings.length > 0
-    && holdings.some((holding) => (
-      Boolean(holding.exchange)
-      || (Number.isFinite(Number(holding.markPrice)) && Number(holding.markPrice) > 0)
-      || (Number.isFinite(Number(holding.initialMargin)) && Number(holding.initialMargin) > 0)
-      || (Number.isFinite(Number(holding.notional)) && Math.abs(Number(holding.notional)) > 0)
-      || Number.isFinite(Number(holding.unrealizedPnl))
-    ))
-  );
+  const shouldMaintainLiveAccountSync = isRealMode;
 
   useEffect(() => {
     if (!shouldMaintainLiveAccountSync) return;
@@ -4186,6 +4184,7 @@ export default function App() {
   const [filteredSyncSymbols, setFilteredSyncSymbols] = useState<Array<{ symbol: string; reason: string }>>([]);
   const [scanDataSource, setScanDataSource] = useState(() => localStorage.getItem('te_scan_data_source') || 'BINANCE PUBLIC');
   const [scanUniverseCounts, setScanUniverseCounts] = useState(() => readStoredJson('te_scan_universe_counts', DEFAULT_SCAN_UNIVERSE_COUNTS));
+  const [scanSelectedSymbols, setScanSelectedSymbols] = useState<string[]>([]);
   const [selectedRejectReason, setSelectedRejectReason] = useState<string | null>(null);
 
   React.useEffect(() => {
@@ -4345,15 +4344,22 @@ export default function App() {
     const reboundHistogram = pick.signal.confluence.macdHistogram === 'BEARISH_FADE'
       || pick.signal.confluence.macdHistogram === 'BULLISH_FADE'
       || pick.signal.confluence.macdHistogram === 'BULLISH_ACCELERATION';
+    const strongMomentum = pick.signal.macdScore != null && pick.signal.macdScore >= 7;
+    const strongSignal = Number.isFinite(pick.signal.score) && pick.signal.score >= Math.max(0, baseRequirements.minScore + 0.8);
+    const strongBearBounce = rsiValue <= 34 && improvingHistogram && reboundHistogram && strongMomentum && strongSignal;
 
-    if (!(rsiValue <= 38 && improvingHistogram && reboundHistogram)) {
-      return baseRequirements;
+    if (!strongBearBounce) {
+      return {
+        minScore: 11,
+        minEdgeAfterFrictionPct: 999,
+        label: `${baseRequirements.label} | bear market long blocked`,
+      };
     }
 
     return {
       minScore: Number(Math.max(0, baseRequirements.minScore - 0.4).toFixed(1)),
       minEdgeAfterFrictionPct: Number(Math.max(0, baseRequirements.minEdgeAfterFrictionPct - 0.06).toFixed(2)),
-      label: `${baseRequirements.label} | oversold bounce long`,
+      label: `${baseRequirements.label} | strong bear bounce long`,
     };
   }, [getRegimeAdjustedTradeRequirements, markovRegimeSummary.state]);
 
@@ -4846,6 +4852,7 @@ export default function App() {
     scanningRef.current = true;
     setScanning(true);
     setIsBotActive(true);
+    setScanSelectedSymbols([]);
     try {
       setScanProgress({ current: 0, total: 0 });
       let allSymbols: { label: string; value: string }[];
@@ -5379,6 +5386,33 @@ export default function App() {
         topDeferred: [],
       });
 
+      if (signalCounts.BUY === 0 && signalCounts.SELL === 0) {
+        const topBlockedReasons = Object.entries(blockedSignals.reduce<Record<string, number>>((acc, entry) => {
+          acc[entry.reason] = (acc[entry.reason] || 0) + 1;
+          return acc;
+        }, {}))
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3)
+          .map(([reason, count]) => `${count} ${reason}`)
+          .join(' | ');
+
+        const topPreFilterReasons = Object.entries(combinedPreScanExcluded.reduce<Record<string, number>>((acc, entry) => {
+          acc[entry.reason] = (acc[entry.reason] || 0) + 1;
+          return acc;
+        }, {}))
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3)
+          .map(([reason, count]) => `${count} ${reason}`)
+          .join(' | ');
+
+        if (topBlockedReasons) {
+          addLog(`SCAN DIAGNOSIS: no entry signals; blocked reasons: ${topBlockedReasons}`, 'warning');
+        }
+        if (topPreFilterReasons) {
+          addLog(`SCAN DIAGNOSIS: pre-scan exclusions: ${topPreFilterReasons}`, 'warning');
+        }
+      }
+
       if (currentAutoTrade && !currentExecutionEnabled) {
         pushScanSkipEvent('SKIP: Another tab owns live execution control; this tab remains read-only.', cycleId);
         return;
@@ -5531,6 +5565,7 @@ export default function App() {
             queuedNotional += incrementalNotional;
           });
 
+          setScanSelectedSymbols(selectedTrades.map((entry) => normalizeLiveFuturesSymbol(entry.pick.symbol)));
           const selectedCount = selectedTrades.length;
           const deferredCount = deferredTrades.length;
           const coverageSummary = `coverage=${results.length}/${shortlistLimit}/${symbolsToScan.length}`;
@@ -6163,6 +6198,16 @@ export default function App() {
       value: totalPnl,
     }));
   }, [pnlTimelinePoints, pnlTimelineScale]);
+  const yesterdayDelta = React.useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayPoint = pnlTimelinePoints.find((point) => point.timestamp === yesterday.getTime());
+    const todayPoint = pnlTimelinePoints.find((point) => point.timestamp === today.getTime());
+    if (!yesterdayPoint || !todayPoint) return null;
+    return todayPoint.value - yesterdayPoint.value;
+  }, [pnlTimelinePoints]);
   const pnlTimelineChart = React.useMemo(() => {
     if (visiblePnlTimelinePoints.length === 0) return null;
 
@@ -6370,15 +6415,16 @@ export default function App() {
         : 0;
       const closeSide: 'BUY' | 'SELL' = h.side === 'SHORT' ? 'BUY' : 'SELL';
       const displaySymbol = h.displaySymbol || (h.symbol.endsWith('USDT')
-        ? `${h.symbol.slice(0, -4)}/USDT:USDT`
+        ? `${h.symbol.slice(0, -4)}/USDT`
         : h.symbol.endsWith('USDC')
-          ? `${h.symbol.slice(0, -4)}/USDC:USDC`
+          ? `${h.symbol.slice(0, -4)}/USDC`
           : h.symbol);
 
       return {
         holding: h,
         index,
         displaySymbol,
+        rawSymbol: h.symbol,
         exchange: h.exchange || 'Binance',
         side: h.side,
         contracts,
@@ -6672,6 +6718,7 @@ export default function App() {
     const latestPickBySymbol = new Map(
       freshDisplayMarketPicks.map((pick) => [normalizeLiveFuturesSymbol(pick.symbol), pick]),
     );
+    const currentPickKeys = new Set(freshDisplayMarketPicks.map((pick) => normalizeLiveFuturesSymbol(pick.symbol)));
 
     const mergedEntries = new Map<string, { pick: MarketScanResult; foundAt: number }>();
     const pushEntry = (pick: MarketScanResult, foundAt: number) => {
@@ -6694,14 +6741,24 @@ export default function App() {
       });
 
       return Array.from(mergedEntries.values())
-        .sort((a, b) => compareTopSignalDisplayPriority(a.pick, b.pick))
+        .sort((a, b) => {
+          const aStale = marketPicks.length === 0 || !currentPickKeys.has(normalizeLiveFuturesSymbol(a.pick.symbol));
+          const bStale = marketPicks.length === 0 || !currentPickKeys.has(normalizeLiveFuturesSymbol(b.pick.symbol));
+          if (aStale !== bStale) return aStale ? 1 : -1;
+          return compareTopSignalDisplayPriority(a.pick, b.pick);
+        })
         .slice(0, visibleSignalTableLimit);
     }
     return freshPersistedRankedSignals
       .slice()
-      .sort((a, b) => compareTopSignalDisplayPriority(a.pick, b.pick))
+      .sort((a, b) => {
+        const aStale = marketPicks.length === 0 || !currentPickKeys.has(normalizeLiveFuturesSymbol(a.pick.symbol));
+        const bStale = marketPicks.length === 0 || !currentPickKeys.has(normalizeLiveFuturesSymbol(b.pick.symbol));
+        if (aStale !== bStale) return aStale ? 1 : -1;
+        return compareTopSignalDisplayPriority(a.pick, b.pick);
+      })
       .slice(0, visibleSignalTableLimit);
-  }, [freshDisplayMarketPicks, freshPersistedRankedSignals, scanSignalSummary.updatedAt]);
+  }, [freshDisplayMarketPicks, freshPersistedRankedSignals, scanSignalSummary.updatedAt, marketPicks]);
   const visibleSignalTablePicks = visibleSignalTableEntries.map((entry) => entry.pick);
   const usingPersistedRankedSignals = freshDisplayMarketPicks.length === 0 && freshPersistedRankedSignals.length > 0;
   const getPickEligibility = React.useCallback((pick: MarketScanResult) => {
@@ -6812,7 +6869,9 @@ export default function App() {
     const currentAutoTrade = autoTrade;
     const liveTradableSymbols = liveTradableSymbolsRef.current;
     const scanSourcePicks = marketPicks.length > 0 ? marketPicks : visibleSignalTablePicks;
+    const currentMarketPickKeys = new Set(marketPicks.map((pick) => normalizeLiveFuturesSymbol(pick.symbol)));
 
+    const scanSelectedSymbolSet = new Set(scanSelectedSymbols.map((symbol) => normalizeLiveFuturesSymbol(symbol)));
     const statuses = Object.fromEntries(
       visibleSignalTablePicks.map((pick) => [pick.symbol, getPickEligibility(pick)]),
     ) as Record<string, { label: string; detail: string; className: string }>;
@@ -6868,6 +6927,20 @@ export default function App() {
             label: 'BLOCKED',
             detail: 'Binance tradable metadata unavailable',
             className: 'bg-rose-100 text-rose-700',
+          };
+        }
+      });
+      return statuses;
+    }
+
+    if (isRealMode && !hasLiveExecutionControl()) {
+      visibleSignalTablePicks.forEach((pick) => {
+        const currentStatus = statuses[pick.symbol];
+        if (currentStatus?.label === 'READY' || currentStatus?.label === 'SELECTED') {
+          statuses[pick.symbol] = {
+            label: 'LOCKED',
+            detail: 'another tab owns live execution control',
+            className: 'bg-amber-100 text-amber-700',
           };
         }
       });
@@ -7002,7 +7075,8 @@ export default function App() {
         return;
       }
 
-      if (selectedEntries.has(selectionKey)) {
+      const isActuallySelected = selectedEntries.has(selectionKey) || scanSelectedSymbolSet.has(normalizeLiveFuturesSymbol(pick.symbol));
+      if (isActuallySelected) {
         statuses[pick.symbol] = {
           label: 'SELECTED',
           detail: 'queued for this scan cycle',
@@ -7028,6 +7102,20 @@ export default function App() {
       };
     });
 
+    visibleSignalTablePicks.forEach((pick) => {
+      const symbolKey = normalizeLiveFuturesSymbol(pick.symbol);
+      const isStalePick = marketPicks.length === 0 || !currentMarketPickKeys.has(symbolKey);
+      const currentStatus = statuses[pick.symbol];
+      if (!isStalePick || !currentStatus) return;
+      if (currentStatus.label === 'READY' || currentStatus.label === 'SELECTED') {
+        statuses[pick.symbol] = {
+          label: 'STALE',
+          detail: 'waiting for a fresh scan cycle',
+          className: 'bg-slate-100 text-slate-700',
+        };
+      }
+    });
+
     return statuses;
   }, [
     visibleSignalTablePicks,
@@ -7044,6 +7132,7 @@ export default function App() {
     liveEntriesPerCycle,
     autoEntryMinScore,
     availableFunds,
+    scanSelectedSymbols,
     liveMinOrderNotional,
     getBufferedLiveCapital,
     getDesiredLiveEntryNotional,
@@ -8098,18 +8187,18 @@ export default function App() {
                       <div className="flex items-center justify-between gap-2">
                         <div className="flex items-center gap-2">
                           <span className="font-black text-[11px] text-indigo-950">{entry.symbol}</span>
-                          <span className={`rounded-sm px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wide ${entry.lifecycle.className}`}>
+                          <span className={`rounded-sm px-2 py-1 text-[10px] sm:text-[11px] font-black uppercase tracking-wide ${entry.lifecycle.className}`}>
                             {entry.lifecycle.label}
                           </span>
-                          <span className={`rounded-sm px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wide ${entry.eligibility.className}`}>
+                          <span className={`rounded-sm px-2 py-1 text-[10px] sm:text-[11px] font-black uppercase tracking-wide ${entry.eligibility.className}`}>
                             {entry.eligibility.label}
                           </span>
                         </div>
-                        <span className="text-[9px] text-indigo-900/70">
+                        <span className="text-[10px] sm:text-[11px] text-indigo-900/70">
                           {entry.signal} | {formatSignalAge(entry.foundAt)}
                         </span>
                       </div>
-                      <div className="mt-1 text-[9px] normal-case tracking-normal text-indigo-950/80">
+                      <div className="mt-1 text-[11px] sm:text-[12px] normal-case tracking-normal text-indigo-950/85 font-semibold">
                         {entry.reason}
                       </div>
                     </div>
@@ -8154,13 +8243,19 @@ export default function App() {
                         : pick.signal.overall === 'BUY'
                           ? (isBlocked ? 'Force Long' : 'Long')
                           : 'Hold';
+                      const isStaleRow = eligibility.label === 'STALE';
                   return (
                   <div key={pick.symbol} className="grid grid-cols-6 items-center group py-1.5 hover:bg-gray-50/50 px-2 border-b border-gray-50 transition-colors">
                     <button 
                       onClick={() => setSymbol(pick.symbol)}
                       className="flex flex-col items-start text-left text-[13px] font-black hover:text-[#F27D26] transition-colors"
                     >
-                      <span>{pick.symbol.replace('USDT', '')}</span>
+                      <span className="flex items-center gap-1">
+                        {pick.symbol.replace('USDT', '')}
+                        {isStaleRow && (
+                          <span title="Stale scan result" className="text-[10px] opacity-50" aria-label="stale signal">⏳</span>
+                        )}
+                      </span>
                       <span className={`mt-1 rounded-sm px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide ${lifecycle.className}`}>
                         {lifecycle.label}
                       </span>
@@ -8223,10 +8318,10 @@ export default function App() {
 
                     <div className="flex justify-center px-2">
                       <div className="flex max-w-[150px] flex-col items-center gap-1 text-center leading-tight">
-                        <span className={`rounded-sm px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wide ${eligibility.className}`}>
+                        <span className={`rounded-sm px-2 py-1 text-[10px] sm:text-[11px] font-black uppercase tracking-wide ${eligibility.className}`}>
                           {eligibility.label}
                         </span>
-                        <span className="text-[8px] font-mono normal-case opacity-60">
+                        <span className="text-[10px] sm:text-[11px] font-mono normal-case opacity-75 break-words max-w-[160px]">
                           {eligibility.detail}
                         </span>
                       </div>
@@ -8984,6 +9079,11 @@ export default function App() {
                     <span>Scroll horizontally to inspect older days</span>
                     <span>{pnlTimelineChart.endLabel}</span>
                   </div>
+                  <div className="mt-1 text-[9px] text-[#141414]/70">
+                    {yesterdayDelta !== null
+                      ? `Yesterday delta: ${yesterdayDelta >= 0 ? '+' : '-'}$${Math.abs(yesterdayDelta).toFixed(2)}`
+                      : 'No yesterday PnL data available'}
+                  </div>
                   <div className="mt-2 flex items-center justify-between font-mono text-[10px] font-bold">
                     <span className={pnlTimelineChart.minValue < 0 ? 'text-rose-600' : 'text-[#141414]/60'}>{pnlTimelineChart.minValue >= 0 ? '+' : '-'}${Math.abs(pnlTimelineChart.minValue).toFixed(2)}</span>
                     <span className={totalPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}>{totalPnl >= 0 ? '+' : '-'}${Math.abs(totalPnl).toFixed(2)} now</span>
@@ -9146,14 +9246,15 @@ export default function App() {
                   ) : (
                     sortedActivePositionRows.map((row) => {
                       const h = row.holding;
-                      const { mark, contracts, stopPrice, margin, notional, unrealizedPnl: pnlVal, pnlPct: pnlPctVal, closeSide, displaySymbol, riskGuardText, recentAdverseMovePct } = row;
+                      const { mark, contracts, stopPrice, margin, notional, unrealizedPnl: pnlVal, pnlPct: pnlPctVal, closeSide, displaySymbol, rawSymbol, riskGuardText, recentAdverseMovePct } = row;
                       return (
                         <tr key={h.id} className="hover:bg-gray-50/50 transition-colors group cursor-pointer" onClick={() => setSymbol(h.symbol)}>
                           <td className="px-1 py-1.5">
                               <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-sm ${h.side === 'SHORT' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{h.side === 'SHORT' ? '↓' : '↑'}</span>
                           </td>
                         <td className="px-1 py-1.5 font-mono text-[10px] font-black uppercase tracking-tight">
-                          {displaySymbol}
+                          <div>{displaySymbol}</div>
+                          <div className="text-[8px] font-normal uppercase opacity-60">{rawSymbol}</div>
                         </td>
                           <td className="px-1 py-1.5 font-mono text-[10px] opacity-60">
                           {contracts < 1 ? contracts.toFixed(8) : contracts.toFixed(4)}
