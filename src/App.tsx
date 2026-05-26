@@ -272,11 +272,11 @@ const compareTopSignalDisplayPriority = (
   a: Pick<MarketScanResult, 'priorityRank' | 'signal'>,
   b: Pick<MarketScanResult, 'priorityRank' | 'signal'>,
 ) => {
-  const bucketDelta = getTopSignalDisplayBucket(a.signal.overall) - getTopSignalDisplayBucket(b.signal.overall);
-  if (bucketDelta !== 0) return bucketDelta;
-
   const priorityRankDelta = (b.priorityRank || 0) - (a.priorityRank || 0);
   if (priorityRankDelta !== 0) return priorityRankDelta;
+
+  const bucketDelta = getTopSignalDisplayBucket(a.signal.overall) - getTopSignalDisplayBucket(b.signal.overall);
+  if (bucketDelta !== 0) return bucketDelta;
 
   const aDirectionalScore = a.signal.overall === 'SELL'
     ? 10 - (a.signal.score || 0)
@@ -4175,6 +4175,7 @@ export default function App() {
   const [filteredSyncSymbols, setFilteredSyncSymbols] = useState<Array<{ symbol: string; reason: string }>>([]);
   const [scanDataSource, setScanDataSource] = useState(() => localStorage.getItem('te_scan_data_source') || 'BINANCE PUBLIC');
   const [scanUniverseCounts, setScanUniverseCounts] = useState(() => readStoredJson('te_scan_universe_counts', DEFAULT_SCAN_UNIVERSE_COUNTS));
+  const [scanSelectedSymbols, setScanSelectedSymbols] = useState<string[]>([]);
   const [selectedRejectReason, setSelectedRejectReason] = useState<string | null>(null);
 
   React.useEffect(() => {
@@ -4835,6 +4836,7 @@ export default function App() {
     scanningRef.current = true;
     setScanning(true);
     setIsBotActive(true);
+    setScanSelectedSymbols([]);
     try {
       setScanProgress({ current: 0, total: 0 });
       let allSymbols: { label: string; value: string }[];
@@ -5547,6 +5549,7 @@ export default function App() {
             queuedNotional += incrementalNotional;
           });
 
+          setScanSelectedSymbols(selectedTrades.map((entry) => normalizeLiveFuturesSymbol(entry.pick.symbol)));
           const selectedCount = selectedTrades.length;
           const deferredCount = deferredTrades.length;
           const coverageSummary = `coverage=${results.length}/${shortlistLimit}/${symbolsToScan.length}`;
@@ -6698,6 +6701,7 @@ export default function App() {
     const latestPickBySymbol = new Map(
       freshDisplayMarketPicks.map((pick) => [normalizeLiveFuturesSymbol(pick.symbol), pick]),
     );
+    const currentPickKeys = new Set(freshDisplayMarketPicks.map((pick) => normalizeLiveFuturesSymbol(pick.symbol)));
 
     const mergedEntries = new Map<string, { pick: MarketScanResult; foundAt: number }>();
     const pushEntry = (pick: MarketScanResult, foundAt: number) => {
@@ -6720,14 +6724,24 @@ export default function App() {
       });
 
       return Array.from(mergedEntries.values())
-        .sort((a, b) => compareTopSignalDisplayPriority(a.pick, b.pick))
+        .sort((a, b) => {
+          const aStale = marketPicks.length === 0 || !currentPickKeys.has(normalizeLiveFuturesSymbol(a.pick.symbol));
+          const bStale = marketPicks.length === 0 || !currentPickKeys.has(normalizeLiveFuturesSymbol(b.pick.symbol));
+          if (aStale !== bStale) return aStale ? 1 : -1;
+          return compareTopSignalDisplayPriority(a.pick, b.pick);
+        })
         .slice(0, visibleSignalTableLimit);
     }
     return freshPersistedRankedSignals
       .slice()
-      .sort((a, b) => compareTopSignalDisplayPriority(a.pick, b.pick))
+      .sort((a, b) => {
+        const aStale = marketPicks.length === 0 || !currentPickKeys.has(normalizeLiveFuturesSymbol(a.pick.symbol));
+        const bStale = marketPicks.length === 0 || !currentPickKeys.has(normalizeLiveFuturesSymbol(b.pick.symbol));
+        if (aStale !== bStale) return aStale ? 1 : -1;
+        return compareTopSignalDisplayPriority(a.pick, b.pick);
+      })
       .slice(0, visibleSignalTableLimit);
-  }, [freshDisplayMarketPicks, freshPersistedRankedSignals, scanSignalSummary.updatedAt]);
+  }, [freshDisplayMarketPicks, freshPersistedRankedSignals, scanSignalSummary.updatedAt, marketPicks]);
   const visibleSignalTablePicks = visibleSignalTableEntries.map((entry) => entry.pick);
   const usingPersistedRankedSignals = freshDisplayMarketPicks.length === 0 && freshPersistedRankedSignals.length > 0;
   const getPickEligibility = React.useCallback((pick: MarketScanResult) => {
@@ -6838,7 +6852,9 @@ export default function App() {
     const currentAutoTrade = autoTrade;
     const liveTradableSymbols = liveTradableSymbolsRef.current;
     const scanSourcePicks = marketPicks.length > 0 ? marketPicks : visibleSignalTablePicks;
+    const currentMarketPickKeys = new Set(marketPicks.map((pick) => normalizeLiveFuturesSymbol(pick.symbol)));
 
+    const scanSelectedSymbolSet = new Set(scanSelectedSymbols.map((symbol) => normalizeLiveFuturesSymbol(symbol)));
     const statuses = Object.fromEntries(
       visibleSignalTablePicks.map((pick) => [pick.symbol, getPickEligibility(pick)]),
     ) as Record<string, { label: string; detail: string; className: string }>;
@@ -7028,7 +7044,8 @@ export default function App() {
         return;
       }
 
-      if (selectedEntries.has(selectionKey)) {
+      const isActuallySelected = selectedEntries.has(selectionKey) || scanSelectedSymbolSet.has(normalizeLiveFuturesSymbol(pick.symbol));
+      if (isActuallySelected) {
         statuses[pick.symbol] = {
           label: 'SELECTED',
           detail: 'queued for this scan cycle',
@@ -7043,6 +7060,20 @@ export default function App() {
           label: 'DEFERRED',
           detail: deferredReason,
           className: 'bg-amber-100 text-amber-700',
+        };
+      }
+    });
+
+    visibleSignalTablePicks.forEach((pick) => {
+      const symbolKey = normalizeLiveFuturesSymbol(pick.symbol);
+      const isStalePick = marketPicks.length === 0 || !currentMarketPickKeys.has(symbolKey);
+      const currentStatus = statuses[pick.symbol];
+      if (!isStalePick || !currentStatus) return;
+      if (currentStatus.label === 'READY' || currentStatus.label === 'SELECTED') {
+        statuses[pick.symbol] = {
+          label: 'STALE',
+          detail: 'waiting for a fresh scan cycle',
+          className: 'bg-slate-100 text-slate-700',
         };
       }
     });
@@ -7063,6 +7094,7 @@ export default function App() {
     liveEntriesPerCycle,
     autoEntryMinScore,
     availableFunds,
+    scanSelectedSymbols,
     liveMinOrderNotional,
     getBufferedLiveCapital,
     getDesiredLiveEntryNotional,
@@ -8173,13 +8205,19 @@ export default function App() {
                         : pick.signal.overall === 'BUY'
                           ? (isBlocked ? 'Force Long' : 'Long')
                           : 'Hold';
+                      const isStaleRow = eligibility.label === 'STALE';
                   return (
                   <div key={pick.symbol} className="grid grid-cols-6 items-center group py-1.5 hover:bg-gray-50/50 px-2 border-b border-gray-50 transition-colors">
                     <button 
                       onClick={() => setSymbol(pick.symbol)}
                       className="flex flex-col items-start text-left text-[13px] font-black hover:text-[#F27D26] transition-colors"
                     >
-                      <span>{pick.symbol.replace('USDT', '')}</span>
+                      <span className="flex items-center gap-1">
+                        {pick.symbol.replace('USDT', '')}
+                        {isStaleRow && (
+                          <span title="Stale scan result" className="text-[10px] opacity-50" aria-label="stale signal">⏳</span>
+                        )}
+                      </span>
                       <span className={`mt-1 rounded-sm px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide ${lifecycle.className}`}>
                         {lifecycle.label}
                       </span>
