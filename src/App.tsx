@@ -182,7 +182,7 @@ const PARAMETER_DEFAULTS = {
   lowMarginLockMinutes: 15,
   closeFailureLockMinutes: 30,
   hardFailureLockMinutes: 120,
-  fullUniverseMode: false,
+  fullUniverseMode: true,
 } as const;
 
 const PROFITABLE_LIVE_RUNTIME_GATES = {
@@ -734,7 +734,8 @@ export default function App() {
     return localStorage.getItem('te_show_extra_criteria') === '1';
   });
   const [fullUniverseMode, setFullUniverseMode] = useState(() => {
-    return localStorage.getItem('te_scan_full_universe_mode') === '1';
+    const saved = localStorage.getItem('te_scan_full_universe_mode');
+    return saved === '1' ? true : saved === '0' ? false : true;
   });
   const [strategyConfig, setStrategyConfig] = useState<StrategyConfig>(() => {
     const saved = localStorage.getItem('te_strategy_config');
