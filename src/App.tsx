@@ -4094,17 +4094,7 @@ export default function App() {
     return () => clearInterval(timer);
   }, [isRealMode, loadLiveAccountAudit]);
 
-  const shouldMaintainLiveAccountSync = isRealMode || (
-    lastExchangeSyncSnapshot.updatedAt > 0
-    && holdings.length > 0
-    && holdings.some((holding) => (
-      Boolean(holding.exchange)
-      || (Number.isFinite(Number(holding.markPrice)) && Number(holding.markPrice) > 0)
-      || (Number.isFinite(Number(holding.initialMargin)) && Number(holding.initialMargin) > 0)
-      || (Number.isFinite(Number(holding.notional)) && Math.abs(Number(holding.notional)) > 0)
-      || Number.isFinite(Number(holding.unrealizedPnl))
-    ))
-  );
+  const shouldMaintainLiveAccountSync = isRealMode;
 
   useEffect(() => {
     if (!shouldMaintainLiveAccountSync) return;
@@ -5377,6 +5367,33 @@ export default function App() {
         deferredSignals: 0,
         topDeferred: [],
       });
+
+      if (signalCounts.BUY === 0 && signalCounts.SELL === 0) {
+        const topBlockedReasons = Object.entries(blockedSignals.reduce<Record<string, number>>((acc, entry) => {
+          acc[entry.reason] = (acc[entry.reason] || 0) + 1;
+          return acc;
+        }, {}))
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3)
+          .map(([reason, count]) => `${count} ${reason}`)
+          .join(' | ');
+
+        const topPreFilterReasons = Object.entries(combinedPreScanExcluded.reduce<Record<string, number>>((acc, entry) => {
+          acc[entry.reason] = (acc[entry.reason] || 0) + 1;
+          return acc;
+        }, {}))
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3)
+          .map(([reason, count]) => `${count} ${reason}`)
+          .join(' | ');
+
+        if (topBlockedReasons) {
+          addLog(`SCAN DIAGNOSIS: no entry signals; blocked reasons: ${topBlockedReasons}`, 'warning');
+        }
+        if (topPreFilterReasons) {
+          addLog(`SCAN DIAGNOSIS: pre-scan exclusions: ${topPreFilterReasons}`, 'warning');
+        }
+      }
 
       if (currentAutoTrade && !currentExecutionEnabled) {
         pushScanSkipEvent('SKIP: Another tab owns live execution control; this tab remains read-only.', cycleId);
