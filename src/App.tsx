@@ -1193,6 +1193,15 @@ export default function App() {
       updatedAt?: number,
     }
   } | null>(null);
+  const [serverBotAvailable, setServerBotAvailable] = useState(false);
+  const [serverBotStatus, setServerBotStatus] = useState<{
+    enabled: boolean;
+    lastRunAt: number | null;
+    nextRunAt: number | null;
+    lastMessage: string;
+    lastError: string | null;
+    cycleCount: number;
+  } | null>(null);
   const [isBotActive, setIsBotActive] = useState(false);
   const [scanExecutionStats, setScanExecutionStats] = useState({ cycleId: 0, attempted: 0, filled: 0, failed: 0, skipped: 0 });
   const [scanExecutionTotals, setScanExecutionTotals] = useState({ attempted: 0, filled: 0, failed: 0, skipped: 0 });
@@ -1202,6 +1211,7 @@ export default function App() {
   const [controllerTabAttentionUntil, setControllerTabAttentionUntil] = useState(0);
   const [entryLockUntil, setEntryLockUntil] = useState(0);
   const [entryLockReason, setEntryLockReason] = useState<string | null>(null);
+  const [serverBotLastMessage, setServerBotLastMessage] = useState('');
   const lastRateLimitWarnAtRef = React.useRef(0);
   const dismissedSyncErrorRef = React.useRef<{ message: string; until: number } | null>(null);
 
@@ -1212,6 +1222,72 @@ export default function App() {
     setEntryLockUntil(0);
     setEntryLockReason(null);
   }, [entryLockReason, entryLockUntil]);
+
+  const refreshServerBotStatus = React.useCallback(async () => {
+    try {
+      const response = await fetch('/api/bot/status');
+      if (!response.ok) {
+        throw new Error('bot status unavailable');
+      }
+      const payload = await response.json();
+      const bot = payload?.bot;
+      if (bot && typeof bot.enabled === 'boolean') {
+        setServerBotAvailable(true);
+        setServerBotStatus(bot);
+        setServerBotLastMessage(bot.lastMessage || '');
+        if (bot.enabled) {
+          autoTradeRef.current = true;
+          setAutoTrade(true);
+        }
+      } else {
+        setServerBotAvailable(false);
+        setServerBotStatus(null);
+      }
+    } catch {
+      setServerBotAvailable(false);
+      setServerBotStatus(null);
+    }
+  }, []);
+
+  const activateServerBot = React.useCallback(async () => {
+    try {
+      const response = await fetch('/api/bot/start', { method: 'POST' });
+      if (!response.ok) throw new Error('failed to start server bot');
+      const payload = await response.json();
+      const bot = payload?.bot;
+      if (bot && typeof bot.enabled === 'boolean') {
+        setServerBotAvailable(true);
+        setServerBotStatus(bot);
+        setServerBotLastMessage(bot.lastMessage || '');
+        autoTradeRef.current = bot.enabled;
+        setAutoTrade(bot.enabled);
+        return true;
+      }
+    } catch (error: any) {
+      addLog(`SERVER BOT START FAILED: ${String(error?.message || error)}`, 'warning');
+    }
+    return false;
+  }, [addLog]);
+
+  const deactivateServerBot = React.useCallback(async () => {
+    try {
+      const response = await fetch('/api/bot/stop', { method: 'POST' });
+      if (!response.ok) throw new Error('failed to stop server bot');
+      const payload = await response.json();
+      const bot = payload?.bot;
+      if (bot && typeof bot.enabled === 'boolean') {
+        setServerBotAvailable(true);
+        setServerBotStatus(bot);
+        setServerBotLastMessage(bot.lastMessage || '');
+        autoTradeRef.current = bot.enabled;
+        setAutoTrade(bot.enabled);
+        return true;
+      }
+    } catch (error: any) {
+      addLog(`SERVER BOT STOP FAILED: ${String(error?.message || error)}`, 'warning');
+    }
+    return false;
+  }, [addLog]);
 
   // Auto-dismiss toast after 8s for warnings/errors, 4s for success/info
   React.useEffect(() => {
@@ -3886,7 +3962,17 @@ export default function App() {
   }, [checkServer]);
 
   useEffect(() => {
-    const handleOffline = () => setServerStatus('ERROR');
+    void refreshServerBotStatus();
+    const poll = setInterval(() => {
+      void refreshServerBotStatus();
+    }, 15000);
+    return () => clearInterval(poll);
+  }, [refreshServerBotStatus]);
+
+  useEffect(() => {
+    const handleOffline = () => {
+      addLog('Browser offline detected; preserving current live state until reconnect.', 'warning');
+    };
     const handleOnline = () => {
       void checkServer();
       if (isRealMode && holdings.length > 0) {
@@ -3900,7 +3986,7 @@ export default function App() {
       window.removeEventListener('offline', handleOffline);
       window.removeEventListener('online', handleOnline);
     };
-  }, [checkServer, holdings.length, isRealMode]);
+  }, [addLog, checkServer, holdings.length, isRealMode]);
 
   useEffect(() => {
     if (!isRealMode || holdings.length === 0 || serverStatus !== 'ERROR') return;
@@ -5825,7 +5911,7 @@ export default function App() {
     };
 
     loadData();
-    if (autoTradeRef.current) {
+    if (autoTradeRef.current && !serverBotStatus?.enabled) {
       if (skipNextImmediateAutoScanRef.current) {
         skipNextImmediateAutoScanRef.current = false;
       } else {
@@ -5838,7 +5924,7 @@ export default function App() {
 
     const refreshInterval = setInterval(() => {
       loadData(true);
-      if (autoTradeRef.current) {
+      if (autoTradeRef.current && !serverBotStatus?.enabled) {
         void performScanRef.current();
         setNextScanSec(scanIntervalSec);
       } else {
@@ -5864,7 +5950,7 @@ export default function App() {
       clearInterval(refreshInterval);
       clearInterval(countdownInterval);
     };
-  }, [autoTrade, symbol, isRealMode, serverConfig?.exchange, serverStatus, scanIntervalSec]);
+  }, [autoTrade, symbol, isRealMode, serverConfig?.exchange, serverStatus, scanIntervalSec, serverBotStatus?.enabled]);
 
   // Dedicated Portfolio Price Watcher (WebSocket first, polling fallback inside subscribeToTicker)
   useEffect(() => {
@@ -7525,7 +7611,8 @@ export default function App() {
                   <span className="text-[11px] font-black uppercase tracking-tighter opacity-60">Autonomous</span>
                 </div>
                 <button 
-                  onClick={() => {
+                  onClick={async () => {
+                    const serverBotEnabled = serverBotAvailable && isRealMode;
                     if (isRealMode && isControlledByAnotherTab) {
                       const message = 'AUTONOMOUS CONTROL LOCKED: another open tab owns live control. This tab is read-only.';
                       setExecutionFeedback({ type: 'warning', message });
@@ -7550,6 +7637,20 @@ export default function App() {
                     }
 
                     const newState = !autoTrade;
+                    if (serverBotEnabled) {
+                      if (newState) {
+                        const started = await activateServerBot();
+                        if (!started) return;
+                        claimLiveControl();
+                      } else {
+                        await deactivateServerBot();
+                        releaseLiveControl();
+                      }
+                      localStorage.setItem('te_auto_trade', newState ? 'true' : 'false');
+                      addLog(`SYSTEM UPDATE: Autonomous Server Bot ${newState ? 'ENGAGED' : 'SUSPENDED'}`, newState ? 'success' : 'warning');
+                      return;
+                    }
+
                     if (newState && isRealMode) {
                       claimLiveControl();
                     }

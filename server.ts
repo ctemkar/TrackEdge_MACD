@@ -6,6 +6,7 @@ import * as ccxt from 'ccxt';
 import dotenv from 'dotenv';
 import cors from 'cors';
 import crypto from 'crypto';
+import { createAutonomousTradingBot } from './server-bot.ts';
 
 dotenv.config();
 
@@ -289,6 +290,30 @@ async function startServer() {
 
   app.use(cors());
   app.use(express.json());
+
+  const serverBot = createAutonomousTradingBot({
+    baseUrl: `http://127.0.0.1:${PORT}`,
+    liveFuturesQuoteAllowlist: liveFuturesQuoteAllowlist,
+    scanIntervalSec: Number(process.env.SERVER_BOT_SCAN_INTERVAL_SEC || '40'),
+    orderNotionalUsd: Number(process.env.SERVER_BOT_ORDER_NOTIONAL_USD || '50'),
+    minSignalScore: Number(process.env.SERVER_BOT_MIN_SIGNAL_SCORE || '6'),
+    maxScanSymbols: Number(process.env.SERVER_BOT_MAX_SCAN_SYMBOLS || '32'),
+  });
+
+  app.get('/api/bot/status', (_req, res) => {
+    res.json({ status: 'success', bot: serverBot.getStatus() });
+  });
+
+  app.post('/api/bot/start', (_req, res) => {
+    serverBot.start();
+    res.json({ status: 'success', bot: serverBot.getStatus() });
+  });
+
+  app.post('/api/bot/stop', (_req, res) => {
+    serverBot.stop();
+    res.json({ status: 'success', bot: serverBot.getStatus() });
+  });
+
   app.use((req, res, next) => {
     res.on('finish', () => {
       if (res.statusCode >= 500) {
@@ -3375,6 +3400,10 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[TradeEdge] Server active on http://0.0.0.0:${PORT}`);
+    if (String(process.env.SERVER_BOT_AUTO_START || 'false').toLowerCase() === 'true') {
+      serverBot.start();
+      console.log('[TradeEdge] Autonomous server bot auto-started.');
+    }
   });
 }
 

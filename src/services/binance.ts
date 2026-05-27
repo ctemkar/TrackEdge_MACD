@@ -352,9 +352,7 @@ export function subscribeToTicker(
       fallbackToPolling();
     };
     ws.onclose = () => {
-      if (!socketOpened) {
-        fallbackToPolling();
-      }
+      fallbackToPolling();
     };
     return () => {
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
