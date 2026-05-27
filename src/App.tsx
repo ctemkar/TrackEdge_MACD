@@ -3617,6 +3617,17 @@ export default function App() {
     const histogramExpanding = holding.side === 'LONG'
       ? signal?.confluence.macdHistogram === 'BULLISH_ACCELERATION'
       : signal?.confluence.macdHistogram === 'BEARISH_ACCELERATION';
+    const macdExitSignal = signal?.exitSignal;
+    const macdExitReason = macdExitSignal === 'EXIT_LONG' && holding.side === 'LONG'
+      ? 'AUTO_EXIT: MACD EXIT LONG'
+      : macdExitSignal === 'EXIT_SHORT' && holding.side === 'SHORT'
+        ? 'AUTO_EXIT: MACD EXIT SHORT'
+        : null;
+
+    if (macdExitReason) {
+      executeTrade(closeSide, holding.symbol, price, macdExitReason, holding.id, cycleId, undefined, holding.amount);
+      return;
+    }
 
     setHoldings(prev => {
       let didChange = false;
@@ -6131,8 +6142,8 @@ export default function App() {
       return sum + trade.pnl;
     }, 0);
   }, [tradeHistory]);
-  const totalPnl = useExchangeAccountMetrics ? (trackedRealizedPnl + openPnl) : basisDelta;
-  const realizedPnl = useExchangeAccountMetrics ? trackedRealizedPnl : (totalPnl - openPnl);
+  const totalPnl = trackedRealizedPnl + openPnl;
+  const realizedPnl = trackedRealizedPnl;
   const pnlTimelinePoints = React.useMemo(() => {
     const closedTrades = [...tradeHistory]
       .filter((trade) => {
