@@ -30,6 +30,30 @@ async function startServer() {
   };
   const nonTradableQuoteBases = new Set(['USDT', 'USDC', 'BUSD', 'TUSD', 'USDP', 'FDUSD']);
 
+  const envDebug = {
+    cwd: process.cwd(),
+    nodeEnv: process.env.NODE_ENV || 'undefined',
+    exchangeEnv: process.env.EXCHANGE || 'undefined',
+    enableRealTrading: process.env.ENABLE_REAL_TRADING || 'false',
+    binanceKeys: {
+      BINANCE_KEY: !!process.env.BINANCE_KEY,
+      BINANCE_SECRET: !!process.env.BINANCE_SECRET,
+      BINANCE_API_KEY: !!process.env.BINANCE_API_KEY,
+      BINANCE_API_SECRET: !!process.env.BINANCE_API_SECRET,
+      BINANCE_LIVE_API_KEY: !!process.env.BINANCE_LIVE_API_KEY,
+      BINANCE_LIVE_API_SECRET: !!process.env.BINANCE_LIVE_API_SECRET,
+    },
+    geminiKeys: {
+      GEMINI_KEY: !!process.env.GEMINI_KEY,
+      GEMINI_SECRET: !!process.env.GEMINI_SECRET,
+      GEMINI_API_KEY: !!process.env.GEMINI_API_KEY,
+      GEMINI_API_SECRET: !!process.env.GEMINI_API_SECRET,
+      GEMINI_LIVE_API_KEY: !!process.env.GEMINI_LIVE_API_KEY,
+      GEMINI_LIVE_API_SECRET: !!process.env.GEMINI_LIVE_API_SECRET,
+    },
+  };
+  console.log('[TradeEdge] ENV DEBUG:', JSON.stringify(envDebug, null, 2));
+
   const publicRateLimitState = {
     bannedUntil: 0,
     backoffUntil: 0,
@@ -950,9 +974,44 @@ async function startServer() {
       privateBlockedUntil: privateBlockedUntil > now ? privateBlockedUntil : 0,
       config: {
         realTradingEnabled: process.env.ENABLE_REAL_TRADING === 'true',
-        hasKeys: !!(hasBinanceKeys || hasGeminiKeys)
+        hasKeys: !!(hasBinanceKeys || hasGeminiKeys),
+        debug: {
+          hasBinanceKeys,
+          hasGeminiKeys,
+          preferredBinanceSource: getPreferredBinanceCredentials().source,
+          exchangeEnv: process.env.EXCHANGE || null,
+        }
       }
     });
+  });
+
+  app.get('/api/debug', async (req, res) => {
+    const hasBinanceKeys = Boolean(
+      (process.env.BINANCE_LIVE_API_KEY && process.env.BINANCE_LIVE_API_SECRET) ||
+      (process.env.BINANCE_API_KEY && process.env.BINANCE_API_SECRET) ||
+      (process.env.BINANCE_KEY && process.env.BINANCE_SECRET)
+    );
+    const hasGeminiKeys = Boolean(
+      (process.env.GEMINI_LIVE_API_KEY && process.env.GEMINI_LIVE_API_SECRET) ||
+      (process.env.GEMINI_API_KEY && process.env.GEMINI_API_SECRET) ||
+      (process.env.GEMINI_KEY && process.env.GEMINI_SECRET)
+    );
+    const debugPayload = {
+      envDebug,
+      exchangeStatus: {
+        hasBinanceKeys,
+        hasGeminiKeys,
+        preferredBinanceSource: getPreferredBinanceCredentials().source,
+        exchangeEnv: process.env.EXCHANGE || null,
+        enableRealTrading: process.env.ENABLE_REAL_TRADING === 'true',
+      },
+      runtime: {
+        cwd: process.cwd(),
+        nodeVersion: process.version,
+        pm2Env: process.env.pm_id || null,
+      }
+    };
+    res.json({ status: 'ok', debug: debugPayload });
   });
 
   app.post('/api/binance/transfer', async (req, res) => {
