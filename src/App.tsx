@@ -164,7 +164,7 @@ const PARAMETER_DEFAULTS = {
   estimatedRoundTripFrictionBps: 18,
   symbolDailyLossLimit: 10,
   symbolDailyFlipLimit: 12,
-  accountDailyLossLimit: 25,
+  accountDailyLossLimit: 75,
   marginStopLossPct: DEFAULT_MARGIN_STOP_LOSS_PCT,
   fastAdverseMoveExitPct: DEFAULT_FAST_ADVERSE_MOVE_EXIT_PCT,
   liveQuoteAllowlistInput: DEFAULT_LIVE_QUOTE_ALLOWLIST_INPUT,
