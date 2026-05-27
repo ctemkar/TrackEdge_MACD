@@ -7,6 +7,15 @@ cd "$REPO_ROOT"
 echo "Stopping existing trackedg process if present..."
 pm2 delete trackedg 2>/dev/null || true
 
+echo "Killing any process listening on port 3000..."
+if command -v lsof >/dev/null 2>&1; then
+  lsof -ti tcp:3000 | xargs -r kill -9 || true
+fi
+
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k 3000/tcp 2>/dev/null || true
+fi
+
 echo "Installing dependencies..."
 npm install
 
