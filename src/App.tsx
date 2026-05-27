@@ -1181,6 +1181,7 @@ export default function App() {
   const [cooldowns, setCooldowns] = useState<Record<string, number>>({});
   const [isSyncing, setIsSyncing] = useState(false);
   const [serverStatus, setServerStatus] = useState<'IDLE' | 'OK' | 'ERROR'>('IDLE');
+  const [browserOnline, setBrowserOnline] = useState<boolean>(typeof navigator !== 'undefined' ? navigator.onLine : true);
   const [serverConfig, setServerConfig] = useState<{ 
     realTradingEnabled: boolean, 
     hasKeys: boolean, 
@@ -3971,9 +3972,11 @@ export default function App() {
 
   useEffect(() => {
     const handleOffline = () => {
+      setBrowserOnline(false);
       addLog('Browser offline detected; preserving current live state until reconnect.', 'warning');
     };
     const handleOnline = () => {
+      setBrowserOnline(true);
       void checkServer();
       if (isRealMode && holdings.length > 0) {
         void syncRealBalanceRef.current();
@@ -9767,6 +9770,7 @@ export default function App() {
         <span>© 2026 TradeEdge Laboratory // Enterprise Core</span>
         <div className="flex items-center gap-4">
           <span>BACKEND: {serverStatus}</span>
+        <span>BROWSER: {browserOnline ? 'ONLINE' : 'OFFLINE'}</span>
           <span>Secure Ingress // Latency 14ms</span>
         </div>
       </footer>
