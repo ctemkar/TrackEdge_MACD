@@ -2399,9 +2399,10 @@ export default function App() {
           message = `BINANCE RATE LIMITED: IP temporarily banned by Binance. Retry at ${retryTime}. (Too many API requests were made recently.)`;
         } else if (isAuthFailedStatus || isAuthError) {
           setPrivateSyncBlockedUntil(0);
+          const authReason = errorData.message || message;
           message = authRetryAt
-            ? `Live futures auth degraded until ${authRetryAt}. Live mode stays on, but exchange sync and new entries are paused.`
-            : `Live futures auth degraded until ${(new Date(authBlockedUntil || Date.now() + 60000)).toLocaleTimeString()}. Live mode stays on, but exchange sync and new entries are paused.`;
+            ? `Live futures auth degraded until ${authRetryAt}. Reason: ${authReason}. Live mode stays on, but exchange sync and new entries are paused.`
+            : `Live futures auth degraded until ${(new Date(authBlockedUntil || Date.now() + 60000)).toLocaleTimeString()}. Reason: ${authReason}. Live mode stays on, but exchange sync and new entries are paused.`;
           setAuthDegradedMessage(message);
           if (hasAuthBlock) {
             entryLockUntilRef.current = Math.max(entryLockUntilRef.current, authBlockedUntil);
