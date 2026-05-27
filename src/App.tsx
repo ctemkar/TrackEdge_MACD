@@ -1224,6 +1224,38 @@ export default function App() {
     setEntryLockReason(null);
   }, [entryLockReason, entryLockUntil]);
 
+  // --- CORE SYSTEM FUNCTIONS (ORDER CRITICAL) ---
+  const addLog = React.useCallback((message: string, type: 'info' | 'success' | 'warning' = 'info') => {
+    const normalized = message.startsWith('SYNC SUCCESS:')
+      ? 'SYNC SUCCESS'
+      : message.startsWith('INITIATING EXCHANGE HANDSHAKE')
+        ? 'INITIATING EXCHANGE HANDSHAKE'
+        : message;
+    const groupKey = `${type}:${normalized}`;
+
+    setSystemLogs(prev => {
+      const now = new Date().toLocaleTimeString();
+      if (prev.length > 0 && prev[0].groupKey === groupKey) {
+        const updatedTop: SystemLogEntry = {
+          ...prev[0],
+          time: now,
+          message,
+          repeatCount: prev[0].repeatCount + 1,
+        };
+        return [updatedTop, ...prev.slice(1)].slice(0, 30);
+      }
+
+      const nextEntry: SystemLogEntry = {
+        time: now,
+        message,
+        type,
+        groupKey,
+        repeatCount: 1,
+      };
+      return [nextEntry, ...prev].slice(0, 30);
+    });
+  }, []);
+
   const refreshServerBotStatus = React.useCallback(async () => {
     try {
       const response = await fetch('/api/bot/status');
@@ -1854,38 +1886,6 @@ export default function App() {
     const saved = localStorage.getItem('te_benchmark_set_at');
     return saved ? (parseInt(saved, 10) || 0) : 0;
   });
-
-  // --- CORE SYSTEM FUNCTIONS (ORDER CRITICAL) ---
-  const addLog = React.useCallback((message: string, type: 'info' | 'success' | 'warning' = 'info') => {
-    const normalized = message.startsWith('SYNC SUCCESS:')
-      ? 'SYNC SUCCESS'
-      : message.startsWith('INITIATING EXCHANGE HANDSHAKE')
-        ? 'INITIATING EXCHANGE HANDSHAKE'
-        : message;
-    const groupKey = `${type}:${normalized}`;
-
-    setSystemLogs(prev => {
-      const now = new Date().toLocaleTimeString();
-      if (prev.length > 0 && prev[0].groupKey === groupKey) {
-        const updatedTop: SystemLogEntry = {
-          ...prev[0],
-          time: now,
-          message,
-          repeatCount: prev[0].repeatCount + 1,
-        };
-        return [updatedTop, ...prev.slice(1)].slice(0, 30);
-      }
-
-      const nextEntry: SystemLogEntry = {
-        time: now,
-        message,
-        type,
-        groupKey,
-        repeatCount: 1,
-      };
-      return [nextEntry, ...prev].slice(0, 30);
-    });
-  }, []);
 
   const requestControllerTabFocus = React.useCallback(() => {
     if (!liveControllerTabId) return;
