@@ -25,6 +25,7 @@ export function getPublicDataSourceSnapshot(): PublicDataSourceSnapshot {
 
 type FetchKlinesOptions = {
   forceBinancePublic?: boolean;
+  baseUrl?: string;
 };
 
 const buildRateLimitedError = (retryAt: number) => {
@@ -47,7 +48,11 @@ export async function fetchBinanceData(
       : (raw.endsWith('USD') && !raw.endsWith('USDT') ? `${raw}T` : raw);
     const forceBinancePublic = options?.forceBinancePublic !== false;
     const sourceQuery = forceBinancePublic ? '&source=binance_public' : '';
-    const response = await fetch(`/api/binance/proxy/klines?symbol=${targetSymbol}&interval=${interval}&limit=${limit}${sourceQuery}`);
+    const baseUrl = String(options?.baseUrl || '').replace(/\/$/, '');
+    const requestUrl = baseUrl
+      ? `${baseUrl}/api/binance/proxy/klines?symbol=${targetSymbol}&interval=${interval}&limit=${limit}${sourceQuery}`
+      : `/api/binance/proxy/klines?symbol=${targetSymbol}&interval=${interval}&limit=${limit}${sourceQuery}`;
+    const response = await fetch(requestUrl);
     rememberPublicDataSource('klines', response);
     const source = response.headers.get('x-tradeedge-source') || '';
     const retryAt = Number(response.headers.get('x-tradeedge-blocked-until') || '0');
@@ -82,7 +87,11 @@ export async function fetchLatestPrice(symbol: string): Promise<number | null> {
     const targetSymbol = raw === 'BTC'
       ? 'BTCUSDT'
       : (raw.endsWith('USD') && !raw.endsWith('USDT') ? `${raw}T` : raw);
-    const response = await fetch(`/api/binance/price/${targetSymbol}?source=binance_public`);
+    const baseUrl = String(options?.baseUrl || '').replace(/\/$/, '');
+    const requestUrl = baseUrl
+      ? `${baseUrl}/api/binance/price/${targetSymbol}?source=binance_public`
+      : `/api/binance/price/${targetSymbol}?source=binance_public`;
+    const response = await fetch(requestUrl);
     const data = await response.json();
     const price = Number(data?.price);
     return Number.isFinite(price) && price > 0 ? price : null;
@@ -112,7 +121,11 @@ export async function fetchAllSymbols(options?: FetchAllSymbolsOptions): Promise
 
     const forceBinancePublic = options?.forceBinancePublic !== false;
     const sourceQuery = forceBinancePublic ? '&source=binance_public' : '';
-    const response = await fetch(`/api/binance/proxy/exchangeInfo?includeSpot=${includeSpot ? '1' : '0'}&includeFutures=${includeFutures ? '1' : '0'}${sourceQuery}`);
+    const baseUrl = String(options?.baseUrl || '').replace(/\/$/, '');
+    const requestUrl = baseUrl
+      ? `${baseUrl}/api/binance/proxy/exchangeInfo?includeSpot=${includeSpot ? '1' : '0'}&includeFutures=${includeFutures ? '1' : '0'}${sourceQuery}`
+      : `/api/binance/proxy/exchangeInfo?includeSpot=${includeSpot ? '1' : '0'}&includeFutures=${includeFutures ? '1' : '0'}${sourceQuery}`;
+    const response = await fetch(requestUrl);
     rememberPublicDataSource('exchangeInfo', response);
     const data = await response.json();
 
@@ -159,11 +172,15 @@ export async function fetchAllSymbols(options?: FetchAllSymbolsOptions): Promise
     return [];
   }
 }
-export async function fetchTopSymbolsByVolume(limit: number = 20, options?: { forceBinancePublic?: boolean }): Promise<string[]> {
+export async function fetchTopSymbolsByVolume(limit: number = 20, options?: { forceBinancePublic?: boolean; baseUrl?: string }): Promise<string[]> {
   try {
     const forceBinancePublic = options?.forceBinancePublic !== false;
     const sourceQuery = forceBinancePublic ? '?source=binance_public' : '';
-    const response = await fetch(`/api/binance/proxy/ticker24hr${sourceQuery}`);
+    const baseUrl = String(options?.baseUrl || '').replace(/\/$/, '');
+    const requestUrl = baseUrl
+      ? `${baseUrl}/api/binance/proxy/ticker24hr${sourceQuery}`
+      : `/api/binance/proxy/ticker24hr${sourceQuery}`;
+    const response = await fetch(requestUrl);
     rememberPublicDataSource('ticker24hr', response);
     const data = await response.json();
     return data
@@ -177,11 +194,15 @@ export async function fetchTopSymbolsByVolume(limit: number = 20, options?: { fo
   }
 }
 
-export async function fetchTicker24hStats(options?: { forceBinancePublic?: boolean }): Promise<Map<string, { quoteVolume: number; priceChangePercent: number }>> {
+export async function fetchTicker24hStats(options?: { forceBinancePublic?: boolean; baseUrl?: string }): Promise<Map<string, { quoteVolume: number; priceChangePercent: number }>> {
   try {
     const forceBinancePublic = options?.forceBinancePublic !== false;
     const sourceQuery = forceBinancePublic ? '?source=binance_public' : '';
-    const response = await fetch(`/api/binance/proxy/ticker24hr${sourceQuery}`);
+    const baseUrl = String(options?.baseUrl || '').replace(/\/$/, '');
+    const requestUrl = baseUrl
+      ? `${baseUrl}/api/binance/proxy/ticker24hr${sourceQuery}`
+      : `/api/binance/proxy/ticker24hr${sourceQuery}`;
+    const response = await fetch(requestUrl);
     rememberPublicDataSource('ticker24hr', response);
     const data = await response.json();
     if (!Array.isArray(data)) return new Map();
